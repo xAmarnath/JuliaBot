@@ -19,6 +19,8 @@ import (
 	_ "github.com/joho/godotenv/autoload"
 )
 
+var SYSTEM_PROMPT = "hi"
+
 type Client struct {
 	baseURL string
 	http    *http.Client
@@ -28,6 +30,7 @@ type Client struct {
 	userID    string
 	userName  string
 }
+
 
 func NewClient() *Client {
 	return &Client{
