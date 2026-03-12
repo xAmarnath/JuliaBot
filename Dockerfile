@@ -30,7 +30,7 @@ RUN apk add --no-cache \
     wget \
     tar \
     yt-dlp \
-    speedtest-cli \
+    speedtest-cli
 
 ENV GOLANG_VERSION=1.25.0
 
