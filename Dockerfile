@@ -31,7 +31,6 @@ RUN apk add --no-cache \
     tar \
     yt-dlp \
     speedtest-cli \
-    aria2
 
 ENV GOLANG_VERSION=1.25.0
 
