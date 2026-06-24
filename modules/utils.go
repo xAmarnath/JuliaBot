@@ -163,47 +163,68 @@ func trimString(s string, length int) string {
 }
 
 func IsUserAdmin(bot *telegram.Client, userID int64, chatID int64, right string) bool {
+	// In a 1:1 PM with the bot the user IS the chat — treat them as fully privileged.
+	if chatID == userID {
+		return true
+	}
+
 	member, err := bot.GetChatMember(chatID, userID)
 	if err != nil {
 		return false
 	}
 
-	if member.Status == telegram.Admin || member.Status == telegram.Creator {
-		if member.Status == telegram.Creator {
-			return true
-		}
-		switch right {
-		case "promote":
-			return member.Rights.AddAdmins
-		case "ban":
-			return member.Rights.BanUsers
-		case "delete":
-			return member.Rights.DeleteMessages
-		case "change_info", "info":
-			return member.Rights.ChangeInfo
-		case "pin":
-			return member.Rights.PinMessages
-		case "invite":
-			return member.Rights.InviteUsers
-		case "":
-			return true
-		}
+	if member.Status != telegram.Admin && member.Status != telegram.Creator {
+		return false
+	}
+	// Creator always wins, regardless of the right asked.
+	if member.Status == telegram.Creator {
+		return true
+	}
+	// Plain admin with no granular rights object — treat as full admin.
+	if member.Rights == nil {
+		return true
+	}
+	switch right {
+	case "promote":
+		return member.Rights.AddAdmins
+	case "ban":
+		return member.Rights.BanUsers
+	case "delete":
+		return member.Rights.DeleteMessages
+	case "change_info", "info":
+		return member.Rights.ChangeInfo
+	case "pin":
+		return member.Rights.PinMessages
+	case "invite":
+		return member.Rights.InviteUsers
+	case "":
+		return true
 	}
 	return false
 }
 
 func CanBot(bot *telegram.Client, chat *telegram.Channel, right string) bool {
-	if chat.AdminRights != nil {
-		switch right {
-		case "ban":
-			return chat.AdminRights.BanUsers
-		case "delete":
-			return chat.AdminRights.DeleteMessages
-		case "invite":
-			return chat.AdminRights.InviteUsers
-		case "promote":
-			return chat.AdminRights.AddAdmins
-		}
+	// Basic groups / nil rights object: assume the bot can act unless we know otherwise.
+	// Telegram will reject the actual API call if it can't; this avoids false denials
+	// in basic groups where AdminRights is always nil.
+	if chat == nil || chat.AdminRights == nil {
+		return true
+	}
+	switch right {
+	case "ban":
+		return chat.AdminRights.BanUsers
+	case "delete":
+		return chat.AdminRights.DeleteMessages
+	case "invite":
+		return chat.AdminRights.InviteUsers
+	case "promote":
+		return chat.AdminRights.AddAdmins
+	case "pin":
+		return chat.AdminRights.PinMessages
+	case "change_info", "info":
+		return chat.AdminRights.ChangeInfo
+	case "":
+		return true
 	}
 	return false
 }
