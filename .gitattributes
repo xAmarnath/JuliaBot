@@ -1,0 +1,4 @@
+# Heroku executes these files on Linux, including archives made on Windows.
+*.sh text eol=lf
+Aptfile text eol=lf
+Procfile text eol=lf
