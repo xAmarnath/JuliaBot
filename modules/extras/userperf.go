@@ -11,11 +11,15 @@ import (
 	modules "main/modules"
 	"main/modules/db"
 
-	tg "github.com/amarnathcjd/gogram/telegram"
-	bolt "go.etcd.io/bbolt"
+	tg "github.com/xAmarnath/gogram/telegram"
+	"main/internal/mongostore"
 )
 
-const userPerfBucket = "user_perf_v1"
+const (
+	userPerfBucket   = "user_perf_v1"
+	userPerfIdleTTL  = time.Hour
+	userPerfMaxChats = 200
+)
 
 type userPerf struct {
 	TotalMsgs   int64            `json:"total_msgs"`
@@ -62,7 +66,7 @@ func userPerfLoadDisk(userID int64) *userPerf {
 	if err != nil || d == nil {
 		return out
 	}
-	_ = d.View(func(tx *bolt.Tx) error {
+	_ = d.View(func(tx *mongostore.Tx) error {
 		b := tx.Bucket([]byte(userPerfBucket))
 		if b == nil {
 			return nil
@@ -86,25 +90,41 @@ func userPerfLoadDisk(userID int64) *userPerf {
 	return out
 }
 
-func UserPerfGet(userID int64) *userPerf {
-	if userID == 0 {
-		return userPerfNew()
+// userPerfEntry returns the live cached entry, loading it from disk without holding
+// userPerfMu so a cold user doesn't stall every other message.
+func userPerfEntry(userID int64) *userPerf {
+	userPerfMu.Lock()
+	e, ok := userPerfCache[userID]
+	userPerfMu.Unlock()
+	if ok {
+		return e
 	}
+	loaded := userPerfLoadDisk(userID)
 	userPerfMu.Lock()
 	defer userPerfMu.Unlock()
 	if e, ok := userPerfCache[userID]; ok {
-		cp := *e
-		cp.Chats = mapCopyInt64(e.Chats)
-		cp.Commands = mapCopyStrInt64(e.Commands)
-		return &cp
+		return e
 	}
-	e := userPerfLoadDisk(userID)
-	userPerfCache[userID] = e
+	userPerfCache[userID] = loaded
+	return loaded
+}
+
+func userPerfClone(e *userPerf) *userPerf {
 	cp := *e
 	cp.Chats = mapCopyInt64(e.Chats)
 	cp.Commands = mapCopyStrInt64(e.Commands)
 	cp.DailyMsgs = mapCopyStrInt64(e.DailyMsgs)
 	return &cp
+}
+
+func UserPerfGet(userID int64) *userPerf {
+	if userID == 0 {
+		return userPerfNew()
+	}
+	e := userPerfEntry(userID)
+	userPerfMu.Lock()
+	defer userPerfMu.Unlock()
+	return userPerfClone(e)
 }
 
 func mapCopyInt64(m map[int64]int64) map[int64]int64 {
@@ -130,30 +150,46 @@ func userPerfFlushAll() {
 	pending := make(map[int64]*userPerf, len(userPerfDirty))
 	for uid := range userPerfDirty {
 		if e, ok := userPerfCache[uid]; ok {
-			cp := *e
-			cp.Chats = mapCopyInt64(e.Chats)
-			cp.Commands = mapCopyStrInt64(e.Commands)
-			cp.DailyMsgs = mapCopyStrInt64(e.DailyMsgs)
-			pending[uid] = &cp
+			pending[uid] = userPerfClone(e)
 		}
 	}
 	userPerfDirty = map[int64]bool{}
 	userPerfMu.Unlock()
 
-	_ = d.Update(func(tx *bolt.Tx) error {
-		b, err := tx.CreateBucketIfNotExists([]byte(userPerfBucket))
-		if err != nil {
-			return err
-		}
-		for uid, e := range pending {
-			raw, jerr := json.Marshal(e)
-			if jerr != nil {
-				continue
+	if len(pending) > 0 {
+		err = d.Update(func(tx *mongostore.Tx) error {
+			b, err := tx.CreateBucketIfNotExists([]byte(userPerfBucket))
+			if err != nil {
+				return err
 			}
-			_ = b.Put(userPerfKey(uid), raw)
+			for uid, e := range pending {
+				raw, jerr := json.Marshal(e)
+				if jerr != nil {
+					continue
+				}
+				if err := b.Put(userPerfKey(uid), raw); err != nil {
+					return err
+				}
+			}
+			return nil
+		})
+	}
+
+	userPerfMu.Lock()
+	defer userPerfMu.Unlock()
+	if err != nil {
+		for uid := range pending {
+			userPerfDirty[uid] = true
 		}
-		return nil
-	})
+		return
+	}
+	// Evict idle, already-persisted users so the cache doesn't hold every user ever seen.
+	idle := time.Now().Add(-userPerfIdleTTL).Unix()
+	for uid, e := range userPerfCache {
+		if !userPerfDirty[uid] && e.LastSeen < idle {
+			delete(userPerfCache, uid)
+		}
+	}
 }
 
 func userPerfStartFlusher() {
@@ -225,12 +261,8 @@ func UserPerfTracker(m *tg.NewMessage) error {
 	isReply := m.IsReply()
 	charLen := int64(len([]rune(text)))
 
+	e := userPerfEntry(senderID)
 	userPerfMu.Lock()
-	e, ok := userPerfCache[senderID]
-	if !ok {
-		e = userPerfLoadDisk(senderID)
-		userPerfCache[senderID] = e
-	}
 	e.TotalMsgs++
 	if isMedia {
 		e.MediaMsgs++
@@ -251,7 +283,7 @@ func UserPerfTracker(m *tg.NewMessage) error {
 		e.NightMsgs++
 	}
 	e.CharSum += charLen
-	if chatID != 0 {
+	if chatID != 0 && (len(e.Chats) < userPerfMaxChats || e.Chats[chatID] > 0) {
 		e.Chats[chatID]++
 	}
 	if cmdName != "" {
@@ -279,13 +311,13 @@ func UserPerfTracker(m *tg.NewMessage) error {
 	e.LastSeen = now.Unix()
 	userPerfDirty[senderID] = true
 	userPerfMu.Unlock()
-
-	userPerfStartFlusher()
 	return nil
 }
 
+// No commands or help of its own: this feeds the profile card in images.go.
 func registerUserPerfHandlers() {
 	c := modules.Client
+	userPerfStartFlusher()
 	c.On(tg.OnNewMessage, UserPerfTracker)
 }
 

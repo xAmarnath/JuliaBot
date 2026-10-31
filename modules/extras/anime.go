@@ -1,89 +1,103 @@
 package extras
 
 import (
+	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"html"
 	"io"
 	"net/http"
-	"net/url"
+	"regexp"
 	"strings"
 	"time"
 
-	tg "github.com/amarnathcjd/gogram/telegram"
+	tg "github.com/xAmarnath/gogram/telegram"
 	modules "main/modules"
 )
 
-var jikanClient = &http.Client{Timeout: 30 * time.Second}
+var animeClient = &http.Client{Timeout: 20 * time.Second}
 
-type jikanImage struct {
-	ImageURL string `json:"image_url"`
-	LargeURL string `json:"large_image_url"`
-	SmallURL string `json:"small_image_url"`
+const anilistQuery = `query ($search: String, $type: MediaType) {
+  Media(search: $search, type: $type, sort: SEARCH_MATCH) {
+    idMal siteUrl format status episodes chapters volumes averageScore genres
+    title { romaji english native }
+    description(asHtml: false)
+    coverImage { extraLarge large }
+    nextAiringEpisode { episode timeUntilAiring }
+  }
+}`
+
+type animeEntry struct {
+	IDMal        int      `json:"idMal"`
+	SiteURL      string   `json:"siteUrl"`
+	Format       string   `json:"format"`
+	Status       string   `json:"status"`
+	Episodes     int      `json:"episodes"`
+	Chapters     int      `json:"chapters"`
+	Volumes      int      `json:"volumes"`
+	AverageScore int      `json:"averageScore"`
+	Genres       []string `json:"genres"`
+	Title        struct {
+		Romaji  string `json:"romaji"`
+		English string `json:"english"`
+		Native  string `json:"native"`
+	} `json:"title"`
+	Description string `json:"description"`
+	CoverImage  struct {
+		ExtraLarge string `json:"extraLarge"`
+		Large      string `json:"large"`
+	} `json:"coverImage"`
+	NextAiringEpisode *struct {
+		Episode         int `json:"episode"`
+		TimeUntilAiring int `json:"timeUntilAiring"`
+	} `json:"nextAiringEpisode"`
 }
 
-type jikanImages struct {
-	JPG  jikanImage `json:"jpg"`
-	WebP jikanImage `json:"webp"`
-}
+var animeTagRe = regexp.MustCompile(`<[^>]+>`)
 
-type jikanEntry struct {
-	MalID    int         `json:"mal_id"`
-	URL      string      `json:"url"`
-	Images   jikanImages `json:"images"`
-	Title    string      `json:"title"`
-	TitleEng string      `json:"title_english"`
-	Type     string      `json:"type"`
-	Episodes int         `json:"episodes"`
-	Chapters int         `json:"chapters"`
-	Volumes  int         `json:"volumes"`
-	Status   string      `json:"status"`
-	Score    float64     `json:"score"`
-	Synopsis string      `json:"synopsis"`
-}
-
-type jikanResponse struct {
-	Data []jikanEntry `json:"data"`
-}
-
-func fetchJikan(endpoint, query string) (*jikanEntry, error) {
-	apiURL := fmt.Sprintf("https://api.jikan.moe/v4/%s?q=%s&limit=1", endpoint, url.QueryEscape(query))
-	req, err := http.NewRequest("GET", apiURL, nil)
+func fetchAniList(ctx context.Context, kind, query string) (*animeEntry, error) {
+	body, _ := json.Marshal(map[string]any{
+		"query":     anilistQuery,
+		"variables": map[string]string{"search": query, "type": strings.ToUpper(kind)},
+	})
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://graphql.anilist.co", bytes.NewReader(body))
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("User-Agent", "JuliaBot/1.0")
+	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
-	resp, err := jikanClient.Do(req)
+	resp, err := animeClient.Do(req)
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("status %d", resp.StatusCode)
+	var out struct {
+		Data struct {
+			Media *animeEntry `json:"Media"`
+		} `json:"data"`
+		Errors []struct {
+			Status int `json:"status"`
+		} `json:"errors"`
 	}
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&out); err != nil {
 		return nil, err
 	}
-	var data jikanResponse
-	if err := json.Unmarshal(body, &data); err != nil {
-		return nil, err
-	}
-	if len(data.Data) == 0 {
+	if resp.StatusCode == http.StatusNotFound || (len(out.Errors) > 0 && out.Errors[0].Status == http.StatusNotFound) {
 		return nil, nil
 	}
-	return &data.Data[0], nil
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("anilist status %d", resp.StatusCode)
+	}
+	return out.Data.Media, nil
 }
 
-func downloadJikanImage(imgURL string) ([]byte, error) {
-	req, err := http.NewRequest("GET", imgURL, nil)
+func fetchAnimeImage(ctx context.Context, imgURL string) ([]byte, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, imgURL, nil)
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("User-Agent", "JuliaBot/1.0")
-	client := &http.Client{Timeout: 30 * time.Second}
-	resp, err := client.Do(req)
+	resp, err := animeClient.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -91,10 +105,10 @@ func downloadJikanImage(imgURL string) ([]byte, error) {
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("image status %d", resp.StatusCode)
 	}
-	return io.ReadAll(resp.Body)
+	return io.ReadAll(io.LimitReader(resp.Body, 10<<20))
 }
 
-func truncateJikan(s string, n int) string {
+func truncateAnime(s string, n int) string {
 	r := []rune(s)
 	if len(r) <= n {
 		return s
@@ -109,140 +123,140 @@ func truncateJikan(s string, n int) string {
 	return string(r[:cut]) + "..."
 }
 
-func buildJikanCaption(e *jikanEntry, kind string) string {
-	title := strings.TrimSpace(e.Title)
+func animeHumanize(s string) string {
+	s = strings.ReplaceAll(strings.ToLower(s), "_", " ")
+	if s == "tv" || s == "ova" || s == "ona" {
+		return strings.ToUpper(s)
+	}
+	if s != "" {
+		s = strings.ToUpper(s[:1]) + s[1:]
+	}
+	return s
+}
+
+func buildAnimeCaption(e *animeEntry, kind string) string {
+	title := strings.TrimSpace(e.Title.English)
 	if title == "" {
-		title = strings.TrimSpace(e.TitleEng)
+		title = strings.TrimSpace(e.Title.Romaji)
 	}
 	if title == "" {
 		title = "Unknown"
 	}
-	synopsis := strings.TrimSpace(e.Synopsis)
+	synopsis := strings.TrimSpace(html.UnescapeString(animeTagRe.ReplaceAllString(strings.ReplaceAll(e.Description, "<br>", "\n"), "")))
 	if synopsis == "" {
 		synopsis = "No synopsis available."
 	}
-	synopsis = truncateJikan(synopsis, 700)
 
 	var b strings.Builder
-	b.WriteString("<b>")
-	b.WriteString(html.EscapeString(title))
-	b.WriteString("</b>\n\n")
-	if strings.TrimSpace(e.Type) != "" {
-		b.WriteString("<b>Type:</b> ")
-		b.WriteString(html.EscapeString(e.Type))
-		b.WriteString("\n")
+	fmt.Fprintf(&b, "<b>%s</b>\n", html.EscapeString(title))
+	if alt := strings.TrimSpace(e.Title.Romaji); alt != "" && alt != title {
+		fmt.Fprintf(&b, "<i>%s</i>\n", html.EscapeString(alt))
+	}
+	b.WriteString("\n")
+	if e.Format != "" {
+		fmt.Fprintf(&b, "<b>Type:</b> %s\n", html.EscapeString(animeHumanize(e.Format)))
 	}
 	if kind == "anime" {
 		if e.Episodes > 0 {
-			b.WriteString(fmt.Sprintf("<b>Episodes:</b> %d\n", e.Episodes))
-		} else {
-			b.WriteString("<b>Episodes:</b> N/A\n")
+			fmt.Fprintf(&b, "<b>Episodes:</b> %d\n", e.Episodes)
+		}
+		if e.NextAiringEpisode != nil {
+			d := time.Duration(e.NextAiringEpisode.TimeUntilAiring) * time.Second
+			fmt.Fprintf(&b, "<b>Next episode:</b> %d in %dd %dh\n", e.NextAiringEpisode.Episode, int(d.Hours())/24, int(d.Hours())%24)
 		}
 	} else {
 		if e.Chapters > 0 {
-			b.WriteString(fmt.Sprintf("<b>Chapters:</b> %d\n", e.Chapters))
-		} else {
-			b.WriteString("<b>Chapters:</b> N/A\n")
+			fmt.Fprintf(&b, "<b>Chapters:</b> %d\n", e.Chapters)
 		}
 		if e.Volumes > 0 {
-			b.WriteString(fmt.Sprintf("<b>Volumes:</b> %d\n", e.Volumes))
+			fmt.Fprintf(&b, "<b>Volumes:</b> %d\n", e.Volumes)
 		}
 	}
-	if strings.TrimSpace(e.Status) != "" {
-		b.WriteString("<b>Status:</b> ")
-		b.WriteString(html.EscapeString(e.Status))
-		b.WriteString("\n")
+	if e.Status != "" {
+		fmt.Fprintf(&b, "<b>Status:</b> %s\n", html.EscapeString(animeHumanize(e.Status)))
 	}
-	if e.Score > 0 {
-		b.WriteString(fmt.Sprintf("<b>Score:</b> %.2f\n", e.Score))
-	} else {
-		b.WriteString("<b>Score:</b> N/A\n")
+	if e.AverageScore > 0 {
+		fmt.Fprintf(&b, "<b>Score:</b> %d/100\n", e.AverageScore)
 	}
-	b.WriteString("\n<b>Synopsis:</b>\n<blockquote>")
-	b.WriteString(html.EscapeString(synopsis))
-	b.WriteString("</blockquote>\n")
-	if strings.TrimSpace(e.URL) != "" {
-		b.WriteString("\n<a href=\"")
-		b.WriteString(html.EscapeString(e.URL))
-		b.WriteString("\">View on MyAnimeList</a>")
+	if len(e.Genres) > 0 {
+		fmt.Fprintf(&b, "<b>Genres:</b> %s\n", html.EscapeString(strings.Join(e.Genres, ", ")))
+	}
+	fmt.Fprintf(&b, "\n<blockquote expandable>%s</blockquote>\n", html.EscapeString(truncateAnime(synopsis, 700)))
+	if e.SiteURL != "" {
+		fmt.Fprintf(&b, "\n<a href=\"%s\">AniList</a>", html.EscapeString(e.SiteURL))
+	}
+	if e.IDMal > 0 {
+		fmt.Fprintf(&b, " · <a href=\"https://myanimelist.net/%s/%d\">MyAnimeList</a>", kind, e.IDMal)
 	}
 	return b.String()
 }
 
-func handleJikanLookup(m *tg.NewMessage, kind string) error {
+func handleAnimeLookup(m *tg.NewMessage, kind string) error {
 	query := strings.TrimSpace(m.Args())
 	if query == "" {
 		m.Reply(fmt.Sprintf("Usage: <code>/%s &lt;title&gt;</code>", kind))
 		return nil
 	}
 	status, _ := m.Reply(fmt.Sprintf("Searching %s...", kind))
-
-	entry, err := fetchJikan(kind, query)
-	if err != nil {
-		msg := "<b>Error:</b> failed to fetch " + kind + " info."
+	reply := func(text string) {
 		if status != nil {
-			status.Edit(msg)
+			status.Edit(text, &tg.SendOptions{LinkPreview: false})
 		} else {
-			m.Reply(msg)
+			m.Reply(text)
 		}
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	entry, err := fetchAniList(ctx, kind, query)
+	if err != nil {
+		reply("Couldn't reach AniList right now. Please try again in a moment.")
 		return nil
 	}
 	if entry == nil {
-		msg := "<b>No results for:</b> " + html.EscapeString(query)
-		if status != nil {
-			status.Edit(msg)
-		} else {
-			m.Reply(msg)
-		}
+		reply("<b>No results for:</b> " + html.EscapeString(query))
 		return nil
 	}
 
-	caption := buildJikanCaption(entry, kind)
-	imgURL := strings.TrimSpace(entry.Images.JPG.LargeURL)
+	caption := buildAnimeCaption(entry, kind)
+	imgURL := entry.CoverImage.ExtraLarge
 	if imgURL == "" {
-		imgURL = strings.TrimSpace(entry.Images.JPG.ImageURL)
+		imgURL = entry.CoverImage.Large
 	}
-	if imgURL == "" {
-		imgURL = strings.TrimSpace(entry.Images.JPG.SmallURL)
-	}
-
 	if imgURL != "" {
-		imgBytes, ierr := downloadJikanImage(imgURL)
-		if ierr == nil && len(imgBytes) > 0 {
+		if img, ierr := fetchAnimeImage(ctx, imgURL); ierr == nil && len(img) > 0 {
 			if status != nil {
 				status.Delete()
 			}
-			m.ReplyMedia(imgBytes, &tg.MediaOptions{
-				Caption:  caption,
-				FileName: kind + ".jpg",
-				MimeType: "image/jpeg",
-			})
+			modules.TransferReplyMedia(m, img, &tg.MediaOptions{Caption: caption, FileName: kind + ".jpg", MimeType: "image/jpeg"})
 			return nil
 		}
 	}
-
-	if status != nil {
-		status.Edit(caption, &tg.SendOptions{LinkPreview: true})
-	} else {
-		m.Reply(caption, &tg.SendOptions{LinkPreview: true})
-	}
+	reply(caption)
 	return nil
 }
 
 func AnimeHandler(m *tg.NewMessage) error {
-	return handleJikanLookup(m, "anime")
+	return handleAnimeLookup(m, "anime")
 }
 
 func MangaHandler(m *tg.NewMessage) error {
-	return handleJikanLookup(m, "manga")
+	return handleAnimeLookup(m, "manga")
 }
 
 func registerAnimeHandlers() {
 	c := modules.Client
-	c.On("cmd:anime", AnimeHandler)
-	c.On("cmd:manga", MangaHandler)
+	modules.OnCommand(c, "cmd:anime", AnimeHandler)
+	modules.OnCommand(c, "cmd:manga", MangaHandler)
 }
 
 func init() {
 	modules.QueueHandlerRegistration(registerAnimeHandlers)
+	modules.Mods.AddModule("Anime", `<b>Anime &amp; Manga</b>
+
+<code>/anime &lt;title&gt;</code> — look up an anime: type, episodes, next airing episode, status, score, genres and synopsis.
+<code>/manga &lt;title&gt;</code> — look up a manga: chapters, volumes, status, score and synopsis.
+
+Data from AniList, with a MyAnimeList link when available.
+Example: <code>/anime frieren</code>`)
 }

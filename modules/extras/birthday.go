@@ -7,15 +7,16 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"main/modules/db"
 
-	tg "github.com/amarnathcjd/gogram/telegram"
+	tg "github.com/xAmarnath/gogram/telegram"
 
 	modules "main/modules"
 
-	"go.etcd.io/bbolt"
+	"main/internal/mongostore"
 )
 
 type birthdayEntry struct {
@@ -30,8 +31,43 @@ type birthdayEntry struct {
 
 const birthdayBucket = "birthdays"
 
+// bdayCache mirrors the birthdays bucket so the per-message tracker never hits the DB
+// unless a birthday user's active chat actually changes.
+var (
+	bdayCache      = map[int64]*birthdayEntry{}
+	bdayLoaded     bool
+	bdayLastTry    time.Time
+	bdayMu         sync.Mutex
+	bdayDateSplitR = strings.NewReplacer("/", "-", ".", "-", " ", "-")
+)
+
+func bdayEnsureLoaded() bool {
+	bdayMu.Lock()
+	if bdayLoaded || time.Since(bdayLastTry) < time.Minute {
+		ok := bdayLoaded
+		bdayMu.Unlock()
+		return ok
+	}
+	bdayLastTry = time.Now()
+	bdayMu.Unlock()
+
+	entries, err := listAllBirthdays()
+	if err != nil {
+		return false
+	}
+	bdayMu.Lock()
+	defer bdayMu.Unlock()
+	if !bdayLoaded {
+		for _, e := range entries {
+			bdayCache[e.UserID] = e
+		}
+		bdayLoaded = true
+	}
+	return true
+}
+
 func parseBirthdayDate(s string) (int, int, int, error) {
-	s = strings.TrimSpace(s)
+	s = bdayDateSplitR.Replace(strings.TrimSpace(s))
 	parts := strings.Split(s, "-")
 	if len(parts) != 2 && len(parts) != 3 {
 		return 0, 0, 0, fmt.Errorf("invalid format")
@@ -62,7 +98,7 @@ func saveBirthday(entry *birthdayEntry) error {
 	if err != nil || database == nil {
 		return fmt.Errorf("db error")
 	}
-	return database.Update(func(tx *bbolt.Tx) error {
+	err = database.Update(func(tx *mongostore.Tx) error {
 		b, err := tx.CreateBucketIfNotExists([]byte(birthdayBucket))
 		if err != nil {
 			return err
@@ -73,6 +109,13 @@ func saveBirthday(entry *birthdayEntry) error {
 		}
 		return b.Put([]byte(strconv.FormatInt(entry.UserID, 10)), data)
 	})
+	if err == nil {
+		cp := *entry
+		bdayMu.Lock()
+		bdayCache[entry.UserID] = &cp
+		bdayMu.Unlock()
+	}
+	return err
 }
 
 func loadBirthday(userID int64) (*birthdayEntry, error) {
@@ -81,7 +124,7 @@ func loadBirthday(userID int64) (*birthdayEntry, error) {
 		return nil, fmt.Errorf("db error")
 	}
 	var entry *birthdayEntry
-	err = database.View(func(tx *bbolt.Tx) error {
+	err = database.View(func(tx *mongostore.Tx) error {
 		b := tx.Bucket([]byte(birthdayBucket))
 		if b == nil {
 			return nil
@@ -105,13 +148,19 @@ func deleteBirthday(userID int64) error {
 	if err != nil || database == nil {
 		return fmt.Errorf("db error")
 	}
-	return database.Update(func(tx *bbolt.Tx) error {
+	err = database.Update(func(tx *mongostore.Tx) error {
 		b := tx.Bucket([]byte(birthdayBucket))
 		if b == nil {
 			return nil
 		}
 		return b.Delete([]byte(strconv.FormatInt(userID, 10)))
 	})
+	if err == nil {
+		bdayMu.Lock()
+		delete(bdayCache, userID)
+		bdayMu.Unlock()
+	}
+	return err
 }
 
 func listAllBirthdays() ([]*birthdayEntry, error) {
@@ -120,7 +169,7 @@ func listAllBirthdays() ([]*birthdayEntry, error) {
 		return nil, fmt.Errorf("db error")
 	}
 	var entries []*birthdayEntry
-	err = database.View(func(tx *bbolt.Tx) error {
+	err = database.View(func(tx *mongostore.Tx) error {
 		b := tx.Bucket([]byte(birthdayBucket))
 		if b == nil {
 			return nil
@@ -138,15 +187,48 @@ func listAllBirthdays() ([]*birthdayEntry, error) {
 }
 
 func updateLastActiveChat(userID, chatID int64, name string) {
-	entry, err := loadBirthday(userID)
-	if err != nil || entry == nil {
+	if !bdayEnsureLoaded() {
 		return
 	}
+	bdayMu.Lock()
+	cur, ok := bdayCache[userID]
+	if !ok || (cur.LastChatID == chatID && (name == "" || cur.Name == name)) {
+		bdayMu.Unlock()
+		return
+	}
+	entry := *cur
+	bdayMu.Unlock()
 	entry.LastChatID = chatID
 	if name != "" {
 		entry.Name = name
 	}
-	_ = saveBirthday(entry)
+	_ = saveBirthday(&entry)
+}
+
+func birthdayOrdinal(n int) string {
+	suffix := "th"
+	if n%100 < 11 || n%100 > 13 {
+		switch n % 10 {
+		case 1:
+			suffix = "st"
+		case 2:
+			suffix = "nd"
+		case 3:
+			suffix = "rd"
+		}
+	}
+	return strconv.Itoa(n) + suffix
+}
+
+// birthdayIsToday also wishes 29 Feb birthdays on 28 Feb in non-leap years.
+func birthdayIsToday(day, month int, now time.Time) bool {
+	if day == now.Day() && month == int(now.Month()) {
+		return true
+	}
+	if day == 29 && month == 2 && now.Month() == time.February && now.Day() == 28 {
+		return time.Date(now.Year(), time.February, 29, 0, 0, 0, 0, time.UTC).Month() != time.February
+	}
+	return false
 }
 
 func daysUntilBirthday(day, month int, now time.Time) int {
@@ -167,8 +249,31 @@ func formatBirthdayDate(day, month, year int) string {
 	return fmt.Sprintf("%d %s", day, monthName)
 }
 
+func birthdaySet(m *tg.NewMessage, day, month, year int) {
+	entry := &birthdayEntry{
+		UserID:     m.SenderID(),
+		Day:        day,
+		Month:      month,
+		Year:       year,
+		LastChatID: m.ChannelID(),
+		Name:       m.Sender.FirstName,
+	}
+	if old, _ := loadBirthday(m.SenderID()); old != nil {
+		entry.LastSent = old.LastSent
+		if m.IsPrivate() && old.LastChatID != 0 {
+			entry.LastChatID = old.LastChatID
+		}
+	}
+	if err := saveBirthday(entry); err != nil {
+		m.Reply("<b>Failed to save birthday.</b>")
+		return
+	}
+	m.Reply(fmt.Sprintf("<b>Birthday saved:</b> %s", formatBirthdayDate(day, month, year)))
+}
+
 func BirthdayHandler(m *tg.NewMessage) error {
 	if m.Sender == nil {
+		m.Reply("<b>Birthdays can only be set from a user account.</b>")
 		return nil
 	}
 	args := strings.TrimSpace(m.Args())
@@ -203,19 +308,7 @@ func BirthdayHandler(m *tg.NewMessage) error {
 			m.Reply("<b>Invalid date.</b> Use <code>DD-MM</code> or <code>DD-MM-YYYY</code>.")
 			return nil
 		}
-		entry := &birthdayEntry{
-			UserID:     m.SenderID(),
-			Day:        day,
-			Month:      month,
-			Year:       year,
-			LastChatID: m.ChatID(),
-			Name:       m.Sender.FirstName,
-		}
-		if err := saveBirthday(entry); err != nil {
-			m.Reply("<b>Failed to save birthday.</b>")
-			return nil
-		}
-		m.Reply(fmt.Sprintf("<b>Birthday saved:</b> %s", formatBirthdayDate(day, month, year)))
+		birthdaySet(m, day, month, year)
 		return nil
 
 	case "clear", "remove", "delete":
@@ -236,19 +329,28 @@ func BirthdayHandler(m *tg.NewMessage) error {
 		targetName := m.Sender.FirstName
 		if m.IsReply() {
 			r, err := m.GetReplyMessage()
-			if err == nil {
-				targetID = r.SenderID()
-				if r.Sender != nil {
-					targetName = r.Sender.FirstName
-				}
+			if err != nil || r == nil || r.SenderID() == 0 {
+				m.Reply("<b>Couldn't read the replied-to user.</b>")
+				return nil
+			}
+			targetID = r.SenderID()
+			if r.Sender != nil {
+				targetName = r.Sender.FirstName
 			}
 		} else if rest != "" {
 			peer, err := m.Client.ResolvePeer(rest)
-			if err == nil {
-				targetID = m.Client.GetPeerID(peer)
-				if u, _ := m.Client.GetUser(targetID); u != nil {
-					targetName = u.FirstName
-				}
+			if err != nil {
+				m.Reply(fmt.Sprintf("<b>User not found:</b> <code>%s</code>", html.EscapeString(rest)))
+				return nil
+			}
+			if _, ok := peer.(*tg.InputPeerUser); !ok {
+				m.Reply("<b>That's not a user.</b>")
+				return nil
+			}
+			targetID = m.Client.GetPeerID(peer)
+			targetName = rest
+			if u, _ := m.Client.GetUser(targetID); u != nil && u.FirstName != "" {
+				targetName = u.FirstName
 			}
 		}
 		entry, _ := loadBirthday(targetID)
@@ -268,19 +370,7 @@ func BirthdayHandler(m *tg.NewMessage) error {
 	default:
 		day, month, year, err := parseBirthdayDate(args)
 		if err == nil {
-			entry := &birthdayEntry{
-				UserID:     m.SenderID(),
-				Day:        day,
-				Month:      month,
-				Year:       year,
-				LastChatID: m.ChatID(),
-				Name:       m.Sender.FirstName,
-			}
-			if err := saveBirthday(entry); err != nil {
-				m.Reply("<b>Failed to save birthday.</b>")
-				return nil
-			}
-			m.Reply(fmt.Sprintf("<b>Birthday saved:</b> %s", formatBirthdayDate(day, month, year)))
+			birthdaySet(m, day, month, year)
 			return nil
 		}
 		m.Reply("<b>Unknown subcommand.</b>\n" +
@@ -291,7 +381,21 @@ func BirthdayHandler(m *tg.NewMessage) error {
 
 func UpcomingBirthdaysHandler(m *tg.NewMessage) error {
 	entries, err := listAllBirthdays()
-	if err != nil || len(entries) == 0 {
+	if err != nil {
+		m.Reply("<b>Couldn't load birthdays.</b> Try again later.")
+		return nil
+	}
+	// In groups, only list members whose last active chat is this one.
+	if !m.IsPrivate() {
+		here := entries[:0]
+		for _, e := range entries {
+			if e.LastChatID == m.ChannelID() || e.LastChatID == m.ChatID() {
+				here = append(here, e)
+			}
+		}
+		entries = here
+	}
+	if len(entries) == 0 {
 		m.Reply("<b>No birthdays saved yet.</b>")
 		return nil
 	}
@@ -328,18 +432,19 @@ func UpcomingBirthdaysHandler(m *tg.NewMessage) error {
 }
 
 func BirthdayActivityTracker(m *tg.NewMessage) error {
-	if m.SenderID() == 0 {
+	if m == nil || m.Message == nil || m.IsPrivate() || m.Sender == nil || m.Sender.Bot {
 		return nil
 	}
-	name := ""
-	if m.Sender != nil {
-		name = m.Sender.FirstName
-	}
-	updateLastActiveChat(m.SenderID(), m.ChatID(), name)
+	updateLastActiveChat(m.Sender.ID, m.ChannelID(), m.Sender.FirstName)
 	return nil
 }
 
 func birthdayTicker() {
+	// Dynos restart daily; catch up on today's wishes in case 09:00 was missed. LastSent prevents duplicates.
+	time.Sleep(2 * time.Minute)
+	if time.Now().UTC().Hour() >= 9 {
+		runBirthdayCheck()
+	}
 	for {
 		now := time.Now().UTC()
 		next := time.Date(now.Year(), now.Month(), now.Day(), 9, 0, 0, 0, time.UTC)
@@ -362,7 +467,7 @@ func runBirthdayCheck() {
 	now := time.Now().UTC()
 	todayKey := now.Format("2006-01-02")
 	for _, e := range entries {
-		if e.Day != now.Day() || e.Month != int(now.Month()) {
+		if !birthdayIsToday(e.Day, e.Month, now) {
 			continue
 		}
 		if e.LastSent == todayKey {
@@ -380,7 +485,7 @@ func runBirthdayCheck() {
 		if e.Year > 0 {
 			age := now.Year() - e.Year
 			if age > 0 && age < 130 {
-				text = fmt.Sprintf("🎂 Happy %dth birthday %s!", age, mention)
+				text = fmt.Sprintf("🎂 Happy %s birthday %s!", birthdayOrdinal(age), mention)
 			}
 		}
 		_, sendErr := modules.Client.SendMessage(e.LastChatID, text)
@@ -393,24 +498,27 @@ func runBirthdayCheck() {
 
 func registerBirthdayHandlers() {
 	c := modules.Client
-	c.On("cmd:bday", BirthdayHandler)
-	c.On("cmd:birthday", BirthdayHandler)
-	c.On("cmd:upcoming", UpcomingBirthdaysHandler)
+	modules.OnCommand(c, "cmd:bday", BirthdayHandler)
+	modules.OnCommand(c, "cmd:birthday", BirthdayHandler)
+	modules.OnCommand(c, "cmd:upcoming", UpcomingBirthdaysHandler)
 	c.On(tg.OnNewMessage, BirthdayActivityTracker)
 	go birthdayTicker()
-
-	modules.Mods.AddModule("Birthday", `<b>Birthday Module</b>
-
-<b>Commands:</b>
- • /bday set DD-MM or DD-MM-YYYY - Save your birthday
- • /bday clear - Remove your birthday
- • /bday check [@user] - Check a birthday
- • /upcoming - Next 5 upcoming birthdays
- • /birthday - Alias for /bday
-
-<i>Daily wishes are sent at 09:00 UTC to your last active chat.</i>`)
 }
 
 func init() {
 	modules.QueueHandlerRegistration(registerBirthdayHandlers)
+
+	modules.Mods.AddModule("Birthday", `<b>Birthday Module</b>
+
+<b>Commands:</b>
+ • <code>/bday</code> - Show your saved birthday
+ • <code>/bday set DD-MM</code> or <code>DD-MM-YYYY</code> - Save your birthday (<code>/</code> or <code>.</code> also work)
+ • <code>/bday clear</code> - Remove your birthday
+ • <code>/bday check [@user]</code> - Check a birthday (or reply to someone)
+ • <code>/upcoming</code> - Next 5 birthdays (in a group: members active here)
+ • <code>/birthday</code> - Alias for /bday
+
+<b>Example:</b> <code>/bday set 14-02-1999</code>
+
+<i>Wishes are sent at 09:00 UTC to the last group you were active in.</i>`)
 }

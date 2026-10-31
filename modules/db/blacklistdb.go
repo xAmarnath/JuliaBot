@@ -3,8 +3,9 @@ package db
 import (
 	"encoding/json"
 	"strconv"
+	"sync"
 
-	bolt "go.etcd.io/bbolt"
+	"main/internal/mongostore"
 )
 
 type BlacklistAction string
@@ -29,8 +30,28 @@ type BlacklistEntry struct {
 	AddedBy     int64  `json:"added_by"`
 }
 
-func ensureBlacklistBuckets(db *bolt.DB) error {
-	return db.Update(func(tx *bolt.Tx) error {
+var bucketsReady sync.Map
+
+// ensureBucketsOnce avoids an extra write round-trip on every call once the buckets exist.
+func ensureBucketsOnce(name string, db *mongostore.DB, create func(*mongostore.DB) error) error {
+	if _, ok := bucketsReady.Load(struct {
+		name string
+		db   *mongostore.DB
+	}{name, db}); ok {
+		return nil
+	}
+	if err := create(db); err != nil {
+		return err
+	}
+	bucketsReady.Store(struct {
+		name string
+		db   *mongostore.DB
+	}{name, db}, true)
+	return nil
+}
+
+func ensureBlacklistBuckets(db *mongostore.DB) error {
+	return db.Update(func(tx *mongostore.Tx) error {
 		_, err := tx.CreateBucketIfNotExists([]byte("blacklist"))
 		if err != nil {
 			return err
@@ -45,12 +66,15 @@ func AddBlacklist(chatID int64, entry *BlacklistEntry) error {
 	if err != nil {
 		return err
 	}
-	if err := ensureBlacklistBuckets(db); err != nil {
+	if err := ensureBucketsOnce("blacklist", db, ensureBlacklistBuckets); err != nil {
 		return err
 	}
 
-	return db.Update(func(tx *bolt.Tx) error {
-		chatsBucket := tx.Bucket([]byte("blacklist"))
+	return db.Update(func(tx *mongostore.Tx) error {
+		chatsBucket, err := tx.CreateBucketIfNotExists([]byte("blacklist"))
+		if err != nil {
+			return err
+		}
 		chatBucket, err := chatsBucket.CreateBucketIfNotExists([]byte(strconv.FormatInt(chatID, 10)))
 		if err != nil {
 			return err
@@ -70,11 +94,11 @@ func RemoveBlacklist(chatID int64, word string) error {
 	if err != nil {
 		return err
 	}
-	if err := ensureBlacklistBuckets(db); err != nil {
+	if err := ensureBucketsOnce("blacklist", db, ensureBlacklistBuckets); err != nil {
 		return err
 	}
 
-	return db.Update(func(tx *bolt.Tx) error {
+	return db.Update(func(tx *mongostore.Tx) error {
 		chatsBucket := tx.Bucket([]byte("blacklist"))
 		if chatsBucket == nil {
 			return nil
@@ -93,12 +117,12 @@ func GetBlacklist(chatID int64) ([]*BlacklistEntry, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := ensureBlacklistBuckets(db); err != nil {
+	if err := ensureBucketsOnce("blacklist", db, ensureBlacklistBuckets); err != nil {
 		return nil, err
 	}
 
 	var entries []*BlacklistEntry
-	err = db.View(func(tx *bolt.Tx) error {
+	err = db.View(func(tx *mongostore.Tx) error {
 		chatsBucket := tx.Bucket([]byte("blacklist"))
 		if chatsBucket == nil {
 			return nil
@@ -127,12 +151,12 @@ func IsBlacklisted(chatID int64, word string) bool {
 	if err != nil {
 		return false
 	}
-	if err := ensureBlacklistBuckets(db); err != nil {
+	if err := ensureBucketsOnce("blacklist", db, ensureBlacklistBuckets); err != nil {
 		return false
 	}
 
 	found := false
-	db.View(func(tx *bolt.Tx) error {
+	db.View(func(tx *mongostore.Tx) error {
 		chatsBucket := tx.Bucket([]byte("blacklist"))
 		if chatsBucket == nil {
 			return nil
@@ -156,12 +180,15 @@ func SetBlacklistSettings(chatID int64, settings *BlacklistSettings) error {
 	if err != nil {
 		return err
 	}
-	if err := ensureBlacklistBuckets(db); err != nil {
+	if err := ensureBucketsOnce("blacklist", db, ensureBlacklistBuckets); err != nil {
 		return err
 	}
 
-	return db.Update(func(tx *bolt.Tx) error {
-		settingsBucket := tx.Bucket([]byte("blacklist_settings"))
+	return db.Update(func(tx *mongostore.Tx) error {
+		settingsBucket, err := tx.CreateBucketIfNotExists([]byte("blacklist_settings"))
+		if err != nil {
+			return err
+		}
 		data, err := json.Marshal(settings)
 		if err != nil {
 			return err
@@ -176,13 +203,16 @@ func GetBlacklistSettings(chatID int64) (*BlacklistSettings, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := ensureBlacklistBuckets(db); err != nil {
+	if err := ensureBucketsOnce("blacklist", db, ensureBlacklistBuckets); err != nil {
 		return nil, err
 	}
 
 	settings := &BlacklistSettings{Action: ActionDelete}
-	err = db.View(func(tx *bolt.Tx) error {
+	err = db.View(func(tx *mongostore.Tx) error {
 		settingsBucket := tx.Bucket([]byte("blacklist_settings"))
+		if settingsBucket == nil {
+			return nil
+		}
 		data := settingsBucket.Get([]byte(strconv.FormatInt(chatID, 10)))
 		if data == nil {
 			return nil
@@ -199,12 +229,12 @@ func GetBlacklistCount(chatID int64) (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	if err := ensureBlacklistBuckets(db); err != nil {
+	if err := ensureBucketsOnce("blacklist", db, ensureBlacklistBuckets); err != nil {
 		return 0, err
 	}
 
 	count := 0
-	err = db.View(func(tx *bolt.Tx) error {
+	err = db.View(func(tx *mongostore.Tx) error {
 		chatsBucket := tx.Bucket([]byte("blacklist"))
 		if chatsBucket == nil {
 			return nil
@@ -229,16 +259,20 @@ func ClearBlacklist(chatID int64) error {
 	if err != nil {
 		return err
 	}
-	if err := ensureBlacklistBuckets(db); err != nil {
+	if err := ensureBucketsOnce("blacklist", db, ensureBlacklistBuckets); err != nil {
 		return err
 	}
 
-	return db.Update(func(tx *bolt.Tx) error {
+	return db.Update(func(tx *mongostore.Tx) error {
 		chatsBucket := tx.Bucket([]byte("blacklist"))
 		if chatsBucket == nil {
 			return nil
 		}
-		return chatsBucket.DeleteBucket([]byte(strconv.FormatInt(chatID, 10)))
+		key := []byte(strconv.FormatInt(chatID, 10))
+		if chatsBucket.Bucket(key) == nil {
+			return nil
+		}
+		return chatsBucket.DeleteBucket(key)
 	})
 }
 

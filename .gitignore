@@ -61,3 +61,11 @@ macy
 *.apk
 claude-proxy
 *.mov
+
+
+# Generated files and local tooling
+__pycache__/
+*.pyc
+modules/extras/tmp/
+tmp/twemoji-svg/
+.code-review-graph/

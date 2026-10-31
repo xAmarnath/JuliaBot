@@ -12,8 +12,8 @@ import (
 
 	modules "main/modules"
 
-	tg "github.com/amarnathcjd/gogram/telegram"
-	bolt "go.etcd.io/bbolt"
+	tg "github.com/xAmarnath/gogram/telegram"
+	"main/internal/mongostore"
 )
 
 const cleanupBucket = "cleanup_cfg"
@@ -53,7 +53,7 @@ func loadCleanupCfg(chatID int64) *cleanupCfg {
 	if err != nil || d == nil {
 		return cfg
 	}
-	_ = d.View(func(tx *bolt.Tx) error {
+	_ = d.View(func(tx *mongostore.Tx) error {
 		b := tx.Bucket([]byte(cleanupBucket))
 		if b == nil {
 			return nil
@@ -65,7 +65,7 @@ func loadCleanupCfg(chatID int64) *cleanupCfg {
 		_ = json.Unmarshal(raw, cfg)
 		return nil
 	})
-	if cfg.Delay <= 0 {
+	if cfg.Delay < 0 {
 		cfg.Delay = 2
 	}
 
@@ -81,7 +81,7 @@ func saveCleanupCfg(chatID int64, cfg *cleanupCfg) error {
 	if err != nil || d == nil {
 		return fmt.Errorf("db unavailable")
 	}
-	err = d.Update(func(tx *bolt.Tx) error {
+	err = d.Update(func(tx *mongostore.Tx) error {
 		b, err := tx.CreateBucketIfNotExists([]byte(cleanupBucket))
 		if err != nil {
 			return err
@@ -126,74 +126,63 @@ func formatCleanupCfg(cfg *cleanupCfg) string {
 }
 
 func CleanupHandler(m *tg.NewMessage) error {
-	if m.IsPrivate() {
-		m.Reply("<b>Cleanup works in groups only.</b>")
+	if !modules.RequireGroup(m) {
 		return nil
 	}
 
 	cfg := loadCleanupCfg(m.ChatID())
-
-	args := m.ArgsList()
+	args := strings.Fields(modules.CommandArgs(m.Text()))
 	if len(args) == 0 {
 		m.Reply(formatCleanupCfg(cfg))
 		return nil
 	}
-
-	if !modules.IsUserAdmin(m.Client, m.SenderID(), m.ChatID(), "change_info") {
-		m.Reply("<b>Permission denied.</b> You need Change Info permission.")
+	sub := strings.ToLower(args[0])
+	if sub == "status" || sub == "show" {
+		m.Reply(formatCleanupCfg(cfg))
 		return nil
 	}
 
-	sub := strings.ToLower(args[0])
+	if !modules.SenderHasRight(m, "delete") {
+		m.Reply("You need the <b>Delete Messages</b> admin right to change cleanup settings.")
+		return nil
+	}
+
+	save := func(ok string) {
+		if err := saveCleanupCfg(m.ChatID(), cfg); err != nil {
+			m.Reply("I couldn't save that setting. Please try again.")
+			return
+		}
+		if cfg.Enabled && !modules.BotHasRight(m.Client, m.ChannelID(), "delete") {
+			ok += "\n\n<i>Note: I need the Delete Messages right to remove service messages.</i>"
+		}
+		m.Reply(ok)
+	}
 
 	switch sub {
 	case "on", "enable", "yes":
 		cfg.Enabled = true
-		if err := saveCleanupCfg(m.ChatID(), cfg); err != nil {
-			m.Reply("<b>Failed to save config.</b>")
-			return nil
-		}
-		m.Reply(fmt.Sprintf("<b>Cleanup enabled.</b> Service messages will be deleted after %d seconds.", cfg.Delay))
-		return nil
+		save(fmt.Sprintf("<b>Cleanup enabled.</b> Service messages will be deleted after %d seconds.", cfg.Delay))
 	case "off", "disable", "no":
 		cfg.Enabled = false
-		if err := saveCleanupCfg(m.ChatID(), cfg); err != nil {
-			m.Reply("<b>Failed to save config.</b>")
-			return nil
-		}
-		m.Reply("<b>Cleanup disabled.</b>")
-		return nil
-	case "status", "show":
-		m.Reply(formatCleanupCfg(cfg))
-		return nil
+		save("<b>Cleanup disabled.</b>")
 	case "delay":
 		if len(args) < 2 {
-			m.Reply("<b>Usage:</b> <code>/cleanup delay &lt;seconds&gt;</code>")
+			m.Reply("<b>Usage:</b> <code>/cleanup delay &lt;seconds&gt;</code> (0-3600)")
 			return nil
 		}
 		n, err := strconv.Atoi(args[1])
-		if err != nil || n < 0 {
-			m.Reply("<b>Invalid delay.</b> Provide a non-negative integer.")
-			return nil
-		}
-		if n > 3600 {
-			m.Reply("<b>Delay too high.</b> Maximum is 3600 seconds.")
+		if err != nil || n < 0 || n > 3600 {
+			m.Reply("<b>Invalid delay.</b> Use a whole number of seconds from 0 to 3600.")
 			return nil
 		}
 		cfg.Delay = n
-		if err := saveCleanupCfg(m.ChatID(), cfg); err != nil {
-			m.Reply("<b>Failed to save config.</b>")
-			return nil
-		}
-		m.Reply(fmt.Sprintf("<b>Delay set to %d seconds.</b>", n))
-		return nil
+		save(fmt.Sprintf("<b>Delay set to %d seconds.</b>", n))
 	case "pinned":
 		if len(args) < 2 {
 			m.Reply("<b>Usage:</b> <code>/cleanup pinned on|off</code>")
 			return nil
 		}
-		v := strings.ToLower(args[1])
-		switch v {
+		switch strings.ToLower(args[1]) {
 		case "on", "enable", "yes":
 			cfg.Pinned = true
 		case "off", "disable", "no":
@@ -202,68 +191,56 @@ func CleanupHandler(m *tg.NewMessage) error {
 			m.Reply("<b>Usage:</b> <code>/cleanup pinned on|off</code>")
 			return nil
 		}
-		if err := saveCleanupCfg(m.ChatID(), cfg); err != nil {
-			m.Reply("<b>Failed to save config.</b>")
-			return nil
-		}
 		state := "off"
 		if cfg.Pinned {
 			state = "on"
 		}
-		m.Reply(fmt.Sprintf("<b>Pinned cleanup:</b> <code>%s</code>", state))
-		return nil
+		save(fmt.Sprintf("<b>Pinned-notice cleanup:</b> <code>%s</code>", state))
+	default:
+		m.Reply(formatCleanupCfg(cfg))
 	}
-
-	m.Reply(formatCleanupCfg(cfg))
 	return nil
 }
 
+// cleanupSkipAction reports service messages that must never be deleted.
+func cleanupSkipAction(a tg.MessageAction, cfg *cleanupCfg) bool {
+	switch a.(type) {
+	case nil, *tg.MessageActionEmpty:
+		return true
+	case *tg.MessageActionTopicCreate:
+		// Deleting a topic's creation message deletes the whole topic.
+		return true
+	case *tg.MessageActionPinMessage:
+		return !cfg.Pinned
+	}
+	return false
+}
+
 func CleanupWatcher(m *tg.NewMessage) error {
-	if m.IsPrivate() {
+	if m == nil || m.Message == nil || m.IsPrivate() || !m.IsService() {
 		return nil
 	}
-	if !m.IsService() || m.Action == nil {
-		return nil
-	}
-
 	cfg := loadCleanupCfg(m.ChatID())
-	if !cfg.Enabled {
+	if !cfg.Enabled || cleanupSkipAction(m.Action, cfg) {
+		return nil
+	}
+	if !modules.BotHasRight(m.Client, m.ChannelID(), "delete") {
 		return nil
 	}
 
-	if _, ok := m.Action.(*tg.MessageActionPinMessage); ok {
-		if !cfg.Pinned {
-			return nil
-		}
-	}
-
-	delay := cfg.Delay
-	if delay < 0 {
-		delay = 2
-	}
-
-	chatID := m.ChatID()
-	peer := m.Peer
-	id := m.ID
-	client := m.Client
-
-	if delay == 0 {
-		go func() {
-			_, _ = client.DeleteMessages(peer, []int32{id})
-		}()
+	chat, id, client := m.ChannelID(), m.ID, m.Client
+	del := func() { _, _ = client.DeleteMessages(chat, []int32{id}) }
+	if cfg.Delay <= 0 {
+		go del()
 		return nil
 	}
-
-	time.AfterFunc(time.Duration(delay)*time.Second, func() {
-		_, _ = client.DeleteMessages(peer, []int32{id})
-		_ = chatID
-	})
+	time.AfterFunc(time.Duration(cfg.Delay)*time.Second, del)
 	return nil
 }
 
 func registerCleanupHandlers() {
 	c := modules.Client
-	c.On("cmd:cleanup", CleanupHandler)
+	modules.OnCommand(c, "cmd:cleanup", CleanupHandler)
 	c.On(tg.OnAction, CleanupWatcher)
 }
 
@@ -272,15 +249,16 @@ func init() {
 
 	modules.Mods.AddModule("Cleanup", `<b>Service Message Cleanup</b>
 
-Auto-delete service messages (join/leave/pin/title changes) per chat.
+Automatically deletes service messages such as "X joined", "X left", "X added Y", title/photo changes and (optionally) "X pinned a message". Forum topic-creation messages are never touched.
 
 <b>Commands:</b>
- - /cleanup - Show current config and usage
- - /cleanup on - Enable auto-delete
- - /cleanup off - Disable auto-delete
- - /cleanup status - Show current config
- - /cleanup delay &lt;seconds&gt; - Set delete delay (default 2)
- - /cleanup pinned on|off - Toggle pinned-notice cleanup
+ - <code>/cleanup</code> or <code>/cleanup status</code> - Show the current settings
+ - <code>/cleanup on</code> / <code>/cleanup off</code> - Enable or disable
+ - <code>/cleanup delay &lt;seconds&gt;</code> - Wait this long before deleting (0-3600, default 2; 0 = immediately)
+ - <code>/cleanup pinned on|off</code> - Also delete "pinned a message" notices
 
-<b>Permission:</b> Admins with Delete Messages permission.`)
+<b>Example:</b>
+ <code>/cleanup delay 30</code> - keep join notices visible for 30 seconds
+
+<b>Permissions:</b> Changing settings needs the Delete Messages right; I need it too.`)
 }

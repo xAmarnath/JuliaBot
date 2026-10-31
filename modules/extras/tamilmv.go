@@ -16,12 +16,12 @@ import (
 	modules "main/modules"
 	"main/modules/db"
 
-	tg "github.com/amarnathcjd/gogram/telegram"
+	tg "github.com/xAmarnath/gogram/telegram"
 )
 
-const tamilMVBase = "https://www.1tamilmv.ing"
+const tamilMVBase = "https://www.1tamilmv.style"
 
-const tamilMVFallback = "https://www.1tamilmv.fi"
+const tamilMVFallback = "https://www.1tamilmv.ing"
 
 var (
 	tamilMVHTTP      = &http.Client{Timeout: 20 * time.Second}
@@ -443,7 +443,7 @@ func tamilMVCallback(c *tg.CallbackQuery) error {
 }
 
 func registerTamilMVHandlers() {
-	modules.Client.On("cmd:tm", tamilMVHandler)
+	modules.OnCommand(modules.Client, "cmd:tm", tamilMVHandler)
 	modules.Client.On("callback:tm:", tamilMVCallback)
 }
 
@@ -550,10 +550,10 @@ func tamilMVAlertWorker() {
 	}
 }
 func registerTamilMVAlertHandlers() {
-	modules.Client.On("cmd:tmalert", tamilMVAlertCreate)
-	modules.Client.On("cmd:tmalerts", tamilMVAlertList)
-	modules.Client.On("cmd:tmalertoff", tamilMVAlertDelete)
-	modules.Client.On("cmd:tmsettings", tamilMVSettings)
+	modules.OnCommand(modules.Client, "cmd:tmalert", tamilMVAlertCreate)
+	modules.OnCommand(modules.Client, "cmd:tmalerts", tamilMVAlertList)
+	modules.OnCommand(modules.Client, "cmd:tmalertoff", tamilMVAlertDelete)
+	modules.OnCommand(modules.Client, "cmd:tmsettings", tamilMVSettings)
 	go tamilMVAlertWorker()
 }
 func init() {

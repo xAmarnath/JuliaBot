@@ -7,8 +7,11 @@ import (
 	"fmt"
 	"html"
 	"io"
+	"main/internal/imdb/scraper"
 	"net/http"
 	"net/url"
+	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -16,8 +19,9 @@ import (
 	modules "main/modules"
 	"main/modules/db"
 
-	tg "github.com/amarnathcjd/gogram/telegram"
-	"go.etcd.io/bbolt"
+	tg "github.com/xAmarnath/gogram/telegram"
+	"github.com/patrickmn/go-cache"
+	"main/internal/mongostore"
 )
 
 func Gban(m *tg.NewMessage) error {
@@ -60,7 +64,7 @@ func Ungban(m *tg.NewMessage) error {
 }
 
 func NightModeHandler(m *tg.NewMessage) error {
-	if !modules.IsUserAdmin(m.Client, m.SenderID(), m.ChatID(), "change_info") {
+	if !modules.IsUserAdmin(m.Client, m.SenderID(), m.ChannelID(), "change_info") {
 		m.Reply("You need Change Info rights to use this command")
 		return nil
 	}
@@ -226,7 +230,7 @@ func TranslateHandler(m *tg.NewMessage) error {
 		m.Reply("Translation failed")
 		return nil
 	}
-	if replaceMode && modules.IsUserAdmin(m.Client, m.SenderID(), m.ChatID(), "delete") {
+	if replaceMode && modules.IsUserAdmin(m.Client, m.SenderID(), m.ChannelID(), "delete") {
 		r.Delete()
 		m.Delete()
 		m.Respond(fmt.Sprintf("<b>Translated from %s:</b>\n%s", src, translated))
@@ -266,7 +270,7 @@ func autotrLoad(chatID int64) *autotrConfig {
 	if err != nil || database == nil {
 		return cfg
 	}
-	_ = database.View(func(tx *bbolt.Tx) error {
+	_ = database.View(func(tx *mongostore.Tx) error {
 		b := tx.Bucket(autotrBucket)
 		if b == nil {
 			return nil
@@ -302,7 +306,7 @@ func autotrSave(chatID int64, cfg *autotrConfig) error {
 	if err != nil {
 		return err
 	}
-	err = database.Update(func(tx *bbolt.Tx) error {
+	err = database.Update(func(tx *mongostore.Tx) error {
 		b, err := tx.CreateBucketIfNotExists(autotrBucket)
 		if err != nil {
 			return err
@@ -322,7 +326,7 @@ func AutoTrHandler(m *tg.NewMessage) error {
 		m.Reply("<b>Auto-translate works in groups only.</b>")
 		return nil
 	}
-	if !modules.IsUserAdmin(m.Client, m.SenderID(), m.ChatID(), "") {
+	if !modules.IsUserAdmin(m.Client, m.SenderID(), m.ChannelID(), "") {
 		return nil
 	}
 	args := strings.TrimSpace(m.Args())
@@ -557,21 +561,425 @@ func WeatherHandler(m *tg.NewMessage) error {
 
 func registerMiscHandlers() {
 	c := modules.Client
-	c.On("cmd:help", modules.HelpHandle)
-	c.On("cmd:nightmode", NightModeHandler)
-	c.On("cmd:tempnote", SaveTempNoteHandler)
+	modules.OnCommand(c, "cmd:imdb", IMDbHandler)
+	c.On("callback:imdb:", IMDbCallback)
+	modules.OnCommand(c, "cmd:help", modules.HelpHandle)
+	modules.OnCommand(c, "cmd:nightmode", NightModeHandler)
+	modules.OnCommand(c, "cmd:tempnote", SaveTempNoteHandler)
 	c.On("callback:verify_op_", modules.AdminVerifyCallback)
 	c.On("callback:help_back", modules.HelpBackCallback)
-	c.On("cmd:gban", Gban, tg.CustomFilter(modules.FilterOwner))
-	c.On("cmd:ungban", Ungban, tg.CustomFilter(modules.FilterOwner))
-	c.On("cmd:tr", TranslateHandler)
-	c.On("cmd:langs", LangsHandler)
-	c.On("cmd:detect", DetectHandler)
-	c.On("cmd:autotr", AutoTrHandler)
+	modules.OnCommand(c, "cmd:gban", Gban, tg.CustomFilter(modules.FilterOwner))
+	modules.OnCommand(c, "cmd:ungban", Ungban, tg.CustomFilter(modules.FilterOwner))
+	modules.OnCommand(c, "cmd:tr", TranslateHandler)
+	modules.OnCommand(c, "cmd:langs", LangsHandler)
+	modules.OnCommand(c, "cmd:detect", DetectHandler)
+	modules.OnCommand(c, "cmd:autotr", AutoTrHandler)
 	c.On(tg.OnNewMessage, AutoTrWatcher)
-	c.On("cmd:weather", WeatherHandler)
+	modules.OnCommand(c, "cmd:weather", WeatherHandler)
 }
 
 func init() {
 	modules.QueueHandlerRegistration(registerMiscHandlers)
+	modules.Mods.AddModule("IMDb", "<code>/imdb &lt;title, ttID or IMDb URL&gt;</code> — search IMDb and view title details.")
+}
+
+var imdbState struct {
+	once   sync.Once
+	client *scraper.Scraper
+	err    error
+}
+
+var imdbGate = make(chan struct{}, 2)
+var imdbSearches = cache.New(time.Hour, 10*time.Minute)
+
+func imdbSearchKey(m *tg.NewMessage) string { return fmt.Sprintf("%d:%d", m.ChatID(), m.ID) }
+
+var imdbIDPattern = regexp.MustCompile(`^tt[0-9]{7,12}$`)
+var imdbURLPattern = regexp.MustCompile(`^(?:https?://)?(?:www\.)?imdb\.com/title/(tt[0-9]{7,12})(?:/|\?|$)`)
+
+func imdbClip(s string, n int) string {
+	r := []rune(strings.TrimSpace(s))
+	if len(r) > n {
+		return string(r[:n]) + "…"
+	}
+	return string(r)
+}
+
+func imdbTitleID(query string) string {
+	if imdbIDPattern.MatchString(query) {
+		return query
+	}
+	if m := imdbURLPattern.FindStringSubmatch(query); m != nil {
+		return m[1]
+	}
+	return ""
+}
+
+func imdbClient(ctx context.Context) (*scraper.Scraper, func(), error) {
+	select {
+	case imdbGate <- struct{}{}:
+	case <-ctx.Done():
+		return nil, nil, ctx.Err()
+	}
+	release := func() { <-imdbGate }
+	imdbState.once.Do(func() { imdbState.client, imdbState.err = scraper.New() })
+	if imdbState.err != nil {
+		release()
+		return nil, nil, imdbState.err
+	}
+	return imdbState.client, release, nil
+}
+
+func IMDbHandler(m *tg.NewMessage) error {
+	query := strings.TrimSpace(m.Args())
+	if query == "" {
+		_, err := m.Reply("Usage: <code>/imdb movie name</code>, <code>/imdb tt0133093</code>, or an IMDb title URL.")
+		return err
+	}
+	if len([]rune(query)) > 200 {
+		_, err := m.Reply("Please use a shorter title or an IMDb ID.")
+		return err
+	}
+	status, err := m.Reply("Searching IMDb…")
+	if err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	c, release, err := imdbClient(ctx)
+	if err != nil {
+		_, err = status.Edit("IMDb is unavailable. Please try again shortly.")
+		return err
+	}
+	defer release()
+	if id := imdbTitleID(query); id != "" {
+		page := imdbSearchPage{owner: m.SenderID(), titleID: id, busy: &sync.Mutex{}}
+		if err := showIMDbTitle(ctx, c, status, page); err != nil {
+			m.Client.Log.Warn("IMDb details failed: %v", err)
+			_, err = status.Edit("IMDb details are temporarily unavailable. Please try again shortly.")
+			return err
+		}
+		return nil
+	}
+	results, err := c.FastSearch(ctx, query, 6)
+	if err != nil {
+		m.Client.Log.Warn("IMDb search failed: %v", err)
+		_, err = status.Edit("IMDb search failed. Please try again shortly.")
+		return err
+	}
+	if len(results) == 0 {
+		_, err = status.Edit("No IMDb titles found for <code>" + html.EscapeString(query) + "</code>.")
+		return err
+	}
+	var out strings.Builder
+	fmt.Fprintf(&out, "<b>IMDb results for %s</b>\n\n", html.EscapeString(query))
+	keyboard := tg.NewKeyboard()
+	for i, result := range results {
+		if !imdbIDPattern.MatchString(result.IMDbID) {
+			continue
+		}
+		label := imdbClip(result.Title, 70)
+		if result.Year != nil {
+			label += fmt.Sprintf(" (%d)", *result.Year)
+		}
+		fmt.Fprintf(&out, "%d. <b>%s</b>", i+1, html.EscapeString(label))
+		if result.TypeText != "" {
+			fmt.Fprintf(&out, " — %s", html.EscapeString(result.TypeText))
+		}
+		out.WriteString("\n")
+		keyboard.AddRow(tg.Button.Data(imdbClip(label, 55), fmt.Sprintf("imdb:%d:%s", m.SenderID(), result.IMDbID)))
+	}
+	page := imdbSearchPage{owner: m.SenderID(), text: out.String(), keyboard: keyboard.Build(), busy: &sync.Mutex{}}
+	storeIMDbPage(status, page)
+	_, err = status.Edit(page.text, &tg.SendOptions{ParseMode: tg.HTML, ReplyMarkup: page.keyboard})
+	return err
+}
+
+func storeIMDbPage(status *tg.NewMessage, page imdbSearchPage) {
+	if imdbSearches.ItemCount() >= 1000 {
+		imdbSearches.DeleteExpired()
+		if imdbSearches.ItemCount() >= 1000 {
+			for key := range imdbSearches.Items() {
+				imdbSearches.Delete(key)
+				break
+			}
+		}
+	}
+	imdbSearches.SetDefault(imdbSearchKey(status), page)
+}
+
+func IMDbCallback(q *tg.CallbackQuery) error {
+	parts := strings.Split(q.DataString(), ":")
+	if len(parts) != 3 || (parts[2] != "back" && parts[2] != "prevtitle" && parts[2] != "similar" && parts[2] != "collapse" && !strings.HasPrefix(parts[2], "page") && !imdbIDPattern.MatchString(parts[2])) {
+		_, err := q.Answer("Invalid IMDb selection.")
+		return err
+	}
+	owner, err := strconv.ParseInt(parts[1], 10, 64)
+	if err != nil || owner != q.SenderID {
+		_, err = q.Answer("Run /imdb to search for your own title.")
+		return err
+	}
+	status, err := q.GetMessage()
+	if err != nil {
+		return err
+	}
+	cached, ok := imdbSearches.Get(imdbSearchKey(status))
+	if !ok || cached.(imdbSearchPage).owner != owner {
+		_, err = q.Answer("Search expired. Run /imdb again.")
+		return err
+	}
+	page := cached.(imdbSearchPage)
+	if !page.busy.TryLock() {
+		_, err = q.Answer("Still loading your previous selection.")
+		return err
+	}
+	defer page.busy.Unlock()
+	// Another callback may have completed between the cache read and TryLock.
+	if latest, found := imdbSearches.Get(imdbSearchKey(status)); found {
+		page = latest.(imdbSearchPage)
+	}
+	if parts[2] == "similar" || parts[2] == "collapse" {
+		if len(page.details) == 0 {
+			_, err = q.Answer("Choose a title first.")
+			return err
+		}
+		page.expanded = parts[2] == "similar"
+		_, _ = q.Answer("")
+		err = editIMDbCard(context.Background(), status, page.details[page.detailIndex], nil, imdbDetailsKeyboard(page, page.detailIndex))
+		if err == nil {
+			storeIMDbPage(status, page)
+		}
+		return err
+	}
+	if strings.HasPrefix(parts[2], "page") {
+		index, parseErr := strconv.Atoi(strings.TrimPrefix(parts[2], "page"))
+		if parseErr != nil || index < 0 || index >= len(page.details) {
+			_, err = q.Answer("Details expired. Run /imdb again.")
+			return err
+		}
+		_, _ = q.Answer(fmt.Sprintf("Details %d/%d", index+1, len(page.details)))
+		err = editIMDbCard(context.Background(), status, page.details[index], nil, imdbDetailsKeyboard(page, index))
+		if err == nil {
+			page.detailIndex = index
+			storeIMDbPage(status, page)
+		}
+		return err
+	}
+	if parts[2] == "back" {
+		if page.keyboard == nil {
+			_, err = q.Answer("No search results to return to.")
+			return err
+		}
+		_, _ = q.Answer("Search results")
+		text := page.text
+		if status.Photo() != nil {
+			text = "<b>IMDb search results</b>\nChoose another title below."
+		}
+		_, err = status.Edit(text, &tg.SendOptions{ParseMode: tg.HTML, ReplyMarkup: page.keyboard})
+		if err == nil {
+			storeIMDbPage(status, imdbResultsPage(page))
+		}
+		return err
+	}
+	page, err = imdbNavigateTitle(page, parts[2])
+	if err != nil {
+		_, err = q.Answer(err.Error())
+		return err
+	}
+	_, _ = q.Answer("Loading IMDb details…")
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	c, release, err := imdbClient(ctx)
+	if err != nil {
+		return err
+	}
+	defer release()
+	if err = showIMDbTitle(ctx, c, status, page); err != nil {
+		status.Client.Log.Warn("IMDb navigation failed: %v", err)
+		_, _ = q.Answer("Couldn't load that title. Please try again.")
+	}
+	return err
+}
+
+func formatIMDbDetails(d *scraper.Details) string {
+	var out strings.Builder
+	title := d.IMDbID
+	if d.Title != nil {
+		title = *d.Title
+	}
+	fmt.Fprintf(&out, "<b>%s</b>", html.EscapeString(imdbClip(title, 120)))
+	if d.Year != nil {
+		fmt.Fprintf(&out, " (%d)", *d.Year)
+	}
+	out.WriteString("\n\n<b>Overview</b>")
+	if d.Type != nil {
+		fmt.Fprintf(&out, "\n<b>Type:</b> %s", html.EscapeString(imdbClip(*d.Type, 40)))
+	}
+	if d.RuntimeMinutes != nil {
+		fmt.Fprintf(&out, "\n<b>Runtime:</b> %d min", *d.RuntimeMinutes)
+	}
+	if d.Certificate != nil {
+		fmt.Fprintf(&out, "\n<b>Certificate:</b> %s", html.EscapeString(imdbClip(*d.Certificate, 30)))
+	}
+	if d.ReleaseDate != nil {
+		fmt.Fprintf(&out, "\n<b>Release:</b> %s", html.EscapeString(imdbClip(*d.ReleaseDate, 40)))
+	}
+	if d.Rating != nil {
+		fmt.Fprintf(&out, "\n<b>IMDb:</b> %.1f/10", *d.Rating)
+	}
+	if d.VoteCount != nil {
+		fmt.Fprintf(&out, " (%d votes)", *d.VoteCount)
+	}
+	if len(d.Genres) > 0 {
+		fmt.Fprintf(&out, "\n<b>Genres:</b> %s", html.EscapeString(imdbClip(strings.Join(d.Genres, ", "), 90)))
+	}
+	if len(d.Languages) > 0 {
+		fmt.Fprintf(&out, "\n<b>Languages:</b> %s", html.EscapeString(imdbClip(strings.Join(d.Languages, ", "), 90)))
+	}
+	if len(d.Countries) > 0 {
+		fmt.Fprintf(&out, "\n<b>Countries:</b> %s", html.EscapeString(imdbClip(strings.Join(d.Countries, ", "), 90)))
+	}
+	if len(d.Directors)+len(d.Writers)+len(d.Stars) > 0 {
+		out.WriteString("\n\n<b>Cast and crew</b>")
+		for _, group := range []struct {
+			label  string
+			people []scraper.Person
+		}{{"Directors", d.Directors}, {"Writers", d.Writers}, {"Cast", d.Stars}} {
+			var names []string
+			for _, p := range group.people[:min(3, len(group.people))] {
+				names = append(names, p.Name)
+			}
+			if len(names) > 0 {
+				fmt.Fprintf(&out, "\n<b>%s:</b> %s", group.label, html.EscapeString(imdbClip(strings.Join(names, ", "), 120)))
+			}
+		}
+	}
+	if d.Plot != nil {
+		fmt.Fprintf(&out, "\n\n<b>Storyline</b>\n%s", html.EscapeString(imdbClip(*d.Plot, 500)))
+	}
+	fmt.Fprintf(&out, "\n\n<a href=\"https://www.imdb.com/title/%s/\">Open on IMDb</a>", d.IMDbID)
+	return out.String()
+}
+
+func showIMDbTitle(ctx context.Context, c *scraper.Scraper, status *tg.NewMessage, page imdbSearchPage) error {
+	id := page.titleID
+	d, err := c.GetTitleDetails(ctx, id)
+	if err != nil {
+		return err
+	}
+	if d == nil {
+		return fmt.Errorf("IMDb title not found: %s", id)
+	}
+	recs, recErr := c.GetRecommendations(ctx, id)
+	if recErr != nil {
+		status.Client.Log.Warn("IMDb recommendations unavailable: %v", recErr)
+	}
+	page.recommendations = imdbRecommendations(id, recs)
+	pages, err := imdbCaptionPages(formatIMDbDetails(d))
+	if err != nil {
+		return err
+	}
+	page.details = pages
+	page.detailIndex = min(page.detailIndex, len(pages)-1)
+	artwork, artErr := loadIMDbArtwork(ctx, c, d)
+	if artErr != nil {
+		status.Client.Log.Warn("IMDb artwork unavailable for %s: %v", id, artErr)
+		if status.Photo() != nil {
+			// Keep the previous title intact instead of pairing its poster
+			// with details for a different title.
+			return artErr
+		}
+	}
+	keyboard := imdbDetailsKeyboard(page, page.detailIndex)
+	err = editIMDbCard(ctx, status, pages[page.detailIndex], artwork, keyboard)
+	if err != nil && len(artwork) > 0 && status.Photo() == nil {
+		status.Client.Log.Warn("IMDb media edit failed for %s: %v", id, err)
+		err = editIMDbCard(ctx, status, pages[page.detailIndex], nil, keyboard)
+	}
+	if err == nil {
+		storeIMDbPage(status, page)
+	}
+	return err
+}
+
+const (
+	browserUA       = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+	extDefaultLimit = 10 << 20
+	extTimeout      = 30 * time.Second
+)
+
+// extHTTP keeps the default transport so the extra root CAs from modules/rootcas.go apply.
+var extHTTP = &http.Client{Timeout: 2 * time.Minute}
+
+type httpStatusError struct {
+	Code int
+	Body string
+}
+
+func (e *httpStatusError) Error() string {
+	if e.Body != "" {
+		return fmt.Sprintf("HTTP %d: %s", e.Code, e.Body)
+	}
+	return fmt.Sprintf("HTTP %d", e.Code)
+}
+
+func isHTTPStatus(err error, code int) bool {
+	se, ok := err.(*httpStatusError)
+	return ok && se.Code == code
+}
+
+// extFetch performs a request with a browser UA (some hosts 403 Go's default) and a bounded body.
+// hdr is key/value pairs; limit <= 0 uses extDefaultLimit.
+func extFetch(ctx context.Context, method, target string, body io.Reader, limit int64, hdr ...string) ([]byte, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if _, ok := ctx.Deadline(); !ok {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, extTimeout)
+		defer cancel()
+	}
+	req, err := http.NewRequestWithContext(ctx, method, target, body)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("User-Agent", browserUA)
+	for i := 0; i+1 < len(hdr); i += 2 {
+		req.Header.Set(hdr[i], hdr[i+1])
+	}
+	resp, err := extHTTP.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if limit <= 0 {
+		limit = extDefaultLimit
+	}
+	data, err := io.ReadAll(io.LimitReader(resp.Body, limit+1))
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		snippet := strings.TrimSpace(string(data))
+		if len(snippet) > 120 || strings.HasPrefix(snippet, "<") {
+			snippet = ""
+		}
+		return nil, &httpStatusError{Code: resp.StatusCode, Body: snippet}
+	}
+	if int64(len(data)) > limit {
+		return nil, fmt.Errorf("response exceeds %d bytes", limit)
+	}
+	return data, nil
+}
+
+func extGet(ctx context.Context, target string, hdr ...string) ([]byte, error) {
+	return extFetch(ctx, http.MethodGet, target, nil, 0, hdr...)
+}
+
+func extGetJSON(ctx context.Context, target string, out any, hdr ...string) error {
+	data, err := extFetch(ctx, http.MethodGet, target, nil, 0, append([]string{"Accept", "application/json"}, hdr...)...)
+	if err != nil {
+		return err
+	}
+	return json.Unmarshal(data, out)
 }

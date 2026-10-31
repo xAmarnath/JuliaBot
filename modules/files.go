@@ -2,20 +2,60 @@ package modules
 
 import (
 	"context"
+	"errors"
+	"fmt"
+	"html"
+	"os"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
-	tg "github.com/amarnathcjd/gogram/telegram"
+	tg "github.com/xAmarnath/gogram/telegram"
 )
 
+type fileTransferKey struct {
+	chat    int64
+	message int32
+}
+
+type activeFileTransfer struct {
+	ctx    context.Context
+	cancel context.CancelFunc
+	owner  int64
+}
+
 var (
-	downloadCancels = make(map[int32]context.CancelFunc)
+	downloadCancels = make(map[fileTransferKey]activeFileTransfer)
+	downloadPaths   = make(map[string]bool)
 	cancelMutex     sync.RWMutex
 )
 
+func TrackFileTransfer(m *tg.NewMessage, owner int64) (context.Context, func()) {
+	return trackFileTransfer(context.Background(), m, owner)
+}
+
+// TrackUserFileTransfer opts explicit download/upload commands into the relay.
+func TrackUserFileTransfer(m *tg.NewMessage, owner int64) (context.Context, func()) {
+	return trackFileTransfer(WithTransferAccount(context.Background()), m, owner)
+}
+
+// UpdateFileTransferStatus preserves the cancel control during long jobs.
+func UpdateFileTransferStatus(m *tg.NewMessage, text string) {
+	_, _ = m.Edit(text, &tg.SendOptions{ParseMode: tg.HTML, ReplyMarkup: transferCancelKeyboard(m.ID)})
+}
+
+func trackFileTransfer(parent context.Context, m *tg.NewMessage, owner int64) (context.Context, func()) {
+	ctx, cancel := context.WithCancel(parent)
+	key := fileTransferKey{m.ChatID(), m.ID}
+	cancelMutex.Lock()
+	downloadCancels[key] = activeFileTransfer{ctx, cancel, owner}
+	cancelMutex.Unlock()
+	_, _ = m.Edit(m.MessageText(), &tg.SendOptions{ParseMode: tg.HTML, ReplyMarkup: transferCancelKeyboard(m.ID)})
+	return ctx, func() { cancel(); cancelMutex.Lock(); delete(downloadCancels, key); cancelMutex.Unlock() }
+}
 func SendFileByIDHandle(m *tg.NewMessage) error {
 	fileId := m.Args()
 	if fileId == "" {
@@ -29,7 +69,7 @@ func SendFileByIDHandle(m *tg.NewMessage) error {
 		return nil
 	}
 
-	m.ReplyMedia(file)
+	TransferReplyMedia(m, file)
 	return nil
 }
 
@@ -54,191 +94,164 @@ func GetFileIDHandle(m *tg.NewMessage) error {
 	return nil
 }
 
-const defaultTransferSpeedCap int64 = 20 * 1024 * 1024
-
-func UploadHandle(m *tg.NewMessage) error {
-	filename := m.Args()
-	if filename == "" {
-		m.Reply("No filename provided")
-		return nil
+func parseUploadArguments(raw string) (string, bool, bool) {
+	var parts []string
+	spoiler, document := false, false
+	for _, part := range strings.Fields(raw) {
+		switch part {
+		case "-s":
+			spoiler = true
+		case "--doc", "-doc":
+			document = true
+		default:
+			parts = append(parts, part)
+		}
 	}
+	return strings.Trim(strings.Join(parts, " "), "\""), spoiler, document
+}
 
-	spoiler := false
-	if strings.Contains(filename, "-s") {
-		spoiler = true
-		filename = strings.ReplaceAll(filename, "-s", "")
+var downloadLink = regexp.MustCompile(`^(?:https?://)?(?:www\.)?t\.me/(?:(c)/)?([A-Za-z0-9_]+)/([0-9]+)(?:\?[^\s]*)?$`)
+
+func ResolveDownloadSource(m *tg.NewMessage) (*tg.NewMessage, string, error) {
+	if m.IsReply() {
+		r, err := m.GetReplyMessage()
+		return r, strings.TrimSpace(m.Args()), err
 	}
-
-	speedCap := defaultTransferSpeedCap
-	filename = strings.TrimSpace(filename)
-
-	msg, _ := m.Reply("Uploading...")
-	uploadStartTimestamp := time.Now()
-
-	if _, err := m.RespondMedia(filename, &tg.MediaOptions{
-		ForceDocument: strings.Contains(filename, "--doc"),
-		Spoiler:       spoiler,
-		Upload: &tg.UploadOptions{
-			ProgressManager: tg.NewProgressManager(5).SetMessage(msg),
-			MaxBytesPerSec:  speedCap,
-		},
-	}); err != nil {
-		msg.Edit("Error: " + err.Error())
-		return nil
-	} else {
-		msg.Edit("Uploaded <code>" + filename + "</code> in <code>" + time.Since(uploadStartTimestamp).String() + "</code>")
+	match := downloadLink.FindStringSubmatch(strings.TrimSpace(m.Args()))
+	if match == nil {
+		return nil, "", errors.New("reply to a file or provide a valid t.me message link")
 	}
-
-	return nil
+	id, err := strconv.ParseInt(match[3], 10, 32)
+	if err != nil || id <= 0 {
+		return nil, "", errors.New("invalid message ID")
+	}
+	var peer any = match[2]
+	if match[1] == "c" {
+		chat, err := strconv.ParseInt(match[2], 10, 64)
+		if err != nil || chat <= 0 {
+			return nil, "", errors.New("invalid channel ID")
+		}
+		peer = chat
+	}
+	r, err := m.Client.GetMessageByID(peer, int32(id))
+	return r, "", err
 }
 
 func DownloadHandle(m *tg.NewMessage) error {
-	if !m.IsReply() && m.Args() == "" {
-		m.Reply("Reply to a file to download it")
-		return nil
+	r, name, err := ResolveDownloadSource(m)
+	if err != nil {
+		_, err = m.Reply(html.EscapeString(err.Error()))
+		return err
 	}
-
-	fn := m.Args()
-
-	var r, msg *tg.NewMessage
-	if m.IsReply() {
-		reply, err := m.GetReplyMessage()
-		if err != nil {
-			m.Reply("Error: " + err.Error())
-			return nil
-		}
-
-		r = reply
-		var rerr error
-		msg, rerr = m.Reply("Downloading...")
-		if rerr != nil || msg == nil {
-			return nil
-		}
-	} else {
-		reg := regexp.MustCompile(`t.me/(\w+)/(\d+)`)
-		match := reg.FindStringSubmatch(m.Args())
-		if len(match) != 3 || match[1] == "c" {
-			// https://t.me/c/2183493392/8
-			reg = regexp.MustCompile(`t.me/c/(\d+)/(\d+)`)
-			match = reg.FindStringSubmatch(m.Args())
-			if len(match) != 3 {
-				m.Reply("Invalid link")
-				return nil
-			}
-
-			id, err := strconv.Atoi(match[2])
-			if err != nil {
-				m.Reply("Invalid link: " + err.Error())
-				return nil
-			}
-
-			chatID, err := strconv.Atoi(match[1])
-			if err != nil {
-				m.Reply("Invalid link: " + err.Error())
-				return nil
-			}
-
-			msgX, err := m.Client.GetMessageByID(chatID, int32(id))
-			if err != nil {
-				m.Reply("Error: " + err.Error())
-				return nil
-			}
-			r = msgX
-			if r == nil || r.File == nil {
-				m.Reply("Not a file.")
-				return nil
-			}
-			fn = r.File.Name
-			msg, err = m.Reply("Downloading... (from c " + strconv.Itoa(id) + ")")
-			if err != nil || msg == nil {
-				return nil
-			}
-		} else {
-			username := match[1]
-			id, err := strconv.Atoi(match[2])
-			if err != nil {
-				m.Reply("Invalid link")
-				return nil
-			}
-
-			msgX, err := m.Client.GetMessageByID(username, int32(id))
-			if err != nil {
-				m.Reply("Error: " + err.Error())
-				return nil
-			}
-			r = msgX
-			if r == nil || r.File == nil {
-				m.Reply("Not a file.")
-				return nil
-			}
-			fn = r.File.Name
-			msg, err = m.Reply("Downloading... (from " + username + " " + strconv.Itoa(id) + ")")
-			if err != nil || msg == nil {
-				return nil
-			}
-		}
+	if r == nil || r.File == nil {
+		_, err = m.Reply("Not a file.")
+		return err
 	}
-
-	uploadStartTimestamp := time.Now()
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	if name == "" {
+		name = r.File.Name
+	}
+	name = filepath.Base(name)
+	if name == "." || name == string(filepath.Separator) || name == "" {
+		_, err = m.Reply("Invalid filename.")
+		return err
+	}
+	if err = os.MkdirAll("downloads", 0755); err != nil {
+		return err
+	}
+	path := filepath.Join("downloads", name)
 	cancelMutex.Lock()
-	downloadCancels[msg.ID] = cancel
-	cancelMutex.Unlock()
-
-	defer func() {
-		cancelMutex.Lock()
-		delete(downloadCancels, msg.ID)
-		cancelMutex.Unlock()
-	}()
-
-	if fi, err := r.Download(&tg.DownloadOptions{
-		ProgressManager: tg.NewProgressManager(5).SetMessage(msg),
-		FileName:        fn,
-		Ctx:             ctx,
-		Delay:           150,
-		MaxBytesPerSec:  defaultTransferSpeedCap,
-	}); err != nil {
-		if err == context.Canceled {
-			msg.Edit("Download cancelled.")
-		} else {
-			msg.Edit("Error: " + err.Error())
-		}
-		return nil
-	} else {
-		msg.Edit("Downloaded <code>" + fi + "</code> in <code>" + time.Since(uploadStartTimestamp).String() + "</code>")
+	busy := downloadPaths[path]
+	if !busy {
+		downloadPaths[path] = true
 	}
-
-	return nil
+	cancelMutex.Unlock()
+	if busy {
+		_, err = m.Reply("This file is already being downloaded.")
+		return err
+	}
+	defer func() { cancelMutex.Lock(); delete(downloadPaths, path); cancelMutex.Unlock() }()
+	if _, err = os.Stat(path); err == nil {
+		_, err = m.Reply("File already exists: " + transferCaption(path))
+		return err
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+	status, err := m.Reply("Downloading...")
+	if err != nil {
+		return err
+	}
+	ctx, done := TrackUserFileTransfer(status, m.SenderID())
+	defer done()
+	start := time.Now()
+	opt := &tg.DownloadOptions{Ctx: ctx, FileName: path, ProgressManager: TransferProgress(status, TransferMediaDC(r.Media()))}
+	file, err := TransferDownload(r, opt)
+	if err != nil {
+		_ = os.Remove(path)
+		message := "Download failed: " + html.EscapeString(err.Error())
+		if errors.Is(err, context.Canceled) {
+			message = "Download cancelled."
+		}
+		_, editErr := status.Edit(message)
+		return editErr
+	}
+	_, err = status.Edit(fmt.Sprintf("Downloaded %s in <code>%s</code>", transferCaption(file), time.Since(start).Round(time.Millisecond)))
+	return err
 }
 
 func CancelDownloadHandle(m *tg.NewMessage) error {
 	if !m.IsReply() {
-		m.Reply("Reply to a download message to cancel it")
-		return nil
+		_, err := m.Reply("Reply to an upload or download progress message to cancel it.")
+		return err
 	}
-
 	reply, err := m.GetReplyMessage()
 	if err != nil {
-		m.Reply("Error: " + err.Error())
-		return nil
+		return err
 	}
-
+	if reply == nil {
+		return errors.New("missing transfer message")
+	}
 	cancelMutex.RLock()
-	cancel, exists := downloadCancels[reply.ID]
+	active, exists := downloadCancels[fileTransferKey{m.ChatID(), reply.ID}]
 	cancelMutex.RUnlock()
-
 	if !exists {
-		m.Reply("No active download found for this message")
-		return nil
+		_, err = m.Reply("No active transfer found for this message.")
+		return err
 	}
-
-	cancel()
-	m.Reply("Download cancelled!")
-	return nil
+	if active.owner != m.SenderID() && m.SenderID() != OwnerId {
+		_, err = m.Reply("You cannot cancel this transfer.")
+		return err
+	}
+	active.cancel()
+	_, err = m.Reply("Cancellation requested.")
+	return err
 }
 
+func transferCancelKeyboard(id int32) *tg.ReplyInlineMarkup {
+	return tg.NewKeyboard().AddRow(tg.Button.Data("Cancel", fmt.Sprintf("filecancel:%d", id))).Build()
+}
+
+func CancelTransferCallback(q *tg.CallbackQuery) error {
+	id, err := strconv.ParseInt(strings.TrimPrefix(q.DataString(), "filecancel:"), 10, 32)
+	if err != nil || int32(id) != q.MessageID {
+		_, err = q.Answer("Invalid transfer.")
+		return err
+	}
+	cancelMutex.RLock()
+	active, exists := downloadCancels[fileTransferKey{q.ChatID, q.MessageID}]
+	cancelMutex.RUnlock()
+	if !exists {
+		_, err = q.Answer("This transfer has already finished.")
+		return err
+	}
+	if q.SenderID != active.owner && q.SenderID != OwnerId {
+		_, err = q.Answer("Only the sender or bot owner can cancel this transfer.")
+		return err
+	}
+	active.cancel()
+	_, _ = q.Answer("Cancelling…")
+	_, err = q.Edit("Cancelling…", &tg.SendOptions{})
+	return err
+}
 func FileInfoHandle(m *tg.NewMessage) error {
 	if !m.IsReply() {
 		m.Reply("Reply to a file to get its info")
@@ -339,18 +352,21 @@ func init() {
 
 <code>/file &lt;fileId&gt;</code> - Send a file by its fileId
 <code>/fid</code> - Reply to a file to get its fileId
-<code>/ul &lt;filename&gt; [-s]</code> - Upload a file
-<code>/dl</code> - Reply to a file to download it
-<code>/cancel</code> - Reply to a download message to cancel it`)
+<code>/ul &lt;filename&gt; [-s] [--doc] [--split 1900MiB]</code> - Upload or split a file
+<code>/ldl [t.me link]</code> - Download a file
+<code>/ariadl &lt;HTTP URL or magnet&gt;</code> - Download with aria2
+<code>/cancel</code> - Reply to a transfer message to cancel it`)
 }
 
 func registerFileHandlers() {
 	c := Client
-	c.On("cmd:file", SendFileByIDHandle)
-	c.On("cmd:fid", GetFileIDHandle)
-	c.On("cmd:ul", UploadHandle, tg.CustomFilter(FilterOwnerNoReply))
-	c.On("cmd:ldl", DownloadHandle, tg.CustomFilter(FilterOwnerNoReply))
-	c.On("cmd:cancel", CancelDownloadHandle, tg.CustomFilter(FilterOwnerNoReply))
-	c.On("cmd:fileinfo", FileInfoHandle)
-	c.On("cmd:finfo", FileInfoHandle)
+	OnCommand(c, "cmd:file", SendFileByIDHandle, tg.CustomFilter(FilterTransferUser))
+	OnCommand(c, "cmd:fid", GetFileIDHandle, tg.CustomFilter(FilterTransferUser))
+	OnCommand(c, "cmd:ul", UploadHandle, tg.CustomFilter(FilterTransferUser))
+	OnCommand(c, "cmd:ldl", DownloadHandle, tg.CustomFilter(FilterTransferUser))
+	OnCommand(c, "cmd:cancel", CancelDownloadHandle, tg.CustomFilter(FilterTransferUser))
+	c.On("callback:filecancel:", CancelTransferCallback)
+	OnCommand(c, "cmd:ariadl", AriaDownloadHandle, tg.CustomFilter(FilterTransferUser))
+	OnCommand(c, "cmd:fileinfo", FileInfoHandle, tg.CustomFilter(FilterTransferUser))
+	OnCommand(c, "cmd:finfo", FileInfoHandle, tg.CustomFilter(FilterTransferUser))
 }

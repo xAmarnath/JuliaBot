@@ -9,7 +9,7 @@ import (
 	"strings"
 	"time"
 
-	tg "github.com/amarnathcjd/gogram/telegram"
+	tg "github.com/xAmarnath/gogram/telegram"
 	modules "main/modules"
 )
 
@@ -37,25 +37,26 @@ func MusicInfoHandler(m *tg.NewMessage) error {
 		m.Reply("Usage: <code>/musicinfo &lt;song name&gt;</code>")
 		return nil
 	}
+	status := modules.NewStatus(m, "Searching iTunes…")
 	client := &http.Client{Timeout: 30 * time.Second}
 	endpoint := "https://itunes.apple.com/search?term=" + url.QueryEscape(query) + "&entity=song&limit=1"
 	resp, err := client.Get(endpoint)
 	if err != nil {
-		m.Reply("Couldn't reach iTunes: " + html.EscapeString(err.Error()))
+		status.Edit("Couldn't reach iTunes: " + html.EscapeString(err.Error()))
 		return nil
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != 200 {
-		m.Reply(fmt.Sprintf("iTunes API returned HTTP %d", resp.StatusCode))
+		status.Edit(fmt.Sprintf("iTunes API returned HTTP %d", resp.StatusCode))
 		return nil
 	}
 	var data iTunesSearchResponse
 	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
-		m.Reply("Failed to parse iTunes response.")
+		status.Edit("Failed to parse iTunes response.")
 		return nil
 	}
 	if data.ResultCount == 0 || len(data.Results) == 0 {
-		m.Reply("No song found for <b>" + html.EscapeString(query) + "</b>")
+		status.Edit("No song found for <b>" + html.EscapeString(query) + "</b>")
 		return nil
 	}
 	r := data.Results[0]
@@ -116,16 +117,17 @@ func MusicInfoHandler(m *tg.NewMessage) error {
 		artwork = strings.Replace(artwork, "100x100bb.jpg", "600x600bb.jpg", 1)
 	}
 	if artwork != "" {
-		if _, err := m.ReplyMedia(artwork, &tg.MediaOptions{Caption: caption}); err == nil {
+		status.Done()
+		if _, err := modules.TransferReplyMedia(m, artwork, &tg.MediaOptions{Caption: caption}); err == nil {
 			return nil
 		}
 	}
-	m.Reply(caption)
+	status.Edit(caption)
 	return nil
 }
 
 func init() { modules.QueueHandlerRegistration(registerAudioMetaHandlers) }
 func registerAudioMetaHandlers() {
 	c := modules.Client
-	c.On("cmd:musicinfo", MusicInfoHandler)
+	modules.OnCommand(c, "cmd:musicinfo", MusicInfoHandler)
 }

@@ -6,18 +6,21 @@ import (
 	"fmt"
 	"html"
 	"main/modules/db"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
-	tg "github.com/amarnathcjd/gogram/telegram"
-	bolt "go.etcd.io/bbolt"
+	tg "github.com/xAmarnath/gogram/telegram"
+	"main/internal/mongostore"
 	modules "main/modules"
 )
 
 const snipeBucket = "snipe_cfg"
 const snipeRingSize = 20
+const snipeMsgCacheMax = 500
+const snipeCacheTTL = 12 * time.Hour
 
 type snipedMsg struct {
 	MessageID  int32
@@ -30,6 +33,7 @@ type snipedMsg struct {
 	OldText    string
 	NewText    string
 	IsEdit     bool
+	Channel    bool
 	Time       int64
 }
 
@@ -71,7 +75,7 @@ func loadSnipeCfg(chatID int64) *snipeCfg {
 	if err != nil || d == nil {
 		return cfg
 	}
-	_ = d.View(func(tx *bolt.Tx) error {
+	_ = d.View(func(tx *mongostore.Tx) error {
 		b := tx.Bucket([]byte(snipeBucket))
 		if b == nil {
 			return nil
@@ -96,7 +100,7 @@ func saveSnipeCfg(chatID int64, cfg *snipeCfg) error {
 	if err != nil || d == nil {
 		return fmt.Errorf("db unavailable")
 	}
-	err = d.Update(func(tx *bolt.Tx) error {
+	err = d.Update(func(tx *mongostore.Tx) error {
 		b, err := tx.CreateBucketIfNotExists([]byte(snipeBucket))
 		if err != nil {
 			return err
@@ -115,6 +119,17 @@ func saveSnipeCfg(chatID int64, cfg *snipeCfg) error {
 	snipeCache[chatID] = &cp
 	snipeCacheMu.Unlock()
 	return nil
+}
+
+func truncRunes(s string, n int) string {
+	if n <= 0 || len(s) <= n {
+		return s
+	}
+	r := []rune(s)
+	if len(r) <= n {
+		return s
+	}
+	return string(r[:n]) + "…"
 }
 
 func snipeAuthorName(m *tg.NewMessage) string {
@@ -151,6 +166,9 @@ func snipeCacheMessage(m *tg.NewMessage) {
 		Text:       m.Text(),
 		Time:       time.Now().Unix(),
 	}
+	if _, ok := m.Message.PeerID.(*tg.PeerChannel); ok {
+		entry.Channel = true
+	}
 
 	if m.IsMedia() && m.File != nil {
 		entry.FileID = m.File.FileID
@@ -160,22 +178,32 @@ func snipeCacheMessage(m *tg.NewMessage) {
 	}
 
 	snipeMsgCacheMu.Lock()
-	if _, ok := snipeMsgCache[chatID]; !ok {
-		snipeMsgCache[chatID] = make(map[int32]*snipedMsg)
+	cm, ok := snipeMsgCache[chatID]
+	if !ok {
+		cm = make(map[int32]*snipedMsg)
+		snipeMsgCache[chatID] = cm
 	}
-	snipeMsgCache[chatID][m.ID] = entry
-	if len(snipeMsgCache[chatID]) > 500 {
-		var oldestID int32
-		var oldestTime int64 = 1 << 62
-		for id, e := range snipeMsgCache[chatID] {
-			if e.Time < oldestTime {
-				oldestTime = e.Time
-				oldestID = id
-			}
-		}
-		delete(snipeMsgCache[chatID], oldestID)
+	cm[m.ID] = entry
+	// Evict in batches so the O(n) scan runs once per ~100 messages, not on every one.
+	if len(cm) > snipeMsgCacheMax+100 {
+		snipeEvictOldest(cm, snipeMsgCacheMax)
 	}
 	snipeMsgCacheMu.Unlock()
+}
+
+// snipeEvictOldest keeps the `keep` highest message IDs (IDs grow monotonically per chat).
+func snipeEvictOldest(cm map[int32]*snipedMsg, keep int) {
+	if len(cm) <= keep {
+		return
+	}
+	ids := make([]int32, 0, len(cm))
+	for id := range cm {
+		ids = append(ids, id)
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i] > ids[j] })
+	for _, id := range ids[keep:] {
+		delete(cm, id)
+	}
 }
 
 func snipeCacheGet(chatID int64, msgID int32) *snipedMsg {
@@ -246,22 +274,19 @@ func SnipeDeleteHandler(d *tg.DeleteMessage) error {
 		return nil
 	}
 
-	var chatID int64
-	if d.ChannelID != 0 {
-		chatID = -1_000_000_000_000 - d.ChannelID
-	}
+	// m.ChatID() keys the cache by the raw channel ID, which is what the update carries.
+	chatID := d.ChannelID
 
 	for _, msgID := range d.Messages {
 		var entry *snipedMsg
 		if chatID != 0 {
 			entry = snipeCacheGet(chatID, msgID)
-		}
-		if entry == nil {
+		} else {
+			// Basic-group message IDs are account-global, so scanning non-channel chats is unambiguous.
 			snipeMsgCacheMu.RLock()
-			for cid, m := range snipeMsgCache {
-				if e, ok := m[msgID]; ok {
+			for _, m := range snipeMsgCache {
+				if e, ok := m[msgID]; ok && !e.Channel {
 					entry = e
-					chatID = cid
 					break
 				}
 			}
@@ -333,15 +358,15 @@ func sendSnipedEntry(m *tg.NewMessage, entry *snipedMsg) {
 	if entry.FileID != "" {
 		caption := header
 		if entry.Text != "" {
-			caption += "\n\n" + html.EscapeString(entry.Text)
+			caption += "\n\n" + html.EscapeString(truncRunes(entry.Text, 900))
 		}
 		media, err := tg.ResolveBotFileID(entry.FileID)
 		if err == nil {
 			if entry.IsSticker {
-				m.ReplyMedia(media)
+				modules.TransferReplyMedia(m, media)
 				m.Respond(caption)
 			} else {
-				m.ReplyMedia(media, &tg.MediaOptions{Caption: caption})
+				modules.TransferReplyMedia(m, media, &tg.MediaOptions{Caption: caption})
 			}
 			return
 		}
@@ -349,7 +374,7 @@ func sendSnipedEntry(m *tg.NewMessage, entry *snipedMsg) {
 
 	body := header
 	if entry.Text != "" {
-		body += "\n\n" + html.EscapeString(entry.Text)
+		body += "\n\n" + html.EscapeString(truncRunes(entry.Text, 3800))
 	} else {
 		body += "\n\n<i>[no text]</i>"
 	}
@@ -362,7 +387,7 @@ func SnipeHandler(m *tg.NewMessage) error {
 		return nil
 	}
 
-	if !modules.IsUserAdmin(m.Client, m.SenderID(), m.ChatID(), "") {
+	if !modules.IsUserAdmin(m.Client, m.SenderID(), m.ChannelID(), "") {
 		m.Reply("Admins only.")
 		return nil
 	}
@@ -408,7 +433,7 @@ func ESnipeHandler(m *tg.NewMessage) error {
 		m.Reply("<b>Snipe works in groups only.</b>")
 		return nil
 	}
-	if !modules.IsUserAdmin(m.Client, m.SenderID(), m.ChatID(), "") {
+	if !modules.IsUserAdmin(m.Client, m.SenderID(), m.ChannelID(), "") {
 		m.Reply("Admins only.")
 		return nil
 	}
@@ -426,8 +451,8 @@ func ESnipeHandler(m *tg.NewMessage) error {
 	body := fmt.Sprintf("<b>Edit by %s</b> <i>(%s)</i>\n\n<s>%s</s> → <b>%s</b>",
 		html.EscapeString(entry.SenderName),
 		formatSnipeTime(entry.Time),
-		html.EscapeString(entry.OldText),
-		html.EscapeString(entry.NewText),
+		html.EscapeString(truncRunes(entry.OldText, 1800)),
+		html.EscapeString(truncRunes(entry.NewText, 1800)),
 	)
 	m.Reply(body)
 	return nil
@@ -474,9 +499,7 @@ func renderSnipesPage(entries []*snipedMsg, page int) (string, int, int) {
 				preview = "[no text]"
 			}
 		}
-		if len(preview) > 80 {
-			preview = preview[:80] + "..."
-		}
+		preview = truncRunes(preview, 80)
 		sb.WriteString(fmt.Sprintf("<b>%d.</b> <b>%s</b> <i>(%s)</i>\n  %s\n\n",
 			i+1,
 			html.EscapeString(entry.SenderName),
@@ -511,7 +534,7 @@ func SnipesHandler(m *tg.NewMessage) error {
 		m.Reply("<b>Snipe works in groups only.</b>")
 		return nil
 	}
-	if !modules.IsUserAdmin(m.Client, m.SenderID(), m.ChatID(), "") {
+	if !modules.IsUserAdmin(m.Client, m.SenderID(), m.ChannelID(), "") {
 		m.Reply("Admins only.")
 		return nil
 	}
@@ -583,7 +606,7 @@ func SnipeToggleHandler(m *tg.NewMessage) error {
 		m.Reply("<b>Snipe works in groups only.</b>")
 		return nil
 	}
-	if !modules.IsUserAdmin(m.Client, m.SenderID(), m.ChatID(), "change_info") {
+	if !modules.IsUserAdmin(m.Client, m.SenderID(), m.ChannelID(), "change_info") {
 		m.Reply("<b>Permission denied.</b> Admins only.")
 		return nil
 	}
@@ -623,11 +646,31 @@ func SnipeToggleHandler(m *tg.NewMessage) error {
 	return nil
 }
 
+// snipeSweep drops cached messages older than snipeCacheTTL so idle chats don't pin memory forever.
+func snipeSweep() {
+	for range time.Tick(10 * time.Minute) {
+		cutoff := time.Now().Add(-snipeCacheTTL).Unix()
+		snipeMsgCacheMu.Lock()
+		for cid, cm := range snipeMsgCache {
+			for id, e := range cm {
+				if e.Time < cutoff {
+					delete(cm, id)
+				}
+			}
+			if len(cm) == 0 {
+				delete(snipeMsgCache, cid)
+			}
+		}
+		snipeMsgCacheMu.Unlock()
+	}
+}
+
 func registerSnipeHandlers() {
 	c := modules.Client
-	c.On("cmd:snipe", SnipeHandler)
-	c.On("cmd:esnipe", ESnipeHandler)
-	c.On("cmd:snipes", SnipesHandler)
+	go snipeSweep()
+	modules.OnCommand(c, "cmd:snipe", SnipeHandler)
+	modules.OnCommand(c, "cmd:esnipe", ESnipeHandler)
+	modules.OnCommand(c, "cmd:snipes", SnipesHandler)
 	c.On("callback:snipes_", SnipesCallback)
 	c.On(tg.OnNewMessage, SnipeCacheHandler)
 	c.On(tg.OnEditMessage, SnipeEditHandler)
@@ -647,7 +690,9 @@ Recover deleted and edited messages in your chat.
  • /snipes [page] - Paginated list of last 10 deleted messages
  • /snipe on|off - Enable/disable snipe in this chat (admins only)
 
-<b>Buffer:</b> Last 20 deleted/edited messages per chat (in-memory)
-<b>Storage:</b> Per-chat enable flag persisted via bbolt
-<b>Permission:</b> Admins with Change Info can toggle.`)
+<b>Example:</b> <code>/snipe 3</code>
+
+<b>Buffer:</b> last 20 deleted/edited messages per chat, in memory only (lost on restart). Only messages seen in the last 12h can be recovered.
+<b>Permission:</b> admins can view; admins with Change Info can toggle.`)
+
 }

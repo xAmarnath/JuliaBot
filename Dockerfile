@@ -32,6 +32,9 @@ RUN apk add --no-cache \
     speedtest-cli \
     aria2
 
+# KissKH uses yt-dlp's parallel HLS downloader and FFmpeg subtitle muxing.
+RUN yt-dlp --version && ffmpeg -version && ffprobe -version
+
 ENV GOLANG_VERSION=1.25.0
 
 RUN wget https://go.dev/dl/go${GOLANG_VERSION}.linux-amd64.tar.gz -O /tmp/go.tar.gz && \

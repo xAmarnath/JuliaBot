@@ -10,9 +10,10 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"unicode/utf8"
 
-	tg "github.com/amarnathcjd/gogram/telegram"
-	"go.etcd.io/bbolt"
+	tg "github.com/xAmarnath/gogram/telegram"
+	"main/internal/mongostore"
 	modules "main/modules"
 )
 
@@ -35,32 +36,22 @@ var (
 	autoReactCacheMu    sync.RWMutex
 )
 
-func ensureAutoReactBucket(database *bbolt.DB) error {
-	return database.Update(func(tx *bbolt.Tx) error {
-		_, err := tx.CreateBucketIfNotExists(autoReactBucketName)
-		return err
-	})
-}
-
-func autoReactChatBucket(tx *bbolt.Tx, chatID int64) (*bbolt.Bucket, error) {
-	root := tx.Bucket(autoReactBucketName)
-	if root == nil {
-		return nil, nil
+func autoReactChatBucket(tx *mongostore.Tx, chatID int64) (*mongostore.Bucket, error) {
+	root, err := tx.CreateBucketIfNotExists(autoReactBucketName)
+	if err != nil {
+		return nil, err
 	}
 	return root.CreateBucketIfNotExists([]byte(strconv.FormatInt(chatID, 10)))
 }
 
 func loadAutoReactRules(chatID int64) ([]autoReactRule, error) {
 	database, err := db.GetDB()
-	if err != nil {
-		return nil, err
-	}
-	if err := ensureAutoReactBucket(database); err != nil {
-		return nil, err
+	if err != nil || database == nil {
+		return nil, fmt.Errorf("db unavailable")
 	}
 
 	var rules []autoReactRule
-	err = database.View(func(tx *bbolt.Tx) error {
+	err = database.View(func(tx *mongostore.Tx) error {
 		root := tx.Bucket(autoReactBucketName)
 		if root == nil {
 			return nil
@@ -82,16 +73,13 @@ func loadAutoReactRules(chatID int64) ([]autoReactRule, error) {
 
 func saveAutoReactRule(chatID int64, rule autoReactRule) error {
 	database, err := db.GetDB()
-	if err != nil {
-		return err
-	}
-	if err := ensureAutoReactBucket(database); err != nil {
-		return err
+	if err != nil || database == nil {
+		return fmt.Errorf("db unavailable")
 	}
 
-	return database.Update(func(tx *bbolt.Tx) error {
+	return database.Update(func(tx *mongostore.Tx) error {
 		chatBucket, err := autoReactChatBucket(tx, chatID)
-		if err != nil || chatBucket == nil {
+		if err != nil {
 			return err
 		}
 		data, err := json.Marshal(rule)
@@ -104,15 +92,12 @@ func saveAutoReactRule(chatID int64, rule autoReactRule) error {
 
 func deleteAutoReactRule(chatID int64, id int) (bool, error) {
 	database, err := db.GetDB()
-	if err != nil {
-		return false, err
-	}
-	if err := ensureAutoReactBucket(database); err != nil {
-		return false, err
+	if err != nil || database == nil {
+		return false, fmt.Errorf("db unavailable")
 	}
 
 	deleted := false
-	err = database.Update(func(tx *bbolt.Tx) error {
+	err = database.Update(func(tx *mongostore.Tx) error {
 		root := tx.Bucket(autoReactBucketName)
 		if root == nil {
 			return nil
@@ -186,7 +171,7 @@ func AutoReactHandler(m *tg.NewMessage) error {
 		return nil
 	}
 
-	if !modules.IsUserAdmin(m.Client, m.SenderID(), m.ChatID(), "change_info") {
+	if !modules.IsUserAdmin(m.Client, m.SenderID(), m.ChannelID(), "change_info") {
 		m.Reply("<b>Permission denied.</b> Admins with Change Info only.")
 		return nil
 	}
@@ -239,8 +224,17 @@ func autoReactAdd(m *tg.NewMessage, rest string) error {
 		return nil
 	}
 
+	if utf8.RuneCountInString(pattern) > 200 {
+		m.Reply("<b>Pattern too long.</b> Max 200 characters.")
+		return nil
+	}
 	if _, err := regexp.Compile("(?i)" + pattern); err != nil {
 		m.Reply("<b>Invalid regex:</b> <code>" + html.EscapeString(err.Error()) + "</code>")
+		return nil
+	}
+	// Reacting to the command itself validates the emoji against this chat's allowed reactions.
+	if err := m.React(emoji); err != nil {
+		m.Reply("<b>Can't react with that emoji here:</b> <code>" + html.EscapeString(err.Error()) + "</code>")
 		return nil
 	}
 
@@ -329,7 +323,11 @@ func autoReactRemove(m *tg.NewMessage, rest string) error {
 }
 
 func AutoReactWatcher(m *tg.NewMessage) error {
-	if m.IsPrivate() || m.Text() == "" || m.IsCommand() {
+	if m == nil || m.Message == nil || m.IsPrivate() {
+		return nil
+	}
+	text := m.Text()
+	if text == "" || m.IsCommand() {
 		return nil
 	}
 
@@ -338,7 +336,6 @@ func AutoReactWatcher(m *tg.NewMessage) error {
 		return nil
 	}
 
-	text := m.Text()
 	for _, r := range rules {
 		if r.re.MatchString(text) {
 			_ = m.React(r.emoji)
@@ -350,7 +347,7 @@ func AutoReactWatcher(m *tg.NewMessage) error {
 
 func registerAutoReactHandlers() {
 	c := modules.Client
-	c.On("cmd:autoreact", AutoReactHandler)
+	modules.OnCommand(c, "cmd:autoreact", AutoReactHandler)
 	c.On(tg.OnNewMessage, AutoReactWatcher)
 }
 
@@ -366,10 +363,13 @@ Automatically react to messages matching a regex pattern with an emoji.
  • <code>/autoreact list</code> - List all rules
  • <code>/autoreact rm &lt;id&gt;</code> - Remove a rule by id
 
+<b>Example:</b> <code>/autoreact add \bthanks?\b 🙏</code>
+
 <b>Notes:</b>
-Pattern is a Go regex matched case-insensitively against the message text.
+Pattern is a Go regex (max 200 chars) matched case-insensitively against the message text; the emoji is the last word.
+The emoji must be a reaction allowed in this chat. Max 50 rules per chat.
 Only one reaction per message is applied (first matching rule by id).
-Compiled regex is cached per chat.
+
 
 <b>Permission:</b> Admins with Change Info only.`)
 }

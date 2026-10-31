@@ -4,7 +4,7 @@ import (
 	"encoding/json"
 	"strconv"
 
-	bolt "go.etcd.io/bbolt"
+	"main/internal/mongostore"
 )
 
 type Rules struct {
@@ -14,8 +14,8 @@ type Rules struct {
 	Buttons   string `json:"buttons,omitempty"`
 }
 
-func ensureRulesBuckets(db *bolt.DB) error {
-	return db.Update(func(tx *bolt.Tx) error {
+func ensureRulesBuckets(db *mongostore.DB) error {
+	return db.Update(func(tx *mongostore.Tx) error {
 		_, err := tx.CreateBucketIfNotExists([]byte("rules"))
 		return err
 	})
@@ -26,12 +26,15 @@ func SetRulesWithMedia(chatID int64, rules *Rules) error {
 	if err != nil {
 		return err
 	}
-	if err := ensureRulesBuckets(db); err != nil {
+	if err := ensureBucketsOnce("rules", db, ensureRulesBuckets); err != nil {
 		return err
 	}
 
-	return db.Update(func(tx *bolt.Tx) error {
-		bucket := tx.Bucket([]byte("rules"))
+	return db.Update(func(tx *mongostore.Tx) error {
+		bucket, err := tx.CreateBucketIfNotExists([]byte("rules"))
+		if err != nil {
+			return err
+		}
 		data, err := json.Marshal(rules)
 		if err != nil {
 			return err
@@ -49,13 +52,16 @@ func GetRulesWithMedia(chatID int64) (*Rules, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := ensureRulesBuckets(db); err != nil {
+	if err := ensureBucketsOnce("rules", db, ensureRulesBuckets); err != nil {
 		return nil, err
 	}
 
 	var rules *Rules
-	err = db.View(func(tx *bolt.Tx) error {
+	err = db.View(func(tx *mongostore.Tx) error {
 		bucket := tx.Bucket([]byte("rules"))
+		if bucket == nil {
+			return nil
+		}
 		data := bucket.Get([]byte(strconv.FormatInt(chatID, 10)))
 		if data == nil {
 			return nil
@@ -87,19 +93,22 @@ func DeleteRules(chatID int64) error {
 	if err != nil {
 		return err
 	}
-	if err := ensureRulesBuckets(db); err != nil {
+	if err := ensureBucketsOnce("rules", db, ensureRulesBuckets); err != nil {
 		return err
 	}
 
-	return db.Update(func(tx *bolt.Tx) error {
+	return db.Update(func(tx *mongostore.Tx) error {
 		bucket := tx.Bucket([]byte("rules"))
+		if bucket == nil {
+			return nil
+		}
 		return bucket.Delete([]byte(strconv.FormatInt(chatID, 10)))
 	})
 }
 
 func HasRules(chatID int64) bool {
-	rules, err := GetRules(chatID)
-	return err == nil && rules != ""
+	rules, err := GetRulesWithMedia(chatID)
+	return err == nil && rules != nil && (rules.Content != "" || rules.FileID != "")
 }
 
 func CloseRulesDB() error {

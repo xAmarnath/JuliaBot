@@ -1,0 +1,17 @@
+ffmpeg
+mediainfo
+aria2
+neofetch
+gawk
+file
+wget
+sox
+yt-dlp
+python3
+python3-minimal
+python3.12
+python3.12-minimal
+libpython3.12-minimal
+libpython3.12-stdlib
+fonts-dejavu-core
+fonts-ubuntu

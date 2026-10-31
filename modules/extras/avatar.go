@@ -12,7 +12,7 @@ import (
 	"strings"
 	"time"
 
-	tg "github.com/amarnathcjd/gogram/telegram"
+	tg "github.com/xAmarnath/gogram/telegram"
 	modules "main/modules"
 )
 
@@ -24,121 +24,86 @@ type avatarTarget struct {
 	Photo     tg.UserProfilePhoto
 }
 
-func avatarResolveTarget(m *tg.NewMessage) (avatarTarget, error) {
-	var info avatarTarget
+func avatarFromUser(u *tg.UserObj) avatarTarget {
+	return avatarTarget{UserID: u.ID, FirstName: u.FirstName, LastName: u.LastName, Username: u.Username, Photo: u.Photo}
+}
 
+// avatarResolveTarget picks the replied user, then an @username/ID argument, then the sender.
+func avatarResolveTarget(m *tg.NewMessage) (avatarTarget, error) {
 	if m.IsReply() {
-		reply, err := m.GetReplyMessage()
-		if err == nil && reply != nil && reply.SenderID() != 0 {
-			u, uerr := m.Client.GetUser(reply.SenderID())
-			if uerr == nil && u != nil {
-				info.UserID = u.ID
-				info.FirstName = u.FirstName
-				info.LastName = u.LastName
-				info.Username = u.Username
-				info.Photo = u.Photo
-				return info, nil
+		if reply, err := m.GetReplyMessage(); err == nil && reply != nil && reply.SenderID() != 0 {
+			if u, uerr := m.Client.GetUser(reply.SenderID()); uerr == nil && u != nil {
+				return avatarFromUser(u), nil
 			}
-			info.UserID = reply.SenderID()
-			info.FirstName = "User"
-			return info, nil
+			return avatarTarget{UserID: reply.SenderID(), FirstName: "User"}, nil
 		}
 	}
 
-	args := strings.TrimSpace(m.Args())
-	if args != "" {
-		token := strings.Fields(args)[0]
-		token = strings.TrimPrefix(token, "@")
+	if args := strings.Fields(m.Args()); len(args) > 0 {
+		token := strings.TrimPrefix(args[0], "@")
 		if n, err := strconv.ParseInt(token, 10, 64); err == nil {
-			u, uerr := m.Client.GetUser(n)
-			if uerr == nil && u != nil {
-				info.UserID = u.ID
-				info.FirstName = u.FirstName
-				info.LastName = u.LastName
-				info.Username = u.Username
-				info.Photo = u.Photo
-				return info, nil
+			if u, uerr := m.Client.GetUser(n); uerr == nil && u != nil {
+				return avatarFromUser(u), nil
 			}
-			return info, fmt.Errorf("could not resolve user %d", n)
+			return avatarTarget{}, fmt.Errorf("could not resolve user %d", n)
 		}
 		peer, err := m.Client.ResolvePeer(token)
 		if err != nil {
-			return info, err
+			return avatarTarget{}, fmt.Errorf("could not resolve @%s", token)
+		}
+		if _, ok := peer.(*tg.InputPeerUser); !ok {
+			return avatarTarget{}, fmt.Errorf("@%s is not a user", token)
 		}
 		id := m.Client.GetPeerID(peer)
-		u, uerr := m.Client.GetUser(id)
-		if uerr == nil && u != nil {
-			info.UserID = u.ID
-			info.FirstName = u.FirstName
-			info.LastName = u.LastName
-			info.Username = u.Username
-			info.Photo = u.Photo
-			return info, nil
+		if u, uerr := m.Client.GetUser(id); uerr == nil && u != nil {
+			return avatarFromUser(u), nil
 		}
-		info.UserID = id
-		info.FirstName = token
-		return info, nil
+		return avatarTarget{UserID: id, FirstName: token}, nil
 	}
 
 	if m.Sender != nil {
-		info.UserID = m.Sender.ID
-		info.FirstName = m.Sender.FirstName
-		info.LastName = m.Sender.LastName
-		info.Username = m.Sender.Username
-		info.Photo = m.Sender.Photo
-		return info, nil
+		return avatarFromUser(m.Sender), nil
 	}
-
-	info.UserID = m.SenderID()
-	info.FirstName = "User"
-	return info, nil
+	return avatarTarget{UserID: m.SenderID(), FirstName: "User"}, nil
 }
 
-func avatarGetAccessHash(m *tg.NewMessage, userID int64) int64 {
-	peer, err := m.Client.ResolvePeer(userID)
-	if err != nil {
-		return 0
-	}
-	if pu, ok := peer.(*tg.InputPeerUser); ok {
-		return pu.AccessHash
-	}
-	return 0
-}
-
-func avatarDownload(m *tg.NewMessage, info avatarTarget) (string, error) {
+func avatarDownload(c *tg.Client, info avatarTarget) (string, error) {
 	if info.Photo == nil {
 		return "", fmt.Errorf("user has no profile photo")
 	}
-	full, err := m.Client.UsersGetFullUser(&tg.InputUserObj{
-		UserID:     info.UserID,
-		AccessHash: avatarGetAccessHash(m, info.UserID),
-	})
+	var hash int64
+	if peer, err := c.ResolvePeer(info.UserID); err == nil {
+		if pu, ok := peer.(*tg.InputPeerUser); ok {
+			hash = pu.AccessHash
+		}
+	}
+	full, err := c.UsersGetFullUser(&tg.InputUserObj{UserID: info.UserID, AccessHash: hash})
 	if err != nil || full == nil {
-		return "", fmt.Errorf("could not fetch full user")
+		return "", fmt.Errorf("could not fetch the user's profile")
 	}
 	uf := full.FullUser
 	var photo tg.Photo
-	if uf.ProfilePhoto != nil {
+	switch {
+	case uf.ProfilePhoto != nil:
 		photo = uf.ProfilePhoto
-	} else if uf.PersonalPhoto != nil {
+	case uf.PersonalPhoto != nil:
 		photo = uf.PersonalPhoto
-	} else if uf.FallbackPhoto != nil {
+	case uf.FallbackPhoto != nil:
 		photo = uf.FallbackPhoto
-	}
-	if photo == nil {
-		return "", fmt.Errorf("no profile photo available")
 	}
 	p, ok := photo.(*tg.PhotoObj)
 	if !ok || p == nil {
-		return "", fmt.Errorf("invalid photo object")
+		return "", fmt.Errorf("user has no visible profile photo")
 	}
 	tmp := filepath.Join(os.TempDir(), fmt.Sprintf("avatar_dl_%d_%d.jpg", info.UserID, time.Now().UnixNano()))
-	_, err = m.Client.DownloadMedia(p, &tg.DownloadOptions{
-		FileName: tmp,
-	})
+	got, err := modules.TransferDownloadMedia(c, p, &tg.DownloadOptions{FileName: tmp})
 	if err != nil {
 		os.Remove(tmp)
 		return "", err
+	}
+	if got != "" && got != tmp {
+		os.Remove(tmp)
+		return got, nil
 	}
 	return tmp, nil
 }
@@ -187,7 +152,7 @@ func AvatarHandler(m *tg.NewMessage) error {
 		return nil
 	}
 
-	path, err := avatarDownload(m, info)
+	path, err := avatarDownload(m.Client, info)
 	if err != nil {
 		if status != nil {
 			status.Edit("failed: " + html.EscapeString(err.Error()))
@@ -219,7 +184,7 @@ func AvatarHandler(m *tg.NewMessage) error {
 		caption += fmt.Sprintf("\n<b>Size:</b> <code>%s</code>", avatarFormatBytes(size))
 	}
 
-	_, merr := m.ReplyMedia(path, &tg.MediaOptions{
+	_, merr := modules.TransferReplyMedia(m, path, &tg.MediaOptions{
 		Caption:  caption,
 		FileName: fmt.Sprintf("avatar_%d.jpg", info.UserID),
 		MimeType: "image/jpeg",
@@ -238,7 +203,7 @@ func AvatarHandler(m *tg.NewMessage) error {
 
 func registerAvatarHandlers() {
 	c := modules.Client
-	c.On("cmd:avatar", AvatarHandler)
+	modules.OnCommand(c, "cmd:avatar", AvatarHandler)
 }
 
 func init() {

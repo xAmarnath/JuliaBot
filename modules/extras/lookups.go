@@ -1,132 +1,130 @@
 package extras
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"html"
-	"io"
 	modules "main/modules"
-	"net/http"
+	"math"
+	"math/big"
+	"math/bits"
+	"math/rand"
+	"net"
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
-	tg "github.com/amarnathcjd/gogram/telegram"
+	tg "github.com/xAmarnath/gogram/telegram"
 )
 
-type dictionaryDefinition struct {
-	Definition string `json:"definition"`
-	Example    string `json:"example"`
+// Wikimedia asks API clients for an identifying UA with contact info.
+const wikiUA = "JuliaBot/1.0 (https://github.com/amarnathcjd)"
+
+var htmlTagRe = regexp.MustCompile(`<[^>]*>`)
+
+func htmlToText(s string) string {
+	return strings.TrimSpace(html.UnescapeString(htmlTagRe.ReplaceAllString(s, "")))
 }
 
-type dictionaryMeaning struct {
+func clipRunes(s string, n int) string {
+	r := []rune(strings.TrimSpace(s))
+	if len(r) <= n {
+		return string(r)
+	}
+	return strings.TrimSpace(string(r[:n])) + "…"
+}
+
+func replyArgOrQuoted(m *tg.NewMessage) string {
+	if s := strings.TrimSpace(m.Args()); s != "" {
+		return s
+	}
+	if m.IsReply() {
+		if r, err := m.GetReplyMessage(); err == nil && r != nil {
+			return strings.TrimSpace(r.Text())
+		}
+	}
+	return ""
+}
+
+type wiktionaryDefinition struct {
+	Definition string   `json:"definition"`
+	Examples   []string `json:"examples"`
+}
+
+type wiktionaryEntry struct {
 	PartOfSpeech string                 `json:"partOfSpeech"`
-	Definitions  []dictionaryDefinition `json:"definitions"`
+	Language     string                 `json:"language"`
+	Definitions  []wiktionaryDefinition `json:"definitions"`
 }
 
-type dictionaryPhonetic struct {
-	Text string `json:"text"`
-}
-
-type dictionaryEntry struct {
-	Word      string               `json:"word"`
-	Phonetic  string               `json:"phonetic"`
-	Phonetics []dictionaryPhonetic `json:"phonetics"`
-	Meanings  []dictionaryMeaning  `json:"meanings"`
-}
-
-func DefineHandler(m *tg.NewMessage) error {
-	word := strings.TrimSpace(m.Args())
-	if word == "" {
-		m.Reply("Usage: <code>/define &lt;word&gt;</code>")
-		return nil
-	}
-	client := &http.Client{Timeout: 30 * time.Second}
-	url := "https://api.dictionaryapi.dev/api/v2/entries/en/" + word
-	resp, err := client.Get(url)
+func fetchWiktionary(word string) ([]wiktionaryEntry, error) {
+	var out map[string][]wiktionaryEntry
+	err := extGetJSON(context.Background(), "https://en.wiktionary.org/api/rest_v1/page/definition/"+url.PathEscape(word), &out, "User-Agent", wikiUA)
 	if err != nil {
-		m.Reply("couldn't fetch definition: " + err.Error())
-		return nil
+		return nil, err
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode == 404 {
-		m.Reply("No definition found for <b>" + html.EscapeString(word) + "</b>")
-		return nil
-	}
-	if resp.StatusCode != 200 {
-		m.Reply(fmt.Sprintf("HTTP %d", resp.StatusCode))
-		return nil
-	}
-	var entries []dictionaryEntry
-	if err := json.NewDecoder(resp.Body).Decode(&entries); err != nil {
-		m.Reply("couldn't parse definition: " + err.Error())
-		return nil
-	}
-	if len(entries) == 0 {
-		m.Reply("No definition found for <b>" + html.EscapeString(word) + "</b>")
-		return nil
-	}
-	entry := entries[0]
-	headword := entry.Word
-	if headword == "" {
-		headword = word
-	}
-	phonetic := entry.Phonetic
-	if phonetic == "" {
-		for _, p := range entry.Phonetics {
-			if p.Text != "" {
-				phonetic = p.Text
-				break
-			}
-		}
-	}
+	return out["en"], nil
+}
+
+func formatWiktionary(word string, entries []wiktionaryEntry) string {
 	var b strings.Builder
-	b.WriteString("<b>")
-	b.WriteString(html.EscapeString(headword))
-	b.WriteString("</b>")
-	if phonetic != "" {
-		b.WriteString(" <i>")
-		b.WriteString(html.EscapeString(phonetic))
-		b.WriteString("</i>")
-	}
-	b.WriteString("\n")
+	fmt.Fprintf(&b, "<b>%s</b>\n", html.EscapeString(word))
 	count := 0
-	for _, meaning := range entry.Meanings {
-		if count >= 3 {
-			break
-		}
-		for _, def := range meaning.Definitions {
-			if count >= 3 {
+	for _, e := range entries {
+		for _, d := range e.Definitions {
+			if count >= 5 {
 				break
 			}
-			if def.Definition == "" {
+			def := htmlToText(d.Definition)
+			if def == "" {
 				continue
 			}
 			count++
-			b.WriteString(fmt.Sprintf("\n<b>%d.</b> <i>(%s)</i> %s", count, html.EscapeString(meaning.PartOfSpeech), html.EscapeString(def.Definition)))
-			if def.Example != "" {
-				b.WriteString("\n   <i>e.g. ")
-				b.WriteString(html.EscapeString(def.Example))
-				b.WriteString("</i>")
+			fmt.Fprintf(&b, "\n<b>%d.</b> <i>(%s)</i> %s", count, html.EscapeString(strings.ToLower(e.PartOfSpeech)), html.EscapeString(clipRunes(def, 400)))
+			if len(d.Examples) > 0 {
+				if ex := htmlToText(d.Examples[0]); ex != "" {
+					fmt.Fprintf(&b, "\n   <i>e.g. %s</i>", html.EscapeString(clipRunes(ex, 250)))
+				}
 			}
 		}
 	}
 	if count == 0 {
-		m.Reply("No definition found for <b>" + html.EscapeString(word) + "</b>")
-		return nil
+		return ""
 	}
-	m.Reply(b.String())
-	return nil
+	fmt.Fprintf(&b, "\n\n<a href=\"https://en.wiktionary.org/wiki/%s\">Wiktionary</a>", url.PathEscape(word))
+	return b.String()
 }
 
-func initFromSrc_dictionary_0_1() { modules.QueueHandlerRegistration(registerDictionaryHandlers) }
-func registerDictionaryHandlers() {
-	c := modules.Client
-	c.On("cmd:define", DefineHandler)
+func DefineHandler(m *tg.NewMessage) error {
+	word := replyArgOrQuoted(m)
+	if word == "" {
+		m.Reply("Usage: <code>/define &lt;word&gt;</code>")
+		return nil
+	}
+	word = clipRunes(word, 80)
+	status := modules.NewStatus(m, "Looking up the definition…")
+	entries, err := fetchWiktionary(word)
+	if isHTTPStatus(err, 404) && strings.ToLower(word) != word {
+		word = strings.ToLower(word)
+		entries, err = fetchWiktionary(word)
+	}
+	if err != nil && !isHTTPStatus(err, 404) {
+		status.Edit("Couldn't fetch definition: " + html.EscapeString(err.Error()))
+		return nil
+	}
+	text := formatWiktionary(word, entries)
+	if text == "" {
+		status.Edit("No English definition found for <b>" + html.EscapeString(word) + "</b>")
+		return nil
+	}
+	status.Edit(text, &tg.SendOptions{LinkPreview: false})
+	return nil
 }
 
 type kanjiLookupResponse struct {
@@ -148,78 +146,44 @@ func KanjiLookupHandler(m *tg.NewMessage) error {
 		m.Reply("Usage: <code>/kanji &lt;character&gt;</code>")
 		return nil
 	}
-	runes := []rune(q)
-	character := string(runes[0])
-	client := &http.Client{Timeout: 30 * time.Second}
-	endpoint := "https://kanjiapi.dev/v1/kanji/" + url.PathEscape(character)
-	resp, err := client.Get(endpoint)
-	if err != nil {
-		m.Reply("couldn't fetch kanji: " + err.Error())
-		return nil
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode == 404 {
-		m.Reply("No kanji found for <b>" + html.EscapeString(character) + "</b>")
-		return nil
-	}
-	if resp.StatusCode != 200 {
-		m.Reply(fmt.Sprintf("HTTP %d", resp.StatusCode))
-		return nil
-	}
+	character := string([]rune(q)[0])
+	status := modules.NewStatus(m, "Looking up the kanji…")
 	var data kanjiLookupResponse
-	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
-		m.Reply("couldn't parse kanji: " + err.Error())
+	err := extGetJSON(context.Background(), "https://kanjiapi.dev/v1/kanji/"+url.PathEscape(character), &data)
+	if isHTTPStatus(err, 404) || (err == nil && data.Kanji == "") {
+		status.Edit("No kanji found for <b>" + html.EscapeString(character) + "</b>")
 		return nil
 	}
-	if data.Kanji == "" {
-		m.Reply("No kanji found for <b>" + html.EscapeString(character) + "</b>")
+	if err != nil {
+		status.Edit("Couldn't fetch kanji: " + html.EscapeString(err.Error()))
 		return nil
 	}
 	var b strings.Builder
-	b.WriteString("<b>")
-	b.WriteString(html.EscapeString(data.Kanji))
-	b.WriteString("</b>")
+	b.WriteString("<b>" + html.EscapeString(data.Kanji) + "</b>")
 	if data.Unicode != "" {
-		b.WriteString(" <i>(U+")
-		b.WriteString(html.EscapeString(data.Unicode))
-		b.WriteString(")</i>")
+		b.WriteString(" <i>(U+" + html.EscapeString(strings.ToUpper(data.Unicode)) + ")</i>")
 	}
 	b.WriteString("\n")
-	if len(data.Meanings) > 0 {
-		b.WriteString("\n<b>Meanings:</b> ")
-		b.WriteString(html.EscapeString(strings.Join(data.Meanings, ", ")))
+	for _, f := range []struct {
+		label string
+		vals  []string
+	}{{"Meanings", data.Meanings}, {"On", data.OnReadings}, {"Kun", data.KunReadings}, {"Name", data.NameReadings}} {
+		if len(f.vals) > 0 {
+			fmt.Fprintf(&b, "\n<b>%s:</b> %s", f.label, html.EscapeString(strings.Join(f.vals, ", ")))
+		}
 	}
-	if len(data.OnReadings) > 0 {
-		b.WriteString("\n<b>On:</b> ")
-		b.WriteString(html.EscapeString(strings.Join(data.OnReadings, ", ")))
-	}
-	if len(data.KunReadings) > 0 {
-		b.WriteString("\n<b>Kun:</b> ")
-		b.WriteString(html.EscapeString(strings.Join(data.KunReadings, ", ")))
-	}
-	if len(data.NameReadings) > 0 {
-		b.WriteString("\n<b>Name:</b> ")
-		b.WriteString(html.EscapeString(strings.Join(data.NameReadings, ", ")))
-	}
-	b.WriteString(fmt.Sprintf("\n<b>Strokes:</b> %d", data.StrokeCount))
+	fmt.Fprintf(&b, "\n<b>Strokes:</b> %d", data.StrokeCount)
 	if data.JLPT > 0 {
-		b.WriteString(fmt.Sprintf("\n<b>JLPT:</b> N%d", data.JLPT))
+		fmt.Fprintf(&b, "\n<b>JLPT:</b> N%d", data.JLPT)
 	}
 	if data.Grade > 0 {
-		b.WriteString(fmt.Sprintf("\n<b>Grade:</b> %d", data.Grade))
+		fmt.Fprintf(&b, "\n<b>Grade:</b> %d", data.Grade)
 	}
 	if data.HeisigEn != "" {
-		b.WriteString("\n<b>Heisig:</b> ")
-		b.WriteString(html.EscapeString(data.HeisigEn))
+		b.WriteString("\n<b>Heisig:</b> " + html.EscapeString(data.HeisigEn))
 	}
-	m.Reply(b.String())
+	status.Edit(b.String())
 	return nil
-}
-
-func initFromSrc_kanji_lookup_1_1() { modules.QueueHandlerRegistration(registerKanjiLookupHandlers) }
-func registerKanjiLookupHandlers() {
-	c := modules.Client
-	c.On("cmd:kanji", KanjiLookupHandler)
 }
 
 type urbanDefinition struct {
@@ -232,10 +196,6 @@ type urbanDefinition struct {
 	Permalink  string `json:"permalink"`
 }
 
-type urbanResponse struct {
-	List []urbanDefinition `json:"list"`
-}
-
 type urbanState struct {
 	Term    string
 	Results []urbanDefinition
@@ -244,23 +204,17 @@ type urbanState struct {
 
 var urbanCache sync.Map
 
-const urbanPageSize = 3
-const urbanMaxResults = 10
-const urbanTTL = 30 * time.Minute
+const (
+	urbanPageSize   = 3
+	urbanMaxResults = 10
+	urbanTTL        = 30 * time.Minute
+)
 
 func urbanFetch(term string) ([]urbanDefinition, error) {
-	client := &http.Client{Timeout: 30 * time.Second}
-	endpoint := "https://api.urbandictionary.com/v0/define?term=" + url.QueryEscape(term)
-	resp, err := client.Get(endpoint)
-	if err != nil {
-		return nil, err
+	var out struct {
+		List []urbanDefinition `json:"list"`
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode != 200 {
-		return nil, fmt.Errorf("HTTP %d", resp.StatusCode)
-	}
-	var out urbanResponse
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+	if err := extGetJSON(context.Background(), "https://api.urbandictionary.com/v0/define?term="+url.QueryEscape(term), &out); err != nil {
 		return nil, err
 	}
 	if len(out.List) > urbanMaxResults {
@@ -270,9 +224,7 @@ func urbanFetch(term string) ([]urbanDefinition, error) {
 }
 
 func urbanCleanText(s string) string {
-	s = strings.ReplaceAll(s, "[", "")
-	s = strings.ReplaceAll(s, "]", "")
-	return strings.TrimSpace(s)
+	return strings.TrimSpace(strings.NewReplacer("[", "", "]", "", "\r\n", "\n").Replace(s))
 }
 
 func urbanRender(term string, results []urbanDefinition, page int) (string, int) {
@@ -281,70 +233,51 @@ func urbanRender(term string, results []urbanDefinition, page int) (string, int)
 	}
 	total := len(results)
 	pages := (total + urbanPageSize - 1) / urbanPageSize
-	if page < 0 {
-		page = 0
-	}
-	if page >= pages {
-		page = pages - 1
-	}
+	page = max(0, min(page, pages-1))
 	start := page * urbanPageSize
-	end := start + urbanPageSize
-	if end > total {
-		end = total
-	}
+	end := min(start+urbanPageSize, total)
 	var b strings.Builder
-	b.WriteString("<b>Urban Dictionary:</b> <i>")
-	b.WriteString(html.EscapeString(term))
-	b.WriteString("</i>\n")
+	b.WriteString("<b>Urban Dictionary:</b> <i>" + html.EscapeString(term) + "</i>\n")
 	for i := start; i < end; i++ {
 		d := results[i]
-		def := urbanCleanText(d.Definition)
-		ex := urbanCleanText(d.Example)
-		if len(def) > 600 {
-			def = def[:600] + "..."
-		}
-		if len(ex) > 400 {
-			ex = ex[:400] + "..."
-		}
-		b.WriteString(fmt.Sprintf("\n<b>%d.</b> 👍 %d  👎 %d\n", i+1, d.ThumbsUp, d.ThumbsDown))
-		b.WriteString("<blockquote>")
-		b.WriteString(html.EscapeString(def))
-		b.WriteString("</blockquote>")
-		if ex != "" {
-			b.WriteString("\n<i>Example:</i>\n<blockquote>")
-			b.WriteString(html.EscapeString(ex))
-			b.WriteString("</blockquote>")
+		fmt.Fprintf(&b, "\n<b>%d.</b> 👍 %d  👎 %d\n<blockquote>%s</blockquote>", i+1, d.ThumbsUp, d.ThumbsDown, html.EscapeString(clipRunes(urbanCleanText(d.Definition), 600)))
+		if ex := urbanCleanText(d.Example); ex != "" {
+			b.WriteString("\n<i>Example:</i>\n<blockquote>" + html.EscapeString(clipRunes(ex, 400)) + "</blockquote>")
 		}
 		b.WriteString("\n")
 	}
-	b.WriteString(fmt.Sprintf("\n<i>Page %d / %d</i>", page+1, pages))
+	fmt.Fprintf(&b, "\n<i>Page %d / %d</i>", page+1, pages)
 	return b.String(), pages
 }
 
-func urbanKeyboard(term string, page, pages int) *tg.ReplyInlineMarkup {
+// Callback data carries only the page (64-byte limit); the term lives in urbanCache.
+func urbanKeyboard(page, pages int) *tg.ReplyInlineMarkup {
 	if pages <= 1 {
 		return nil
 	}
-	b := tg.Button
-	kb := tg.NewKeyboard()
 	var row []tg.KeyboardInlineButton
 	if page > 0 {
-		row = append(row, b.Data("« Prev", fmt.Sprintf("urban:%s:%d", term, page-1)))
+		row = append(row, tg.Button.Data("« Prev", fmt.Sprintf("urban:%d", page-1)))
 	}
 	if page < pages-1 {
-		row = append(row, b.Data("Next »", fmt.Sprintf("urban:%s:%d", term, page+1)))
+		row = append(row, tg.Button.Data("Next »", fmt.Sprintf("urban:%d", page+1)))
 	}
-	if len(row) > 0 {
-		kb.AddRow(row...)
-	}
-	return kb.Build()
+	return tg.NewKeyboard().AddRow(row...).Build()
 }
 
+var urbanLastGC time.Time
+var urbanGCMu sync.Mutex
+
 func urbanGC() {
-	now := time.Now()
+	urbanGCMu.Lock()
+	if time.Since(urbanLastGC) < 5*time.Minute {
+		urbanGCMu.Unlock()
+		return
+	}
+	urbanLastGC = time.Now()
+	urbanGCMu.Unlock()
 	urbanCache.Range(func(k, v any) bool {
-		st, ok := v.(*urbanState)
-		if !ok || now.Sub(st.Created) > urbanTTL {
+		if st, ok := v.(*urbanState); !ok || time.Since(st.Created) > urbanTTL {
 			urbanCache.Delete(k)
 		}
 		return true
@@ -352,7 +285,7 @@ func urbanGC() {
 }
 
 func UrbanHandler(m *tg.NewMessage) error {
-	term := strings.TrimSpace(m.Args())
+	term := clipRunes(replyArgOrQuoted(m), 100)
 	if term == "" {
 		m.Reply("Usage: <code>/urban &lt;term&gt;</code>")
 		return nil
@@ -360,7 +293,7 @@ func UrbanHandler(m *tg.NewMessage) error {
 	urbanGC()
 	results, err := urbanFetch(term)
 	if err != nil {
-		m.Reply("couldn't fetch urban dictionary: " + html.EscapeString(err.Error()))
+		m.Reply("Couldn't fetch Urban Dictionary: " + html.EscapeString(err.Error()))
 		return nil
 	}
 	if len(results) == 0 {
@@ -368,81 +301,47 @@ func UrbanHandler(m *tg.NewMessage) error {
 		return nil
 	}
 	text, pages := urbanRender(term, results, 0)
-	opts := &tg.SendOptions{}
-	if kb := urbanKeyboard(term, 0, pages); kb != nil {
+	opts := &tg.SendOptions{LinkPreview: false}
+	if kb := urbanKeyboard(0, pages); kb != nil {
 		opts.ReplyMarkup = kb
 	}
 	sent, err := m.Reply(text, opts)
-	if err != nil {
+	if err != nil || sent == nil {
 		return nil
 	}
-	key := fmt.Sprintf("%d:%d", sent.ChatID(), sent.ID)
-	urbanCache.Store(key, &urbanState{Term: term, Results: results, Created: time.Now()})
+	urbanCache.Store(fmt.Sprintf("%d:%d", sent.ChatID(), sent.ID), &urbanState{Term: term, Results: results, Created: time.Now()})
 	return nil
 }
 
 func UrbanCallback(c *tg.CallbackQuery) error {
-	data := c.DataString()
-	rest := strings.TrimPrefix(data, "urban:")
-	idx := strings.LastIndex(rest, ":")
-	if idx <= 0 {
-		c.Answer("Bad data.", &tg.CallbackOptions{Alert: false})
-		return nil
-	}
-	term := rest[:idx]
-	pageStr := rest[idx+1:]
-	page, err := strconv.Atoi(pageStr)
+	rest := strings.TrimPrefix(c.DataString(), "urban:")
+	page, err := strconv.Atoi(rest[strings.LastIndex(rest, ":")+1:])
 	if err != nil {
-		c.Answer("Bad page.", &tg.CallbackOptions{Alert: false})
+		c.Answer("Bad page.")
 		return nil
 	}
-	urbanGC()
-	key := fmt.Sprintf("%d:%d", c.ChatID, c.MessageID)
-	var results []urbanDefinition
-	if v, ok := urbanCache.Load(key); ok {
-		if st, ok2 := v.(*urbanState); ok2 && time.Since(st.Created) <= urbanTTL {
-			results = st.Results
-		}
+	v, ok := urbanCache.Load(fmt.Sprintf("%d:%d", c.ChatID, c.MessageID))
+	st, _ := v.(*urbanState)
+	if !ok || st == nil || time.Since(st.Created) > urbanTTL {
+		c.Answer("Session expired. Run /urban again.", &tg.CallbackOptions{Alert: true})
+		return nil
 	}
-	if results == nil {
-		fresh, ferr := urbanFetch(term)
-		if ferr != nil || len(fresh) == 0 {
-			c.Answer("Session expired. Run /urban again.", &tg.CallbackOptions{Alert: true})
-			return nil
-		}
-		results = fresh
-		urbanCache.Store(key, &urbanState{Term: term, Results: results, Created: time.Now()})
-	}
-	text, pages := urbanRender(term, results, page)
-	opts := &tg.SendOptions{}
-	if kb := urbanKeyboard(term, page, pages); kb != nil {
+	text, pages := urbanRender(st.Term, st.Results, page)
+	opts := &tg.SendOptions{LinkPreview: false}
+	if kb := urbanKeyboard(page, pages); kb != nil {
 		opts.ReplyMarkup = kb
 	}
 	c.Edit(text, opts)
-	c.Answer("", &tg.CallbackOptions{Alert: false})
+	c.Answer("")
 	return nil
-}
-
-func initFromSrc_urban_2_1() { modules.QueueHandlerRegistration(registerUrbanHandlers) }
-func registerUrbanHandlers() {
-	c := modules.Client
-	c.On("cmd:urban", UrbanHandler)
-	c.On("callback:urban:", UrbanCallback)
 }
 
 type wikiThumbnail struct {
 	Source string `json:"source"`
-	Width  int    `json:"width"`
-	Height int    `json:"height"`
 }
 
 type wikiContentURLs struct {
 	Page string `json:"page"`
-}
-
-type wikiURLBundle struct {
-	Desktop wikiContentURLs `json:"desktop"`
-	Mobile  wikiContentURLs `json:"mobile"`
 }
 
 type wikiSummaryResponse struct {
@@ -453,76 +352,57 @@ type wikiSummaryResponse struct {
 	Extract      string         `json:"extract"`
 	Thumbnail    *wikiThumbnail `json:"thumbnail"`
 	Originalimg  *wikiThumbnail `json:"originalimage"`
-	ContentURLs  wikiURLBundle  `json:"content_urls"`
-	Detail       string         `json:"detail"`
-}
-
-func wikiHTTPClient() *http.Client {
-	return &http.Client{Timeout: 30 * time.Second}
+	ContentURLs  struct {
+		Desktop wikiContentURLs `json:"desktop"`
+		Mobile  wikiContentURLs `json:"mobile"`
+	} `json:"content_urls"`
 }
 
 func wikiTrimExtract(s string, max int) string {
 	s = strings.TrimSpace(s)
-	if s == "" {
-		return ""
-	}
 	if idx := strings.Index(s, "\n"); idx > 0 {
-		s = s[:idx]
+		s = strings.TrimSpace(s[:idx])
 	}
-	s = strings.TrimSpace(s)
 	runes := []rune(s)
 	if len(runes) <= max {
 		return s
 	}
 	cut := string(runes[:max])
-	if i := strings.LastIndex(cut, " "); i > max/2 {
+	if i := strings.LastIndex(cut, " "); i > len(cut)/2 {
 		cut = cut[:i]
 	}
 	return strings.TrimSpace(cut) + "..."
 }
 
-func wikiFetchSummary(term string) (*wikiSummaryResponse, int, error) {
-	endpoint := "https://en.wikipedia.org/api/rest_v1/page/summary/" + url.PathEscape(strings.ReplaceAll(term, " ", "_"))
-	req, err := http.NewRequest(http.MethodGet, endpoint, nil)
-	if err != nil {
-		return nil, 0, err
-	}
-	req.Header.Set("User-Agent", "JuliaBot/1.0 (https://github.com/amarnathcjd)")
-	req.Header.Set("Accept", "application/json")
-	resp, err := wikiHTTPClient().Do(req)
-	if err != nil {
-		return nil, 0, err
-	}
-	defer resp.Body.Close()
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, resp.StatusCode, err
-	}
+func wikiFetchSummary(ctx context.Context, title string) (*wikiSummaryResponse, error) {
 	var out wikiSummaryResponse
-	if err := json.Unmarshal(body, &out); err != nil {
-		return nil, resp.StatusCode, err
+	err := extGetJSON(ctx, "https://en.wikipedia.org/api/rest_v1/page/summary/"+url.PathEscape(strings.ReplaceAll(title, " ", "_")), &out, "User-Agent", wikiUA)
+	if err != nil {
+		return nil, err
 	}
-	return &out, resp.StatusCode, nil
+	return &out, nil
 }
 
-func wikiDownloadThumb(src string) (string, error) {
-	if src == "" {
-		return "", nil
+// wikiResolve maps loose queries ("linux kernal") to an article title via opensearch.
+func wikiResolve(ctx context.Context, term string) string {
+	var out []json.RawMessage
+	err := extGetJSON(ctx, "https://en.wikipedia.org/w/api.php?action=opensearch&limit=1&namespace=0&format=json&search="+url.QueryEscape(term), &out, "User-Agent", wikiUA)
+	if err != nil || len(out) < 2 {
+		return ""
 	}
-	req, err := http.NewRequest(http.MethodGet, src, nil)
+	var titles []string
+	if json.Unmarshal(out[1], &titles) != nil || len(titles) == 0 {
+		return ""
+	}
+	return titles[0]
+}
+
+func wikiDownloadThumb(ctx context.Context, src string) (string, error) {
+	data, err := extFetch(ctx, "GET", src, nil, 8<<20, "User-Agent", wikiUA)
 	if err != nil {
 		return "", err
 	}
-	req.Header.Set("User-Agent", "JuliaBot/1.0 (https://github.com/amarnathcjd)")
-	resp, err := wikiHTTPClient().Do(req)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode >= 400 {
-		return "", nil
-	}
-	ext := strings.ToLower(filepath.Ext(src))
+	ext := strings.ToLower(filepath.Ext(strings.SplitN(src, "?", 2)[0]))
 	if ext == "" || len(ext) > 5 {
 		ext = ".jpg"
 	}
@@ -531,7 +411,7 @@ func wikiDownloadThumb(src string) (string, error) {
 		return "", err
 	}
 	defer tmp.Close()
-	if _, err := io.Copy(tmp, resp.Body); err != nil {
+	if _, err := tmp.Write(data); err != nil {
 		os.Remove(tmp.Name())
 		return "", err
 	}
@@ -539,360 +419,408 @@ func wikiDownloadThumb(src string) (string, error) {
 }
 
 func WikiHandler(m *tg.NewMessage) error {
-	term := strings.TrimSpace(m.Args())
+	term := clipRunes(replyArgOrQuoted(m), 200)
 	if term == "" {
 		m.Reply("<b>Usage:</b> <code>/wiki &lt;term&gt;</code>")
 		return nil
 	}
-	status, _ := m.Reply("<i>Searching Wikipedia for <code>" + html.EscapeString(term) + "</code>...</i>")
-	data, code, err := wikiFetchSummary(term)
+	status, err := m.Reply("<i>Searching Wikipedia for <code>" + html.EscapeString(term) + "</code>...</i>")
+	if err != nil || status == nil {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+	data, err := wikiFetchSummary(ctx, term)
+	if isHTTPStatus(err, 404) {
+		if t := wikiResolve(ctx, term); t != "" {
+			data, err = wikiFetchSummary(ctx, t)
+		}
+	}
+	if isHTTPStatus(err, 404) {
+		status.Edit("<b>No Wikipedia article found for</b> <code>" + html.EscapeString(term) + "</code>.")
+		return nil
+	}
 	if err != nil {
-		msg := "<b>Wikipedia lookup failed:</b> <code>" + html.EscapeString(err.Error()) + "</code>"
-		if status != nil {
-			status.Edit(msg)
-		} else {
-			m.Reply(msg)
-		}
-		return nil
-	}
-	if code == 404 {
-		msg := "<b>No Wikipedia article found for</b> <code>" + html.EscapeString(term) + "</code>."
-		if status != nil {
-			status.Edit(msg)
-		} else {
-			m.Reply(msg)
-		}
-		return nil
-	}
-	if code >= 400 || data == nil {
-		detail := ""
-		if data != nil {
-			detail = data.Detail
-		}
-		if detail == "" {
-			detail = "request failed"
-		}
-		msg := "<b>Wikipedia lookup failed:</b> <code>" + html.EscapeString(detail) + "</code>"
-		if status != nil {
-			status.Edit(msg)
-		} else {
-			m.Reply(msg)
-		}
+		status.Edit("<b>Wikipedia lookup failed:</b> <code>" + html.EscapeString(err.Error()) + "</code>")
 		return nil
 	}
 
 	title := data.Title
 	if title == "" {
-		title = data.DisplayTitle
-	}
-	if title == "" {
 		title = term
 	}
 	pageURL := data.ContentURLs.Desktop.Page
 	if pageURL == "" {
-		pageURL = data.ContentURLs.Mobile.Page
-	}
-	if pageURL == "" {
 		pageURL = "https://en.wikipedia.org/wiki/" + url.PathEscape(strings.ReplaceAll(title, " ", "_"))
 	}
+	disambig := strings.EqualFold(data.Type, "disambiguation")
 
 	var sb strings.Builder
-	sb.WriteString("<b>")
-	sb.WriteString(html.EscapeString(title))
-	sb.WriteString("</b>")
+	sb.WriteString("<b>" + html.EscapeString(title) + "</b>")
 	if data.Description != "" {
-		sb.WriteString("\n<i>")
-		sb.WriteString(html.EscapeString(data.Description))
-		sb.WriteString("</i>")
+		sb.WriteString("\n<i>" + html.EscapeString(data.Description) + "</i>")
 	}
 	sb.WriteString("\n\n")
-
-	if strings.EqualFold(data.Type, "disambiguation") {
+	if disambig {
 		sb.WriteString("<i>This term refers to multiple things. Please be more specific.</i>\n\n")
 	}
-
-	extract := wikiTrimExtract(data.Extract, 600)
-	if extract != "" {
-		sb.WriteString(html.EscapeString(extract))
-		sb.WriteString("\n\n")
+	if extract := wikiTrimExtract(data.Extract, 700); extract != "" {
+		sb.WriteString(html.EscapeString(extract) + "\n\n")
 	} else {
 		sb.WriteString("<i>No summary available.</i>\n\n")
 	}
-
-	sb.WriteString("<a href=\"")
-	sb.WriteString(html.EscapeString(pageURL))
-	sb.WriteString("\">Read on Wikipedia</a>")
-
+	sb.WriteString("<a href=\"" + html.EscapeString(pageURL) + "\">Read on Wikipedia</a>")
 	out := sb.String()
 
 	thumbURL := ""
 	if data.Thumbnail != nil {
 		thumbURL = data.Thumbnail.Source
 	}
-	if thumbURL == "" && data.Originalimg != nil {
-		thumbURL = data.Originalimg.Source
-	}
-
-	if thumbURL != "" && !strings.EqualFold(data.Type, "disambiguation") {
-		path, err := wikiDownloadThumb(thumbURL)
-		if err == nil && path != "" {
+	if thumbURL != "" && !disambig {
+		if path, err := wikiDownloadThumb(ctx, thumbURL); err == nil {
 			defer os.Remove(path)
-			if status != nil {
+			if _, err := modules.TransferReplyMedia(m, path, &tg.MediaOptions{Caption: out}); err == nil {
 				status.Delete()
+				return nil
 			}
-			m.ReplyMedia(path, &tg.MediaOptions{Caption: out})
-			return nil
 		}
 	}
-
-	if status != nil {
-		status.Edit(out)
-	} else {
-		m.Reply(out)
-	}
+	status.Edit(out, &tg.SendOptions{LinkPreview: false})
 	return nil
 }
 
-func initFromSrc_definewiki_3_1() { modules.QueueHandlerRegistration(registerWikiHandlers) }
-
-func registerWikiHandlers() {
-	c := modules.Client
-	c.On("cmd:wiki", WikiHandler)
+func numberFacts(n int64) []string {
+	var facts []string
+	abs := n
+	if abs < 0 {
+		abs = -abs
+	}
+	parity := "even"
+	if n%2 != 0 {
+		parity = "odd"
+	}
+	facts = append(facts, fmt.Sprintf("%d is %s.", n, parity))
+	if n > 1 && big.NewInt(n).ProbablyPrime(20) {
+		facts = append(facts, fmt.Sprintf("%d is a prime number.", n))
+	} else if n > 1 {
+		facts = append(facts, fmt.Sprintf("Prime factorisation: %s", primeFactors(n)))
+	}
+	if r := int64(math.Sqrt(float64(abs))); n >= 0 && (r*r == n || (r+1)*(r+1) == n) {
+		facts = append(facts, fmt.Sprintf("%d is a perfect square.", n))
+	}
+	if c := int64(math.Round(math.Cbrt(float64(n)))); c*c*c == n && n != 0 {
+		facts = append(facts, fmt.Sprintf("%d is a perfect cube (%d³).", n, c))
+	}
+	if n > 0 && n&(n-1) == 0 {
+		facts = append(facts, fmt.Sprintf("%d is a power of two (2^%d).", n, bits.TrailingZeros64(uint64(n))))
+	}
+	if n > 1 && n <= 1e12 {
+		if s := divisorSum(n); s == n {
+			facts = append(facts, fmt.Sprintf("%d is a perfect number.", n))
+		} else if s > n {
+			facts = append(facts, fmt.Sprintf("%d is an abundant number.", n))
+		}
+	}
+	if isFibonacci(n) {
+		facts = append(facts, fmt.Sprintf("%d is a Fibonacci number.", n))
+	}
+	if s := strconv.FormatInt(abs, 10); len(s) > 1 && s == reverseString(s) {
+		facts = append(facts, fmt.Sprintf("%d is a palindrome.", n))
+	}
+	digitSum := 0
+	for _, ch := range strconv.FormatInt(abs, 10) {
+		digitSum += int(ch - '0')
+	}
+	facts = append(facts, fmt.Sprintf("Digit sum: %d", digitSum))
+	if n > 0 && n < 4000 {
+		facts = append(facts, "Roman numeral: "+toRoman(int(n)))
+	}
+	facts = append(facts,
+		"Binary: "+strconv.FormatInt(n, 2),
+		"Hex: 0x"+strings.ToUpper(strconv.FormatInt(n, 16)),
+		"Octal: 0o"+strconv.FormatInt(n, 8))
+	return facts
 }
 
-var numFactClient = &http.Client{Timeout: 30 * time.Second}
+func primeFactors(n int64) string {
+	var parts []string
+	for p := int64(2); p*p <= n; p++ {
+		k := 0
+		for n%p == 0 {
+			n /= p
+			k++
+		}
+		if k == 1 {
+			parts = append(parts, strconv.FormatInt(p, 10))
+		} else if k > 1 {
+			parts = append(parts, fmt.Sprintf("%d^%d", p, k))
+		}
+		if p > 1e6 {
+			break
+		}
+	}
+	if n > 1 {
+		parts = append(parts, strconv.FormatInt(n, 10))
+	}
+	return strings.Join(parts, " × ")
+}
 
-func fetchNumFact(endpoint string) (string, error) {
-	req, err := http.NewRequest(http.MethodGet, endpoint, nil)
-	if err != nil {
-		return "", err
+func divisorSum(n int64) int64 {
+	sum := int64(1)
+	for i := int64(2); i*i <= n; i++ {
+		if n%i == 0 {
+			sum += i
+			if j := n / i; j != i {
+				sum += j
+			}
+		}
 	}
-	req.Header.Set("User-Agent", "JuliaBot/1.0")
-	resp, err := numFactClient.Do(req)
-	if err != nil {
-		return "", err
+	return sum
+}
+
+func isFibonacci(n int64) bool {
+	if n < 0 {
+		return false
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("numbersapi returned status %d", resp.StatusCode)
+	a, b := int64(0), int64(1)
+	for a < n {
+		if b > math.MaxInt64-a {
+			return false
+		}
+		a, b = b, a+b
 	}
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return "", err
+	return a == n
+}
+
+func reverseString(s string) string {
+	r := []rune(s)
+	for i, j := 0, len(r)-1; i < j; i, j = i+1, j-1 {
+		r[i], r[j] = r[j], r[i]
 	}
-	return strings.TrimSpace(string(body)), nil
+	return string(r)
+}
+
+func toRoman(n int) string {
+	vals := []int{1000, 900, 500, 400, 100, 90, 50, 40, 10, 9, 5, 4, 1}
+	syms := []string{"M", "CM", "D", "CD", "C", "XC", "L", "XL", "X", "IX", "V", "IV", "I"}
+	var b strings.Builder
+	for i, v := range vals {
+		for n >= v {
+			b.WriteString(syms[i])
+			n -= v
+		}
+	}
+	return b.String()
 }
 
 func NumFactHandler(m *tg.NewMessage) error {
 	arg := strings.TrimSpace(m.Args())
 	if arg == "" {
-		m.Reply("Usage: <code>/numfact &lt;number&gt;</code>")
-		return nil
+		arg = strconv.Itoa(rand.Intn(1000) + 1)
 	}
-	if _, err := strconv.Atoi(arg); err != nil {
+	n, err := strconv.ParseInt(strings.ReplaceAll(arg, ",", ""), 10, 64)
+	if err != nil || n == math.MinInt64 {
 		m.Reply("<b>Error:</b> please provide a valid integer.")
 		return nil
 	}
-	endpoint := "http://numbersapi.com/" + arg + "/trivia"
-	fact, err := fetchNumFact(endpoint)
-	if err != nil {
-		m.Reply("<b>Error:</b> failed to fetch number fact.")
-		return nil
+	var b strings.Builder
+	fmt.Fprintf(&b, "<b>Number Facts: %d</b>\n", n)
+	for _, f := range numberFacts(n) {
+		b.WriteString("\n• " + html.EscapeString(f))
 	}
-	if fact == "" {
-		m.Reply("<b>Error:</b> no fact received.")
-		return nil
-	}
-	m.Reply(fmt.Sprintf("<b>Number Fact (%s):</b>\n<blockquote>%s</blockquote>", html.EscapeString(arg), html.EscapeString(fact)))
+	m.Reply(b.String())
 	return nil
 }
 
+type onThisDayEvent struct {
+	Text string `json:"text"`
+	Year int    `json:"year"`
+}
+
+func parseMonthDay(arg string) (int, int, bool) {
+	arg = strings.TrimSpace(arg)
+	if arg == "" || strings.EqualFold(arg, "today") {
+		now := time.Now().UTC()
+		return int(now.Month()), now.Day(), true
+	}
+	for _, layout := range []string{"1/2", "01/02", "1-2", "01-02", "Jan 2", "January 2", "2 Jan", "2 January"} {
+		if t, err := time.Parse(layout, arg); err == nil {
+			return int(t.Month()), t.Day(), true
+		}
+	}
+	return 0, 0, false
+}
+
 func DateFactHandler(m *tg.NewMessage) error {
-	arg := strings.TrimSpace(m.Args())
-	if arg == "" {
-		m.Reply("Usage: <code>/datefact MM/DD</code>")
+	month, day, ok := parseMonthDay(m.Args())
+	if !ok {
+		m.Reply("Usage: <code>/datefact [MM/DD]</code> — e.g. <code>/datefact 03/14</code> or <code>/datefact Mar 14</code> (default: today)")
 		return nil
 	}
-	parts := strings.Split(arg, "/")
-	if len(parts) != 2 {
-		m.Reply("<b>Error:</b> format must be <code>MM/DD</code>.")
-		return nil
+	status := modules.NewStatus(m, "Fetching events for that date…")
+	var out struct {
+		Events []onThisDayEvent `json:"events"`
 	}
-	month, err := strconv.Atoi(strings.TrimSpace(parts[0]))
-	if err != nil || month < 1 || month > 12 {
-		m.Reply("<b>Error:</b> invalid month (1-12).")
-		return nil
-	}
-	day, err := strconv.Atoi(strings.TrimSpace(parts[1]))
-	if err != nil || day < 1 || day > 31 {
-		m.Reply("<b>Error:</b> invalid day (1-31).")
-		return nil
-	}
-	endpoint := fmt.Sprintf("http://numbersapi.com/%d/%d/date", month, day)
-	fact, err := fetchNumFact(endpoint)
+	err := extGetJSON(context.Background(), fmt.Sprintf("https://en.wikipedia.org/api/rest_v1/feed/onthisday/events/%02d/%02d", month, day), &out, "User-Agent", wikiUA)
 	if err != nil {
-		m.Reply("<b>Error:</b> failed to fetch date fact.")
+		status.Edit("<b>Error:</b> failed to fetch date facts: " + html.EscapeString(err.Error()))
 		return nil
 	}
-	if fact == "" {
-		m.Reply("<b>Error:</b> no fact received.")
+	if len(out.Events) == 0 {
+		status.Edit("<b>Error:</b> no events found for that date.")
 		return nil
 	}
-	label := fmt.Sprintf("%02d/%02d", month, day)
-	m.Reply(fmt.Sprintf("<b>Date Fact (%s):</b>\n<blockquote>%s</blockquote>", html.EscapeString(label), html.EscapeString(fact)))
+	rand.Shuffle(len(out.Events), func(i, j int) { out.Events[i], out.Events[j] = out.Events[j], out.Events[i] })
+	label := time.Date(2000, time.Month(month), day, 0, 0, 0, 0, time.UTC).Format("January 2")
+	var b strings.Builder
+	fmt.Fprintf(&b, "<b>On this day — %s</b>\n", label)
+	for _, e := range out.Events[:min(3, len(out.Events))] {
+		fmt.Fprintf(&b, "\n<b>%d:</b> %s", e.Year, html.EscapeString(clipRunes(e.Text, 300)))
+	}
+	status.Edit(b.String())
 	return nil
+}
+
+var (
+	wikiRefRe      = regexp.MustCompile(`(?s)<ref[^>/]*/>|<ref[^>]*>.*?</ref>`)
+	wikiTemplateRe = regexp.MustCompile(`\{\{[^{}]*\}\}`)
+	wikiLinkRe     = regexp.MustCompile(`\[\[(?:[^|\]]*\|)?([^\]]*)\]\]`)
+	wikiCommentRe  = regexp.MustCompile(`(?s)<!--.*?-->`)
+)
+
+func cleanWikitext(s string) string {
+	s = wikiCommentRe.ReplaceAllString(s, "")
+	s = wikiRefRe.ReplaceAllString(s, "")
+	for i := 0; i < 5 && strings.Contains(s, "{{"); i++ {
+		s = wikiTemplateRe.ReplaceAllString(s, "")
+	}
+	s = wikiLinkRe.ReplaceAllString(s, "$1")
+	s = strings.NewReplacer("'''", "", "''", "", "&nbsp;", " ").Replace(s)
+	return strings.Join(strings.Fields(htmlTagRe.ReplaceAllString(s, "")), " ")
+}
+
+// parseYearEvents extracts bullet events from a Wikipedia year article's "Events" wikitext,
+// prefixing nested bullets with their parent date.
+func parseYearEvents(wikitext string) []string {
+	var events []string
+	parent := ""
+	for _, line := range strings.Split(wikitext, "\n") {
+		if !strings.HasPrefix(line, "*") {
+			continue
+		}
+		depth := len(line) - len(strings.TrimLeft(line, "*"))
+		text := cleanWikitext(strings.TrimLeft(line, "*"))
+		if text == "" {
+			continue
+		}
+		if depth == 1 {
+			if i := strings.Index(text, " – "); i < 0 && len([]rune(text)) < 25 {
+				parent = text
+				continue
+			}
+			parent = ""
+			if i := strings.Index(text, " – "); i > 0 {
+				parent = text[:i]
+			}
+		} else if parent != "" {
+			text = parent + " – " + text
+		}
+		if len([]rune(text)) >= 20 {
+			events = append(events, text)
+		}
+	}
+	return events
 }
 
 func YearFactHandler(m *tg.NewMessage) error {
 	arg := strings.TrimSpace(m.Args())
-	if arg == "" {
-		m.Reply("Usage: <code>/yearfact &lt;year&gt;</code>")
-		return nil
-	}
 	year, err := strconv.Atoi(arg)
-	if err != nil {
-		m.Reply("<b>Error:</b> please provide a valid year.")
+	if arg == "" || err != nil || year < 1 || year > time.Now().Year() {
+		m.Reply(fmt.Sprintf("Usage: <code>/yearfact &lt;year&gt;</code> — a year between 1 and %d, e.g. <code>/yearfact 1969</code>", time.Now().Year()))
 		return nil
 	}
-	endpoint := fmt.Sprintf("http://numbersapi.com/%d/year", year)
-	fact, err := fetchNumFact(endpoint)
-	if err != nil {
-		m.Reply("<b>Error:</b> failed to fetch year fact.")
+	status := modules.NewStatus(m, "Fetching events from that year…")
+	var out struct {
+		Parse struct {
+			Wikitext string `json:"wikitext"`
+		} `json:"parse"`
+	}
+	endpoint := fmt.Sprintf("https://en.wikipedia.org/w/api.php?action=parse&prop=wikitext&section=1&format=json&formatversion=2&redirects=1&page=%s", url.QueryEscape(yearArticle(year)))
+	if err := extGetJSON(context.Background(), endpoint, &out, "User-Agent", wikiUA); err != nil {
+		status.Edit("<b>Error:</b> failed to fetch year facts: " + html.EscapeString(err.Error()))
 		return nil
 	}
-	if fact == "" {
-		m.Reply("<b>Error:</b> no fact received.")
+	events := parseYearEvents(out.Parse.Wikitext)
+	if len(events) == 0 {
+		status.Edit(fmt.Sprintf("<b>Error:</b> no events found for %d.", year))
 		return nil
 	}
-	m.Reply(fmt.Sprintf("<b>Year Fact (%d):</b>\n<blockquote>%s</blockquote>", year, html.EscapeString(fact)))
+	rand.Shuffle(len(events), func(i, j int) { events[i], events[j] = events[j], events[i] })
+	var b strings.Builder
+	fmt.Fprintf(&b, "<b>Events in %d</b>\n", year)
+	for _, e := range events[:min(3, len(events))] {
+		b.WriteString("\n• " + html.EscapeString(clipRunes(e, 300)))
+	}
+	fmt.Fprintf(&b, "\n\n<a href=\"https://en.wikipedia.org/wiki/%s\">More on Wikipedia</a>", url.PathEscape(yearArticle(year)))
+	status.Edit(b.String(), &tg.SendOptions{LinkPreview: false})
 	return nil
 }
 
-func registerNumFactHandlers() {
-	c := modules.Client
-	c.On("cmd:numfact", NumFactHandler)
-	c.On("cmd:datefact", DateFactHandler)
-	c.On("cmd:yearfact", YearFactHandler)
-}
-
-func initFromSrc_numfact_4_1() {
-	modules.QueueHandlerRegistration(registerNumFactHandlers)
-}
-
-var randomFactAPIClient = &http.Client{Timeout: 30 * time.Second}
-
-type uselessFactResp struct {
-	ID        string `json:"id"`
-	Text      string `json:"text"`
-	Source    string `json:"source"`
-	SourceURL string `json:"source_url"`
-	Language  string `json:"language"`
-	Permalink string `json:"permalink"`
+func yearArticle(year int) string {
+	if year < 1000 {
+		return fmt.Sprintf("AD_%d", year)
+	}
+	return strconv.Itoa(year)
 }
 
 type zenQuoteResp struct {
-	Q    string `json:"q"`
-	A    string `json:"a"`
-	I    string `json:"i"`
-	H    string `json:"h"`
-	Date string `json:"date"`
+	Q string `json:"q"`
+	A string `json:"a"`
 }
 
-func fetchRandomFactAPIJSON(url string, out interface{}) error {
-	req, err := http.NewRequest("GET", url, nil)
-	if err != nil {
-		return err
+func RandomFactHandler(m *tg.NewMessage) error {
+	status := modules.NewStatus(m, "Finding a fact…")
+	var f struct {
+		Text      string `json:"text"`
+		Source    string `json:"source"`
+		SourceURL string `json:"source_url"`
 	}
-	req.Header.Set("Accept", "application/json")
-	req.Header.Set("User-Agent", "JuliaBot (https://github.com/amarnathcjd)")
-	resp, err := randomFactAPIClient.Do(req)
-	if err != nil {
-		return err
+	if err := extGetJSON(context.Background(), "https://uselessfacts.jsph.pl/api/v2/facts/random?language=en", &f); err != nil || f.Text == "" {
+		status.Edit("<b>Error:</b> failed to fetch a random fact.")
+		return nil
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode != 200 {
-		return fmt.Errorf("status %d", resp.StatusCode)
+	msg := "<b>Random Fact:</b>\n<i>" + html.EscapeString(f.Text) + "</i>"
+	if f.Source != "" {
+		if f.SourceURL != "" {
+			msg += fmt.Sprintf("\n\n<b>Source:</b> <a href=\"%s\">%s</a>", html.EscapeString(f.SourceURL), html.EscapeString(f.Source))
+		} else {
+			msg += "\n\n<b>Source:</b> " + html.EscapeString(f.Source)
+		}
 	}
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return err
-	}
-	return json.Unmarshal(body, out)
+	status.Edit(msg, &tg.SendOptions{LinkPreview: false})
+	return nil
 }
 
-func RandomFact2Handler(m *tg.NewMessage) error {
-	var f uselessFactResp
-	if err := fetchRandomFactAPIJSON("https://uselessfacts.jsph.pl/api/v2/facts/random?language=en", &f); err != nil {
-		m.Reply("<b>Error:</b> failed to fetch random fact.")
+func zenQuote(m *tg.NewMessage, endpoint, title string) error {
+	var arr []zenQuoteResp
+	if err := extGetJSON(context.Background(), endpoint, &arr); err != nil || len(arr) == 0 || arr[0].Q == "" {
+		m.Reply("<b>Error:</b> failed to fetch a quote.")
 		return nil
 	}
-	if f.Text == "" {
-		m.Reply("<b>Error:</b> empty fact received.")
-		return nil
+	author := arr[0].A
+	if author == "" {
+		author = "Unknown"
 	}
-	source := f.Source
-	if source == "" {
-		source = "unknown"
-	}
-	msg := fmt.Sprintf("<b>Random Fact:</b>\n<i>%s</i>\n\n<b>Source:</b> <code>%s</code>", html.EscapeString(f.Text), html.EscapeString(source))
-	if f.Permalink != "" {
-		msg += fmt.Sprintf("\n<a href=\"%s\">permalink</a>", html.EscapeString(f.Permalink))
-	}
-	m.Reply(msg)
+	m.Reply(fmt.Sprintf("<b>%s</b>\n<blockquote>%s</blockquote>\n— <i>%s</i>", title, html.EscapeString(arr[0].Q), html.EscapeString(author)))
 	return nil
 }
 
 func QuoteDailyHandler(m *tg.NewMessage) error {
-	var arr []zenQuoteResp
-	if err := fetchRandomFactAPIJSON("https://zenquotes.io/api/today", &arr); err != nil {
-		m.Reply("<b>Error:</b> failed to fetch daily quote.")
-		return nil
-	}
-	if len(arr) == 0 || arr[0].Q == "" {
-		m.Reply("<b>Error:</b> empty quote received.")
-		return nil
-	}
-	q := arr[0]
-	author := q.A
-	if author == "" {
-		author = "Unknown"
-	}
-	msg := fmt.Sprintf("<b>Quote of the Day:</b>\n<i>%s</i>\n\n<b>— %s</b>", html.EscapeString(q.Q), html.EscapeString(author))
-	if q.Date != "" {
-		msg += fmt.Sprintf("\n<code>%s</code>", html.EscapeString(q.Date))
-	}
-	m.Reply(msg)
-	return nil
+	return zenQuote(m, "https://zenquotes.io/api/today", "Quote of the Day")
 }
 
 func RandomQuoteHandler(m *tg.NewMessage) error {
-	var arr []zenQuoteResp
-	if err := fetchRandomFactAPIJSON("https://zenquotes.io/api/random", &arr); err != nil {
-		m.Reply("<b>Error:</b> failed to fetch random quote.")
-		return nil
-	}
-	if len(arr) == 0 || arr[0].Q == "" {
-		m.Reply("<b>Error:</b> empty quote received.")
-		return nil
-	}
-	q := arr[0]
-	author := q.A
-	if author == "" {
-		author = "Unknown"
-	}
-	m.Reply(fmt.Sprintf("<b>Random Quote:</b>\n<i>%s</i>\n\n<b>— %s</b>", html.EscapeString(q.Q), html.EscapeString(author)))
-	return nil
-}
-
-func registerRandomFactAPIHandlers() {
-	c := modules.Client
-	c.On("cmd:randomfact2", RandomFact2Handler)
-	c.On("cmd:quotedaily", QuoteDailyHandler)
-	c.On("cmd:randomquote", RandomQuoteHandler)
-}
-
-func initFromSrc_random_fact_api_5_1() {
-	modules.QueueHandlerRegistration(registerRandomFactAPIHandlers)
+	return zenQuote(m, "https://zenquotes.io/api/random", "Random Quote")
 }
 
 type ipLookupResult struct {
@@ -901,7 +829,6 @@ type ipLookupResult struct {
 	Query       string  `json:"query"`
 	Country     string  `json:"country"`
 	CountryCode string  `json:"countryCode"`
-	Region      string  `json:"region"`
 	RegionName  string  `json:"regionName"`
 	City        string  `json:"city"`
 	Zip         string  `json:"zip"`
@@ -917,52 +844,35 @@ type ipLookupResult struct {
 	Reverse     string  `json:"reverse"`
 }
 
-func IPLookupHandler(m *tg.NewMessage) error {
-	target := strings.TrimSpace(m.Args())
-	if target == "" {
-		if m.IsReply() {
-			r, err := m.GetReplyMessage()
-			if err == nil && r != nil {
-				target = strings.TrimSpace(r.Text())
-			}
-		}
-	}
-	if target == "" {
-		m.Reply("Usage: <code>/ip &lt;ip or domain&gt;</code>")
-		return nil
-	}
+func normalizeIPTarget(target string) string {
+	target = strings.TrimSpace(target)
 	if strings.Contains(target, "://") {
 		if u, err := url.Parse(target); err == nil && u.Host != "" {
 			target = u.Host
 		}
 	}
-	target = strings.TrimPrefix(target, "www.")
-	if i := strings.Index(target, "/"); i > 0 {
+	if i := strings.IndexAny(target, "/?#"); i > 0 {
 		target = target[:i]
 	}
-	if i := strings.Index(target, ":"); i > 0 {
-		if _, err := strconv.Atoi(target[i+1:]); err == nil {
-			target = target[:i]
-		}
+	if host, _, err := net.SplitHostPort(target); err == nil {
+		target = host
 	}
+	target = strings.Trim(target, "[]")
+	return strings.TrimPrefix(strings.ToLower(target), "www.")
+}
 
-	client := &http.Client{Timeout: 15 * time.Second}
-	api := fmt.Sprintf("http://ip-api.com/json/%s?fields=status,message,query,country,countryCode,region,regionName,city,zip,lat,lon,timezone,isp,org,as,mobile,proxy,hosting,reverse",
-		url.PathEscape(target))
-	resp, err := client.Get(api)
-	if err != nil {
-		m.Reply("Lookup failed: " + html.EscapeString(err.Error()))
+func IPLookupHandler(m *tg.NewMessage) error {
+	target := normalizeIPTarget(replyArgOrQuoted(m))
+	if target == "" || strings.ContainsAny(target, " \n") {
+		m.Reply("Usage: <code>/ip &lt;ip or domain&gt;</code>")
 		return nil
 	}
-	defer resp.Body.Close()
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		m.Reply("Failed to read response.")
-		return nil
-	}
+	status := modules.NewStatus(m, "Looking up the address…")
 	var r ipLookupResult
-	if err := json.Unmarshal(body, &r); err != nil {
-		m.Reply("Failed to parse response.")
+	// ip-api's free tier is HTTP-only.
+	api := "http://ip-api.com/json/" + url.PathEscape(target) + "?fields=status,message,query,country,countryCode,regionName,city,zip,lat,lon,timezone,isp,org,as,mobile,proxy,hosting,reverse"
+	if err := extGetJSON(context.Background(), api, &r); err != nil {
+		status.Edit("Lookup failed: " + html.EscapeString(err.Error()))
 		return nil
 	}
 	if r.Status != "success" {
@@ -970,48 +880,42 @@ func IPLookupHandler(m *tg.NewMessage) error {
 		if msg == "" {
 			msg = "invalid query"
 		}
-		m.Reply(fmt.Sprintf("Lookup failed for <code>%s</code>: %s",
-			html.EscapeString(target), html.EscapeString(msg)))
+		status.Edit(fmt.Sprintf("Lookup failed for <code>%s</code>: %s", html.EscapeString(target), html.EscapeString(msg)))
 		return nil
 	}
 
 	var sb strings.Builder
 	sb.WriteString("<b>IP Lookup</b>\n")
-	sb.WriteString(fmt.Sprintf("<b>Query:</b> <code>%s</code>\n", html.EscapeString(r.Query)))
-	if r.Reverse != "" && r.Reverse != r.Query {
-		sb.WriteString(fmt.Sprintf("<b>Reverse:</b> <code>%s</code>\n", html.EscapeString(r.Reverse)))
-	}
-	if r.Country != "" {
-		loc := r.Country
-		if r.CountryCode != "" {
-			loc += fmt.Sprintf(" (%s)", r.CountryCode)
+	field := func(label, val string, code bool) {
+		if val == "" {
+			return
 		}
-		sb.WriteString(fmt.Sprintf("<b>Country:</b> %s\n", html.EscapeString(loc)))
+		val = html.EscapeString(val)
+		if code {
+			val = "<code>" + val + "</code>"
+		}
+		fmt.Fprintf(&sb, "<b>%s:</b> %s\n", label, val)
 	}
-	regionCity := strings.TrimSpace(strings.Join([]string{r.City, r.RegionName}, ", "))
-	regionCity = strings.Trim(regionCity, " ,")
-	if regionCity != "" {
-		sb.WriteString(fmt.Sprintf("<b>Region:</b> %s\n", html.EscapeString(regionCity)))
+	field("Query", r.Query, true)
+	if r.Reverse != r.Query {
+		field("Reverse", r.Reverse, true)
 	}
-	if r.Zip != "" {
-		sb.WriteString(fmt.Sprintf("<b>Zip:</b> %s\n", html.EscapeString(r.Zip)))
+	if r.Country != "" && r.CountryCode != "" {
+		field("Country", fmt.Sprintf("%s (%s)", r.Country, r.CountryCode), false)
+	} else {
+		field("Country", r.Country, false)
 	}
-	if r.Timezone != "" {
-		sb.WriteString(fmt.Sprintf("<b>Timezone:</b> %s\n", html.EscapeString(r.Timezone)))
-	}
+	field("Region", strings.Trim(strings.Join([]string{r.City, r.RegionName}, ", "), " ,"), false)
+	field("Zip", r.Zip, false)
+	field("Timezone", r.Timezone, false)
 	if r.Lat != 0 || r.Lon != 0 {
-		sb.WriteString(fmt.Sprintf("<b>Coords:</b> <a href=\"https://maps.google.com/?q=%f,%f\">%.4f, %.4f</a>\n",
-			r.Lat, r.Lon, r.Lat, r.Lon))
+		fmt.Fprintf(&sb, "<b>Coords:</b> <a href=\"https://maps.google.com/?q=%f,%f\">%.4f, %.4f</a>\n", r.Lat, r.Lon, r.Lat, r.Lon)
 	}
-	if r.ISP != "" {
-		sb.WriteString(fmt.Sprintf("<b>ISP:</b> %s\n", html.EscapeString(r.ISP)))
+	field("ISP", r.ISP, false)
+	if r.Org != r.ISP {
+		field("Org", r.Org, false)
 	}
-	if r.Org != "" && r.Org != r.ISP {
-		sb.WriteString(fmt.Sprintf("<b>Org:</b> %s\n", html.EscapeString(r.Org)))
-	}
-	if r.AS != "" {
-		sb.WriteString(fmt.Sprintf("<b>AS:</b> <code>%s</code>\n", html.EscapeString(r.AS)))
-	}
+	field("AS", r.AS, true)
 	var flags []string
 	if r.Mobile {
 		flags = append(flags, "mobile")
@@ -1022,41 +926,50 @@ func IPLookupHandler(m *tg.NewMessage) error {
 	if r.Hosting {
 		flags = append(flags, "hosting/dc")
 	}
-	if len(flags) > 0 {
-		sb.WriteString(fmt.Sprintf("<b>Flags:</b> %s\n", strings.Join(flags, ", ")))
-	}
-
-	m.Reply(sb.String(), &tg.SendOptions{LinkPreview: false})
+	field("Flags", strings.Join(flags, ", "), false)
+	status.Edit(sb.String(), &tg.SendOptions{LinkPreview: false})
 	return nil
 }
 
-func registerIPLookupHandlers() {
+func registerLookupHandlers() {
 	c := modules.Client
-	c.On("cmd:ip", IPLookupHandler)
-	c.On("cmd:iplookup", IPLookupHandler)
-}
-
-func initFromSrc_iplookup_6_1() {
-	modules.QueueHandlerRegistration(registerIPLookupHandlers)
+	modules.OnCommand(c, "cmd:define", DefineHandler)
+	modules.OnCommand(c, "cmd:kanji", KanjiLookupHandler)
+	modules.OnCommand(c, "cmd:urban", UrbanHandler)
+	modules.OnCommand(c, "cmd:ud", UrbanHandler)
+	c.On("callback:urban:", UrbanCallback)
+	modules.OnCommand(c, "cmd:wiki", WikiHandler)
+	modules.OnCommand(c, "cmd:numfact", NumFactHandler)
+	modules.OnCommand(c, "cmd:datefact", DateFactHandler)
+	modules.OnCommand(c, "cmd:yearfact", YearFactHandler)
+	modules.OnCommand(c, "cmd:randomfact", RandomFactHandler)
+	modules.OnCommand(c, "cmd:randomfact2", RandomFactHandler)
+	modules.OnCommand(c, "cmd:quotedaily", QuoteDailyHandler)
+	modules.OnCommand(c, "cmd:randomquote", RandomQuoteHandler)
+	modules.OnCommand(c, "cmd:ip", IPLookupHandler)
+	modules.OnCommand(c, "cmd:iplookup", IPLookupHandler)
 }
 
 func init() {
-	initFromSrc_dictionary_0_1()
-	initFromSrc_kanji_lookup_1_1()
-	initFromSrc_urban_2_1()
-	initFromSrc_definewiki_3_1()
-	initFromSrc_numfact_4_1()
-	initFromSrc_random_fact_api_5_1()
-	initFromSrc_iplookup_6_1()
+	modules.QueueHandlerRegistration(registerLookupHandlers)
+	modules.Mods.AddModule("Lookup", `<b>Lookup</b>
 
-	modules.Mods.AddModule("IP Lookup", `<b>IP Lookup</b>
+<b>Words</b>
+ - <code>/define &lt;word&gt;</code> - dictionary definition (Wiktionary). Ex: <code>/define serendipity</code>
+ - <code>/urban &lt;term&gt;</code> (alias <code>/ud</code>) - Urban Dictionary with paging. Ex: <code>/urban yeet</code>
+ - <code>/kanji &lt;character&gt;</code> - kanji meanings, readings, JLPT. Ex: <code>/kanji 日</code>
+ - <code>/wiki &lt;term&gt;</code> - Wikipedia summary. Ex: <code>/wiki Alan Turing</code>
 
-Look up geolocation, ISP, ASN, and proxy/hosting flags for any IP address or domain.
+<b>Facts &amp; quotes</b>
+ - <code>/numfact [number]</code> - math facts about a number. Ex: <code>/numfact 28</code>
+ - <code>/datefact [MM/DD]</code> - historical events on a date (default today). Ex: <code>/datefact 07/20</code>
+ - <code>/yearfact &lt;year&gt;</code> - events from a year. Ex: <code>/yearfact 1969</code>
+ - <code>/randomfact</code> - a random fact
+ - <code>/randomquote</code> - a random quote
+ - <code>/quotedaily</code> - quote of the day
 
-<b>Commands:</b>
- - /ip &lt;ip or domain&gt; - Lookup details
- - /iplookup &lt;ip or domain&gt; - Same as /ip
- - Reply to a message with just <code>/ip</code> to look up whatever text it contains.
+<b>Network</b>
+ - <code>/ip &lt;ip or domain&gt;</code> (alias <code>/iplookup</code>) - geolocation, ISP, ASN, proxy/hosting flags. Ex: <code>/ip 1.1.1.1</code>
 
-<i>Data by ip-api.com — free tier, 45 requests/min.</i>`)
+<i>/define, /urban, /wiki and /ip also work as a reply to a message containing the text.</i>`)
 }

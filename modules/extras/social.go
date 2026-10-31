@@ -4,7 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
-	tg "github.com/amarnathcjd/gogram/telegram"
+	tg "github.com/xAmarnath/gogram/telegram"
 	"html"
 	"io"
 	modules "main/modules"
@@ -20,6 +20,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	nethtml "golang.org/x/net/html"
 )
 
 var charsX = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ+/"
@@ -49,6 +51,9 @@ type Downloads struct {
 }
 
 func decodeStringX(d string, e, f int) string {
+	if e < 2 || e > len(charsX) || f < 2 || f > len(charsX) {
+		return ""
+	}
 	baseChars := charsX[:e]
 	targetChars := charsX[:f]
 
@@ -81,6 +86,9 @@ func reverseX(s string) string {
 }
 
 func decodeX(encodedString string, _ int, alphabet string, shift, offset int, _ int) string {
+	if offset < 2 || offset >= len(alphabet) || offset > len(charsX) {
+		return ""
+	}
 	var decoded strings.Builder
 
 	for i := 0; i < len(encodedString); {
@@ -164,7 +172,7 @@ func fetchInstagramMedia(url string) (*SnapResponse, error) {
 	formField.Write([]byte(strings.TrimSpace(url)))
 	writer.Close()
 
-	client := &http.Client{}
+	client := &http.Client{Timeout: 30 * time.Second}
 	req, _ := http.NewRequest("POST", hostUrl, form)
 	for key, value := range headers {
 		req.Header.Set(key, value)
@@ -191,32 +199,84 @@ func fetchInstagramMedia(url string) (*SnapResponse, error) {
 		return &SnapResponse{Error: "could not fetch post (may be private, deleted, or age-restricted)"}, nil
 	}
 
-	pattern := regexp.MustCompile(`class=\\"icon\s+icon-dl(image|video)\\"[^>]*>.*?<a[^>]+href=\\"([^"]+)\\"`)
-	matches := pattern.FindAllStringSubmatch(result, -1)
-
-	if len(matches) == 0 {
+	media := parseInstagramDownloadLinks(result)
+	if len(media.Images) == 0 && len(media.Videos) == 0 {
 		return &SnapResponse{Error: "failed to extract download URLs"}, nil
 	}
+	return media, nil
+}
 
-	var images, videos []string
-	for _, match := range matches {
-		if len(match) >= 3 {
-			mediaType := match[1]
-			mediaURL := strings.ReplaceAll(match[2], "\\", "")
-
-			switch mediaType {
-			case "image":
-				images = append(images, mediaURL)
-			case "video":
-				videos = append(videos, mediaURL)
+// Providers may put a thumbnail link before the actual video button. Classify
+// the button itself instead of taking the first URL next to a video icon.
+func parseInstagramDownloadLinks(raw string) *SnapResponse {
+	raw = strings.NewReplacer(`\"`, `"`, `\/`, `/`, `\u0026`, `&`).Replace(raw)
+	doc, err := nethtml.Parse(strings.NewReader(raw))
+	out := &SnapResponse{}
+	if err != nil {
+		return out
+	}
+	seen := map[string]bool{}
+	var visit func(*nethtml.Node)
+	visit = func(n *nethtml.Node) {
+		if n.Type == nethtml.ElementNode && n.Data == "a" {
+			href, kind, label := "", "", ""
+			for _, a := range n.Attr {
+				if a.Key == "href" {
+					href = a.Val
+				}
+				if a.Key == "title" {
+					label += " " + a.Val
+				}
+			}
+			var scan func(*nethtml.Node)
+			scan = func(child *nethtml.Node) {
+				if child.Type == nethtml.TextNode {
+					label += " " + child.Data
+				}
+				for _, a := range child.Attr {
+					if a.Key == "class" {
+						for _, cls := range strings.Fields(a.Val) {
+							if cls == "icon-dlvideo" {
+								kind = "video"
+							}
+							if cls == "icon-dlimage" {
+								kind = "image"
+							}
+						}
+					}
+				}
+				for c := child.FirstChild; c != nil; c = c.NextSibling {
+					scan(c)
+				}
+			}
+			scan(n)
+			label = strings.ToLower(label)
+			switch {
+			case strings.Contains(label, "thumbnail"):
+				kind = ""
+			case strings.Contains(label, "download video"):
+				kind = "video"
+			case strings.Contains(label, "download photo"), strings.Contains(label, "download image"):
+				kind = "image"
+			}
+			u, err := url.Parse(href)
+			if err == nil && u.Host != "" && (u.Scheme == "https" || u.Scheme == "http") && !seen[href] {
+				switch kind {
+				case "video":
+					out.Videos = append(out.Videos, href)
+					seen[href] = true
+				case "image":
+					out.Images = append(out.Images, href)
+					seen[href] = true
+				}
 			}
 		}
+		for c := n.FirstChild; c != nil; c = c.NextSibling {
+			visit(c)
+		}
 	}
-
-	return &SnapResponse{
-		Images: images,
-		Videos: videos,
-	}, nil
+	visit(doc)
+	return out
 }
 
 type fastdlResp struct {
@@ -263,31 +323,11 @@ func fetchInstagramMediaFastdl(target string) (*SnapResponse, error) {
 		return &SnapResponse{Error: clean}, nil
 	}
 
-	itemRe := regexp.MustCompile(`(?s)<li>\s*<div class="download-items">(.*?)</li>`)
-	iconRe := regexp.MustCompile(`icon icon-dl(image|video)`)
-	hrefRe := regexp.MustCompile(`href="(https://dl\.snapcdn\.app/[^"]+)"`)
-
-	var images, videos []string
-	for _, item := range itemRe.FindAllStringSubmatch(parsed.Data, -1) {
-		block := item[1]
-		iconMatch := iconRe.FindStringSubmatch(block)
-		hrefMatch := hrefRe.FindStringSubmatch(block)
-		if iconMatch == nil || hrefMatch == nil {
-			continue
-		}
-		mediaURL := html.UnescapeString(hrefMatch[1])
-		switch iconMatch[1] {
-		case "image":
-			images = append(images, mediaURL)
-		case "video":
-			videos = append(videos, mediaURL)
-		}
-	}
-
-	if len(images) == 0 && len(videos) == 0 {
+	media := parseInstagramDownloadLinks(parsed.Data)
+	if len(media.Images) == 0 && len(media.Videos) == 0 {
 		return &SnapResponse{Error: "fastdl: no media found"}, nil
 	}
-	return &SnapResponse{Images: images, Videos: videos}, nil
+	return media, nil
 }
 
 func stripHTMLTags(s string) string {
@@ -328,7 +368,7 @@ func fetchTikTokMedia(urx string) (*SnapResponse, error) {
 		"user-agent":         "Mozilla/5.0 (Linux; Android 6.0; Nexus 5 Build/MRA58N) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Mobile Safari/537.36",
 	}
 
-	client := &http.Client{}
+	client := &http.Client{Timeout: 30 * time.Second}
 	getReq, _ := http.NewRequest("GET", "https://ssstik.io/in", nil)
 	for key, value := range headers {
 		getReq.Header.Set(key, value)
@@ -576,13 +616,15 @@ func mediaOptsFor(item *snapMediaItem) *tg.MediaOptions {
 	return opts
 }
 
-func sendAsAlbums(m *tg.NewMessage, items []*snapMediaItem) {
+func sendAsAlbums(m *tg.NewMessage, items []*snapMediaItem) error {
 	const batch = 10
 	for i := 0; i < len(items); i += batch {
 		end := min(i+batch, len(items))
 		chunk := items[i:end]
 		if len(chunk) == 1 {
-			m.ReplyMedia(chunk[0].path, mediaOptsFor(chunk[0]))
+			if _, err := modules.TransferReplyMedia(m, chunk[0].path, mediaOptsFor(chunk[0])); err != nil {
+				return err
+			}
 			continue
 		}
 		paths := make([]string, len(chunk))
@@ -599,12 +641,20 @@ func sendAsAlbums(m *tg.NewMessage, items []*snapMediaItem) {
 				&tg.DocumentAttributeVideo{SupportsStreaming: true},
 			}
 		}
-		if _, err := m.ReplyAlbum(paths, albumOpts); err != nil {
+		if _, err := modules.TransferReplyAlbum(m, paths, albumOpts); err != nil {
+			// Only retry individual files for a definitive album-format rejection.
+			// A timeout may mean Telegram already delivered part or all of it.
+			if !strings.Contains(err.Error(), "MEDIA_INVALID") && !strings.Contains(err.Error(), "GROUPED_MEDIA_INVALID") {
+				return err
+			}
 			for _, it := range chunk {
-				m.ReplyMedia(it.path, mediaOptsFor(it))
+				if _, err := modules.TransferReplyMedia(m, it.path, mediaOptsFor(it)); err != nil {
+					return err
+				}
 			}
 		}
 	}
+	return nil
 }
 
 func muxVideoFileWithAudio(videoPath string, audioBytes []byte) (*snapMediaItem, error) {
@@ -651,10 +701,13 @@ func InstaHandler(m *tg.NewMessage) error {
 		return nil
 	}
 
-	msg, _ := m.Reply("Processing request...")
+	msg, err := m.Reply("Processing request...")
+	if err != nil {
+		return err
+	}
 
 	resp, err := FetchInstagramMedia(m.Args())
-	if err != nil || resp.Error != "" {
+	if err != nil || resp == nil || resp.Error != "" {
 		msg.Edit("Failed to process URL")
 		return nil
 	}
@@ -664,10 +717,16 @@ func InstaHandler(m *tg.NewMessage) error {
 		return nil
 	}
 
-	defer msg.Delete()
 	msg.Edit(fmt.Sprintf("Found %d image(s), %d video(s). Downloading...", len(resp.Images), len(resp.Videos)))
 
 	isTikTok := isTikTokURL(m.Args())
+	delivered := 0
+	expected := min(len(resp.Videos), 20) + min(len(resp.Images), 20)
+	fail := func(err error) error {
+		m.Client.Log.Warn("Social media delivery failed: %v", err)
+		_, editErr := msg.Edit("Upload failed: " + html.EscapeString(truncErr(err)))
+		return editErr
+	}
 
 	if len(resp.Videos) > 0 {
 		vids := downloadAllAsFiles(resp.Videos, 20, "vid")
@@ -683,28 +742,43 @@ func InstaHandler(m *tg.NewMessage) error {
 			}
 		}
 
-		sendAsAlbums(m, vids)
+		if err := sendAsAlbums(m, vids); err != nil {
+			return fail(err)
+		}
+		delivered += len(vids)
 	}
 
 	if len(resp.Images) > 0 {
 		imgs := downloadAllAsFiles(resp.Images, 20, "img")
 		defer removeItems(imgs)
-		sendAsAlbums(m, imgs)
+		if err := sendAsAlbums(m, imgs); err != nil {
+			return fail(err)
+		}
+		delivered += len(imgs)
 	}
-
+	if delivered == 0 {
+		_, err = msg.Edit("The media could not be downloaded. It may be private, expired, or temporarily unavailable.")
+		return err
+	}
+	if delivered < expected {
+		_, err = msg.Edit(fmt.Sprintf("Sent %d of %d files. Some media could not be downloaded; try the link again later.", delivered, expected))
+		return err
+	}
+	_, err = msg.Delete()
 	return nil
 }
 
 func registerInstaHandlers() {
 	c := modules.Client
-	c.On("cmd:snap", InstaHandler)
-	c.On("cmd:insta", InstaHandler)
-	c.On("cmd:tik", InstaHandler)
+	modules.OnCommand(c, "cmd:snap", InstaHandler)
+	modules.OnCommand(c, "cmd:insta", InstaHandler)
+	modules.OnCommand(c, "cmd:tik", InstaHandler)
 }
 
 func initFromSrc_insta_0_1() {
 	modules.QueueHandlerRegistration(registerInstaHandlers)
 }
+
 var igOgMetaPattern = regexp.MustCompile(`<meta\s+property="og:([a-z_]+)"\s+content="([^"]*)"`)
 var igURLPattern = regexp.MustCompile(`https?://(?:www\.)?instagram\.com/[^\s]+`)
 
@@ -830,7 +904,7 @@ func IgMetaHandler(m *tg.NewMessage) error {
 	}
 	caption := b.String()
 	if meta.Image != "" {
-		if _, err := m.ReplyMedia(meta.Image, &tg.MediaOptions{Caption: caption}); err != nil {
+		if _, err := modules.TransferReplyMedia(m, meta.Image, &tg.MediaOptions{Caption: caption}); err != nil {
 			status.Edit(caption+"\n\n<b>Image:</b> <a href=\""+html.EscapeString(meta.Image)+"\">link</a>", &tg.SendOptions{LinkPreview: false})
 			return nil
 		}
@@ -843,7 +917,7 @@ func IgMetaHandler(m *tg.NewMessage) error {
 
 func registerIgMetaHandlers() {
 	c := modules.Client
-	c.On("cmd:igmeta", IgMetaHandler)
+	modules.OnCommand(c, "cmd:igmeta", IgMetaHandler)
 }
 
 func initFromSrc_instagram_oembed_1_1() { modules.QueueHandlerRegistration(registerIgMetaHandlers) }
@@ -852,6 +926,7 @@ func initFromSrc_instagram_0_1() {
 	initFromSrc_insta_0_1()
 	initFromSrc_instagram_oembed_1_1()
 }
+
 var tweetHTTPClient = &http.Client{
 	Timeout: 30 * time.Second,
 	CheckRedirect: func(req *http.Request, via []*http.Request) error {
@@ -903,7 +978,7 @@ func tweetExtractText(rawHTML string) string {
 }
 
 func tweetFetchOEmbed(tweetURL string) (*tweetOEmbed, error) {
-	endpoint := "https://publish.twitter.com/oembed?url=" + url.QueryEscape(tweetURL)
+	endpoint := "https://publish.x.com/oembed?url=" + url.QueryEscape(tweetURL)
 	req, err := http.NewRequest(http.MethodGet, endpoint, nil)
 	if err != nil {
 		return nil, err
@@ -954,9 +1029,10 @@ func TweetHandler(m *tg.NewMessage) error {
 		return nil
 	}
 
+	status := modules.NewStatus(m, "Fetching the post…")
 	data, err := tweetFetchOEmbed(match)
 	if err != nil {
-		m.Reply("<b>Error:</b> " + html.EscapeString(err.Error()))
+		status.Edit("<b>Error:</b> " + html.EscapeString(err.Error()))
 		return nil
 	}
 
@@ -982,15 +1058,16 @@ func TweetHandler(m *tg.NewMessage) error {
 	}
 	b.WriteString(fmt.Sprintf("\n<a href=\"%s\">View on X</a>", html.EscapeString(data.URL)))
 
-	m.Reply(b.String(), &tg.SendOptions{LinkPreview: false})
+	status.Edit(b.String(), &tg.SendOptions{LinkPreview: false})
 	return nil
 }
 
 func initFromSrc_twitter_thread_1_1() { modules.QueueHandlerRegistration(registerTweetHandlers) }
 func registerTweetHandlers() {
 	c := modules.Client
-	c.On("cmd:tweet", TweetHandler)
+	modules.OnCommand(c, "cmd:tweet", TweetHandler)
 }
+
 type itunesTrack struct {
 	ArtistName       string  `json:"artistName"`
 	CollectionName   string  `json:"collectionName"`
@@ -1159,7 +1236,7 @@ func SpotifyMetaHandler(m *tg.NewMessage) error {
 	caption := b.String()
 	artwork := upgradeArtwork(track.ArtworkURL100)
 	if strings.TrimSpace(artwork) != "" {
-		if _, err := m.ReplyMedia(artwork, &tg.MediaOptions{Caption: caption}); err != nil {
+		if _, err := modules.TransferReplyMedia(m, artwork, &tg.MediaOptions{Caption: caption}); err != nil {
 			status.Edit(caption, &tg.SendOptions{LinkPreview: false})
 			return nil
 		}
@@ -1173,7 +1250,7 @@ func SpotifyMetaHandler(m *tg.NewMessage) error {
 func initFromSrc_spotify_meta_2_1() { modules.QueueHandlerRegistration(registerSpotifyMetaHandlers) }
 func registerSpotifyMetaHandlers() {
 	c := modules.Client
-	c.On("cmd:spotify", SpotifyMetaHandler)
+	modules.OnCommand(c, "cmd:spotify", SpotifyMetaHandler)
 }
 
 func init() {

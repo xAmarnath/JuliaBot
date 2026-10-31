@@ -1,437 +1,716 @@
 package extras
 
 import (
+	"encoding/base64"
 	"fmt"
 	"html"
 	"main/modules/db"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	modules "main/modules"
 
-	tg "github.com/amarnathcjd/gogram/telegram"
+	tg "github.com/xAmarnath/gogram/telegram"
 )
 
-func isBlacklistRegexPattern(s string) bool {
+// ------------------ Trigger matching (shared by blacklist and filters) ------------------
+
+const (
+	regexTriggerPrefix = "regex:"
+	maxTriggerLen      = 256
+	maxMatchInput      = 4096
+	maxBlacklistItems  = 500
+	triggerCacheTTL    = 10 * time.Minute
+	triggerErrTTL      = time.Minute
+)
+
+type trigger struct {
+	key  string
+	word string
+	re   *regexp.Regexp
+}
+
+// regexTriggerPattern extracts the pattern from "regex:<p>" or the legacy "/<p>/" form.
+func regexTriggerPattern(raw string) (string, bool) {
+	s := strings.TrimSpace(raw)
+	if len(s) >= len(regexTriggerPrefix) && strings.EqualFold(s[:len(regexTriggerPrefix)], regexTriggerPrefix) {
+		return strings.TrimSpace(s[len(regexTriggerPrefix):]), true
+	}
+	if len(s) > 2 && s[0] == '/' && s[len(s)-1] == '/' {
+		return s[1 : len(s)-1], true
+	}
+	return "", false
+}
+
+// normalizeTriggerKey returns the storage key for user input: regexes keep their case, words are lowercased.
+func normalizeTriggerKey(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if p, ok := regexTriggerPattern(raw); ok {
+		return regexTriggerPrefix + p
+	}
+	return strings.ToLower(strings.Join(strings.Fields(raw), " "))
+}
+
+func compileTrigger(raw string) (*trigger, error) {
+	raw = strings.TrimSpace(raw)
+	if p, ok := regexTriggerPattern(raw); ok {
+		if p == "" {
+			return nil, fmt.Errorf("the regex pattern is empty")
+		}
+		if len(p) > maxTriggerLen {
+			return nil, fmt.Errorf("the regex is too long (max %d characters)", maxTriggerLen)
+		}
+		re, err := modules.ValidateUserRegex(p)
+		if err != nil {
+			return nil, err
+		}
+		return &trigger{key: raw, re: re}, nil
+	}
+	word := strings.ToLower(strings.Join(strings.Fields(raw), " "))
+	if word == "" {
+		return nil, fmt.Errorf("the word is empty")
+	}
+	if len(word) > maxTriggerLen {
+		return nil, fmt.Errorf("the word is too long (max %d characters)", maxTriggerLen)
+	}
+	if utf8.RuneCountInString(word) < 2 && !isNoSpaceScript(firstRune(word)) {
+		return nil, fmt.Errorf("the word must be at least 2 characters")
+	}
+	return &trigger{key: raw, word: word}, nil
+}
+
+func (t *trigger) isRegex() bool { return t.re != nil }
+
+// match expects lower = strings.ToLower(text).
+func (t *trigger) match(text, lower string) bool {
+	if t.re != nil {
+		return t.re.MatchString(truncateUTF8(text, maxMatchInput))
+	}
+	return containsWord(lower, t.word)
+}
+
+func truncateUTF8(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	for n > 0 && !utf8.RuneStart(s[n]) {
+		n--
+	}
+	return s[:n]
+}
+
+func firstRune(s string) rune {
+	r, _ := utf8.DecodeRuneInString(s)
+	return r
+}
+
+func lastRune(s string) rune {
+	r, _ := utf8.DecodeLastRuneInString(s)
+	return r
+}
+
+func isWordRune(r rune) bool {
+	return r == '_' || unicode.IsLetter(r) || unicode.IsDigit(r) || unicode.Is(unicode.Mn, r)
+}
+
+// Scripts written without spaces can't use word boundaries.
+func isNoSpaceScript(r rune) bool {
+	return unicode.In(r, unicode.Han, unicode.Hiragana, unicode.Katakana, unicode.Thai, unicode.Lao, unicode.Khmer, unicode.Myanmar)
+}
+
+// containsWord reports whether word occurs in text as a whole word. Boundaries are only
+// enforced on edges where the word itself starts/ends with a word character.
+func containsWord(text, word string) bool {
+	if word == "" {
+		return false
+	}
+	needStart := isWordRune(firstRune(word)) && !isNoSpaceScript(firstRune(word))
+	needEnd := isWordRune(lastRune(word)) && !isNoSpaceScript(lastRune(word))
+	for from := 0; from <= len(text)-len(word); {
+		i := strings.Index(text[from:], word)
+		if i < 0 {
+			return false
+		}
+		start := from + i
+		end := start + len(word)
+		okStart := !needStart || start == 0 || !isWordRune(lastRune(text[:start]))
+		okEnd := !needEnd || end == len(text) || !isWordRune(firstRune(text[end:]))
+		if okStart && okEnd {
+			return true
+		}
+		_, size := utf8.DecodeRuneInString(text[start:])
+		from = start + size
+	}
+	return false
+}
+
+// splitQuotedFirst splits `"multi word" rest` or `word rest`.
+func splitQuotedFirst(s string) (string, string) {
 	s = strings.TrimSpace(s)
-	return len(s) >= 2 && strings.HasPrefix(s, "/") && strings.HasSuffix(s, "/")
+	if strings.HasPrefix(s, `"`) || strings.HasPrefix(s, "“") {
+		open := `"`
+		if strings.HasPrefix(s, "“") {
+			open = "“"
+		}
+		body := s[len(open):]
+		if j := strings.IndexAny(body, "\"”"); j >= 0 {
+			_, size := utf8.DecodeRuneInString(body[j:])
+			return strings.TrimSpace(body[:j]), strings.TrimSpace(body[j+size:])
+		}
+	}
+	return modules.SplitFirstArg(s)
+}
+
+func isCommandMessage(m *tg.NewMessage) bool {
+	if m.Message == nil {
+		return false
+	}
+	for _, e := range m.Message.Entities {
+		if bc, ok := e.(*tg.MessageEntityBotCommand); ok && bc.Offset == 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// mediaUniqueID identifies the underlying file so re-sends of the same sticker/photo match.
+func mediaUniqueID(m *tg.NewMessage) int64 {
+	if m == nil || m.Message == nil || m.Message.Media == nil {
+		return 0
+	}
+	if p := m.Photo(); p != nil {
+		return p.ID
+	}
+	if d := m.Document(); d != nil {
+		return d.ID
+	}
+	return 0
+}
+
+func fileIDUniqueID(fileID string) int64 {
+	fileID = strings.TrimRight(fileID, "=")
+	data, err := base64.RawURLEncoding.DecodeString(fileID)
+	if err != nil {
+		return 0
+	}
+	if len(data) == 20 || len(data) == 28 {
+		id, _, kind, dc, _ := tg.UnpackBotFileID(fileID)
+		if dc > 0 {
+			switch kind {
+			case 2, 3, 4, 5, 8, 9, 10, 13:
+				return id
+			}
+		}
+	}
+	parts := strings.Split(string(data), "_")
+	if len(parts) != 4 && len(parts) != 5 {
+		return 0
+	}
+	values := make([]int64, len(parts))
+	for i, part := range parts {
+		values[i], err = strconv.ParseInt(part, 10, 64)
+		if err != nil {
+			return 0
+		}
+	}
+	if values[1] <= 0 {
+		return 0
+	}
+	switch values[0] {
+	case 2, 3, 4, 5, 8, 9, 10, 13:
+		return values[2]
+	}
+	return 0
+}
+
+// sendChunked replies with lines split across messages that fit Telegram's 4096-char limit.
+func sendChunked(m *tg.NewMessage, header string, lines []string, footer string) {
+	const limit = 3800
+	var b strings.Builder
+	b.WriteString(header)
+	for _, line := range lines {
+		if b.Len()+len(line)+1 > limit {
+			m.Reply(b.String())
+			b.Reset()
+		}
+		b.WriteString(line)
+		b.WriteByte('\n')
+	}
+	if b.Len()+len(footer) > limit {
+		m.Reply(b.String())
+		b.Reset()
+	}
+	b.WriteString(footer)
+	if strings.TrimSpace(b.String()) != "" {
+		m.Reply(b.String())
+	}
+}
+
+// ------------------ Blacklist cache ------------------
+
+type blacklistState struct {
+	at       time.Time
+	ttl      time.Duration
+	entries  []*db.BlacklistEntry
+	triggers []*trigger
+	media    map[int64]bool
+	settings db.BlacklistSettings
 }
 
 var (
-	blacklistRegexMu    sync.RWMutex
-	blacklistRegexCache = map[string]*regexp.Regexp{}
+	blacklistMu    sync.RWMutex
+	blacklistCache = map[int64]*blacklistState{}
 )
 
-func blacklistCompilePattern(p string) *regexp.Regexp {
-	blacklistRegexMu.RLock()
-	if re, ok := blacklistRegexCache[p]; ok {
-		blacklistRegexMu.RUnlock()
-		return re
+func invalidateBlacklist(chatID int64) {
+	blacklistMu.Lock()
+	delete(blacklistCache, chatID)
+	blacklistMu.Unlock()
+}
+
+func loadBlacklistState(chatID int64) *blacklistState {
+	blacklistMu.RLock()
+	st, ok := blacklistCache[chatID]
+	blacklistMu.RUnlock()
+	if ok && time.Since(st.at) < st.ttl {
+		return st
 	}
-	blacklistRegexMu.RUnlock()
-	re, err := modules.ValidateUserRegex(p)
-	if err != nil {
-		return nil
+	st = &blacklistState{at: time.Now(), ttl: triggerCacheTTL, media: map[int64]bool{}, settings: db.BlacklistSettings{Action: db.ActionDelete}}
+	entries, err := db.GetBlacklist(chatID)
+	settings, serr := db.GetBlacklistSettings(chatID)
+	if err != nil || serr != nil {
+		st.ttl = triggerErrTTL
 	}
-	blacklistRegexMu.Lock()
-	blacklistRegexCache[p] = re
-	blacklistRegexMu.Unlock()
-	return re
+	if settings != nil {
+		st.settings = *settings
+	}
+	st.entries = entries
+	for _, e := range entries {
+		if e.FileID != "" {
+			if id := fileIDUniqueID(e.FileID); id != 0 {
+				st.media[id] = true
+			}
+			continue
+		}
+		if t, err := compileTrigger(e.Word); err == nil {
+			st.triggers = append(st.triggers, t)
+		}
+	}
+	blacklistMu.Lock()
+	blacklistCache[chatID] = st
+	blacklistMu.Unlock()
+	return st
+}
+
+func (st *blacklistState) match(m *tg.NewMessage) (string, bool) {
+	if len(st.media) > 0 {
+		if id := mediaUniqueID(m); id != 0 && st.media[id] {
+			return "media", true
+		}
+	}
+	text := m.Text()
+	if text == "" || len(st.triggers) == 0 {
+		return "", false
+	}
+	lower := strings.ToLower(text)
+	for _, t := range st.triggers {
+		if t.match(text, lower) {
+			return t.key, true
+		}
+	}
+	return "", false
+}
+
+func findBlacklistEntry(chatID int64, raw string) *db.BlacklistEntry {
+	entries, _ := db.GetBlacklist(chatID)
+	candidates := []string{normalizeTriggerKey(raw), strings.TrimSpace(raw), strings.ToLower(strings.TrimSpace(raw))}
+	if p, ok := regexTriggerPattern(raw); ok {
+		candidates = append(candidates, "/"+p+"/")
+	}
+	for _, c := range candidates {
+		for _, e := range entries {
+			if e.FileID == "" && e.Word == c {
+				return e
+			}
+		}
+	}
+	return nil
+}
+
+// ------------------ Blacklist commands ------------------
+
+func blacklistAdminGate(m *tg.NewMessage) bool {
+	if !modules.RequireGroup(m) {
+		return false
+	}
+	if !modules.SenderHasRight(m, "ban") {
+		m.Reply("You need the <b>Ban Users</b> admin right to change the blacklist.")
+		return false
+	}
+	return true
+}
+
+func replyMediaFileID(m *tg.NewMessage) (*tg.NewMessage, string) {
+	if !m.IsReply() {
+		return nil, ""
+	}
+	reply, err := m.GetReplyMessage()
+	if err != nil || reply == nil || !reply.IsMedia() || reply.File == nil || mediaUniqueID(reply) == 0 {
+		return nil, ""
+	}
+	return reply, reply.File.FileID
 }
 
 func AddBlacklistHandler(m *tg.NewMessage) error {
-	if m.IsPrivate() {
-		m.Reply("Blacklist can only be used in groups")
+	if !blacklistAdminGate(m) {
 		return nil
 	}
+	chatID := m.ChatID()
+	raw := modules.CommandArgs(m.Text())
 
-	if !modules.IsUserAdmin(m.Client, m.SenderID(), m.ChatID(), "ban") {
-		m.Reply("You need Ban Users permission to modify blacklist")
-		return nil
-	}
-
-	if m.IsReply() {
-		reply, err := m.GetReplyMessage()
-		if err == nil && reply.IsMedia() && reply.File != nil {
-			fileID := reply.File.FileID
-			if fileID == "" {
-				m.Reply("Unable to get file ID from this media")
-				return nil
-			}
-
-			if db.IsBlacklisted(m.ChatID(), fileID) {
-				m.Reply("This media is already blacklisted")
-				return nil
-			}
-
-			msgLink := fmt.Sprintf("https://t.me/c/%d/%d", m.ChatID(), reply.ID)
-
-			entry := &db.BlacklistEntry{
-				Word:        fileID,
-				FileID:      fileID,
-				MessageLink: msgLink,
-				AddedBy:     m.SenderID(),
-			}
-
-			if err := db.AddBlacklist(m.ChatID(), entry); err != nil {
-				m.Reply("Failed to add media to blacklist")
-				return nil
-			}
-
-			m.Reply("Media added to blacklist. Any matching media will be deleted.")
-			return nil
-		}
-	}
-
-	raw := strings.TrimSpace(m.Args())
 	if raw == "" {
-		m.Reply("Usage: /addbl &lt;word/phrase&gt;, /addbl /regex/, or reply to media with /addbl")
-		return nil
-	}
-
-	word := raw
-	isRegex := isBlacklistRegexPattern(raw)
-	if isRegex {
-		if _, err := modules.ValidateUserRegex(raw); err != nil {
-			m.Reply("Rejected regex: " + html.EscapeString(err.Error()))
+		reply, fileID := replyMediaFileID(m)
+		if reply == nil {
+			m.Reply("<b>Usage:</b>\n<code>/addbl word</code>\n<code>/addbl regex:pattern</code>\nOne item per line to add several, or reply to a sticker/photo/file with <code>/addbl</code>.")
 			return nil
 		}
-	} else {
-		word = strings.ToLower(word)
-		if len(word) < 2 {
-			m.Reply("Blacklisted word must be at least 2 characters")
+		if fileID == "" {
+			m.Reply("I couldn't read that media's file ID.")
 			return nil
 		}
-	}
-
-	if db.IsBlacklisted(m.ChatID(), word) {
-		m.Reply(fmt.Sprintf("<code>%s</code> is already in the blacklist", html.EscapeString(word)))
+		uid := mediaUniqueID(reply)
+		for _, e := range loadBlacklistState(chatID).entries {
+			if e.FileID != "" && fileIDUniqueID(e.FileID) == uid {
+				m.Reply("This media is already blacklisted.")
+				return nil
+			}
+		}
+		link := ""
+		if cid := m.ChannelID(); cid < -1000000000000 {
+			link = fmt.Sprintf("https://t.me/c/%d/%d", chatID, reply.ID)
+		}
+		entry := &db.BlacklistEntry{Word: fileID, FileID: fileID, MessageLink: link, AddedBy: m.SenderID()}
+		if err := db.AddBlacklist(chatID, entry); err != nil {
+			m.Reply("I couldn't save the blacklist right now. Please try again.")
+			return nil
+		}
+		invalidateBlacklist(chatID)
+		m.Reply("Media added to the blacklist. Matching media will be deleted, including posts from admins.")
 		return nil
 	}
 
-	entry := &db.BlacklistEntry{
-		Word:    word,
-		AddedBy: m.SenderID(),
+	st := loadBlacklistState(chatID)
+	existing := map[string]bool{}
+	for _, e := range st.entries {
+		existing[e.Word] = true
 	}
+	count := len(st.entries)
 
-	if err := db.AddBlacklist(m.ChatID(), entry); err != nil {
-		m.Reply("Failed to add to blacklist")
-		return nil
+	var added, skipped, failed []string
+	for _, line := range strings.Split(raw, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		t, err := compileTrigger(line)
+		if err != nil {
+			failed = append(failed, fmt.Sprintf("<code>%s</code>: %s", html.EscapeString(line), html.EscapeString(err.Error())))
+			continue
+		}
+		key := normalizeTriggerKey(line)
+		if existing[key] || (t.isRegex() && existing["/"+strings.TrimPrefix(key, regexTriggerPrefix)+"/"]) {
+			skipped = append(skipped, "<code>"+html.EscapeString(key)+"</code>")
+			continue
+		}
+		if count >= maxBlacklistItems {
+			failed = append(failed, fmt.Sprintf("<code>%s</code>: blacklist is full (max %d items)", html.EscapeString(key), maxBlacklistItems))
+			continue
+		}
+		if err := db.AddBlacklist(chatID, &db.BlacklistEntry{Word: key, AddedBy: m.SenderID()}); err != nil {
+			failed = append(failed, "<code>"+html.EscapeString(key)+"</code>: couldn't save")
+			continue
+		}
+		existing[key] = true
+		count++
+		added = append(added, "<code>"+html.EscapeString(key)+"</code>")
 	}
+	invalidateBlacklist(chatID)
 
-	m.Reply(fmt.Sprintf("Added <code>%s</code> to the blacklist", word))
+	var out []string
+	if len(added) > 0 {
+		out = append(out, "<b>Added to blacklist:</b> "+strings.Join(added, ", "))
+	}
+	if len(skipped) > 0 {
+		out = append(out, "<b>Already blacklisted:</b> "+strings.Join(skipped, ", "))
+	}
+	if len(failed) > 0 {
+		out = append(out, "<b>Rejected:</b>\n"+strings.Join(failed, "\n"))
+	}
+	if len(out) == 0 {
+		out = append(out, "Nothing to add.")
+	}
+	sendChunked(m, "", out, "")
 	return nil
 }
 
 func RemoveBlacklistHandler(m *tg.NewMessage) error {
-	if m.IsPrivate() {
-		m.Reply("Blacklist can only be used in groups")
+	if !blacklistAdminGate(m) {
 		return nil
 	}
+	chatID := m.ChatID()
+	raw := modules.CommandArgs(m.Text())
 
-	if !modules.IsUserAdmin(m.Client, m.SenderID(), m.ChatID(), "ban") {
-		m.Reply("You need Ban Users permission to modify blacklist")
-		return nil
-	}
-
-	if m.IsReply() {
-		reply, err := m.GetReplyMessage()
-		if err == nil && reply.IsMedia() && reply.File != nil {
-			fileID := reply.File.FileID
-			if fileID == "" {
-				m.Reply("Unable to get file ID from this media")
-				return nil
-			}
-
-			if !db.IsBlacklisted(m.ChatID(), fileID) {
-				m.Reply("This media is not in the blacklist")
-				return nil
-			}
-
-			if err := db.RemoveBlacklist(m.ChatID(), fileID); err != nil {
-				m.Reply("Failed to remove media from blacklist")
-				return nil
-			}
-
-			m.Reply("Media removed from blacklist")
+	if raw == "" {
+		reply, _ := replyMediaFileID(m)
+		if reply == nil {
+			m.Reply("<b>Usage:</b> <code>/rmbl word</code>, <code>/rmbl regex:pattern</code> (one per line), or reply to blacklisted media.")
 			return nil
 		}
-	}
-
-	word := strings.TrimSpace(strings.ToLower(m.Args()))
-	if word == "" {
-		m.Reply("Usage: /rmbl <word> or reply to media")
+		uid := mediaUniqueID(reply)
+		for _, e := range loadBlacklistState(chatID).entries {
+			if e.FileID != "" && fileIDUniqueID(e.FileID) == uid {
+				if err := db.RemoveBlacklist(chatID, e.Word); err != nil {
+					m.Reply("I couldn't update the blacklist right now. Please try again.")
+					return nil
+				}
+				invalidateBlacklist(chatID)
+				m.Reply("Media removed from the blacklist.")
+				return nil
+			}
+		}
+		m.Reply("That media isn't blacklisted.")
 		return nil
 	}
 
-	if !db.IsBlacklisted(m.ChatID(), word) {
-		m.Reply(fmt.Sprintf("<code>%s</code> is not in the blacklist", word))
-		return nil
+	var removed, missing []string
+	for _, line := range strings.Split(raw, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		e := findBlacklistEntry(chatID, line)
+		if e == nil {
+			missing = append(missing, "<code>"+html.EscapeString(line)+"</code>")
+			continue
+		}
+		if err := db.RemoveBlacklist(chatID, e.Word); err != nil {
+			missing = append(missing, "<code>"+html.EscapeString(line)+"</code> (couldn't save)")
+			continue
+		}
+		removed = append(removed, "<code>"+html.EscapeString(e.Word)+"</code>")
 	}
+	invalidateBlacklist(chatID)
 
-	if err := db.RemoveBlacklist(m.ChatID(), word); err != nil {
-		m.Reply("Failed to remove from blacklist")
-		return nil
+	var out []string
+	if len(removed) > 0 {
+		out = append(out, "<b>Removed from blacklist:</b> "+strings.Join(removed, ", "))
 	}
-
-	m.Reply(fmt.Sprintf("Removed <code>%s</code> from the blacklist", word))
+	if len(missing) > 0 {
+		out = append(out, "<b>Not in blacklist:</b> "+strings.Join(missing, ", "))
+	}
+	sendChunked(m, "", out, "")
 	return nil
 }
 
+func blacklistActionLabel(s db.BlacklistSettings) string {
+	label := string(s.Action)
+	if label == "" {
+		label = string(db.ActionDelete)
+	}
+	if s.Duration != "" && (s.Action == db.ActionTBan || s.Action == db.ActionTMute) {
+		label += " (" + html.EscapeString(s.Duration) + ")"
+	}
+	return label
+}
+
 func ListBlacklistHandler(m *tg.NewMessage) error {
-	if m.IsPrivate() {
-		m.Reply("Blacklist can only be used in groups")
+	if !modules.RequireGroup(m) {
 		return nil
 	}
-
-	entries, err := db.GetBlacklist(m.ChatID())
-	if err != nil || len(entries) == 0 {
-		m.Reply("No blacklisted words in this chat")
+	st := loadBlacklistState(m.ChatID())
+	if len(st.entries) == 0 {
+		m.Reply("No blacklisted items in this chat.\nAdmins can add some with <code>/addbl word</code>.")
 		return nil
 	}
+	entries := append([]*db.BlacklistEntry(nil), st.entries...)
+	sort.Slice(entries, func(i, j int) bool { return entries[i].Word < entries[j].Word })
 
-	sort.Slice(entries, func(i, j int) bool {
-		return entries[i].Word < entries[j].Word
-	})
-
-	settings, _ := db.GetBlacklistSettings(m.ChatID())
-	actionStr := string(settings.Action)
-	if settings.Duration != "" {
-		actionStr += " (" + settings.Duration + ")"
-	}
-
-	var resp strings.Builder
-	resp.WriteString("<b>Blacklisted items:</b>\n\n")
-
-	wordCount := 0
-	mediaCount := 0
-	for i, entry := range entries {
-		if entry.FileID != "" {
-			resp.WriteString(fmt.Sprintf("%d. [Media File]\n", i+1))
-			mediaCount++
-		} else {
-			resp.WriteString(fmt.Sprintf("%d. <code>%s</code>\n", i+1, entry.Word))
-			wordCount++
+	var lines []string
+	words, regexes, media := 0, 0, 0
+	for _, e := range entries {
+		if e.FileID != "" {
+			media++
+			continue
 		}
+		if _, ok := regexTriggerPattern(e.Word); ok {
+			regexes++
+		} else {
+			words++
+		}
+		lines = append(lines, " • <code>"+html.EscapeString(e.Word)+"</code>")
 	}
-
-	resp.WriteString(fmt.Sprintf("\nTotal: <b>%d</b> items", len(entries)))
-	if wordCount > 0 && mediaCount > 0 {
-		resp.WriteString(fmt.Sprintf(" (%d words, %d media)", wordCount, mediaCount))
+	if media > 0 {
+		lines = append(lines, fmt.Sprintf(" • %d blacklisted media (see /rmblmenu)", media))
 	}
-	resp.WriteString(fmt.Sprintf("\nAction: <b>%s</b>", actionStr))
-
-	m.Reply(resp.String())
+	footer := fmt.Sprintf("\nTotal: <b>%d</b> (%d words, %d regex, %d media)\nAction: <b>%s</b>", len(entries), words, regexes, media, blacklistActionLabel(st.settings))
+	sendChunked(m, "<b>Blacklisted items:</b>\n\n", lines, footer)
 	return nil
 }
 
 func SetBlacklistActionHandler(m *tg.NewMessage) error {
-	if m.IsPrivate() {
-		m.Reply("Blacklist can only be used in groups")
+	if !blacklistAdminGate(m) {
 		return nil
 	}
-
-	if !modules.IsUserAdmin(m.Client, m.SenderID(), m.ChatID(), "ban") {
-		m.Reply("You need Ban Users permission to modify blacklist settings")
-		return nil
-	}
-
-	args := strings.Fields(strings.ToLower(m.Args()))
+	chatID := m.ChatID()
+	args := strings.Fields(strings.ToLower(modules.CommandArgs(m.Text())))
 	if len(args) == 0 {
-		current, _ := db.GetBlacklistSettings(m.ChatID())
-		currentAction := string(current.Action)
-		if current.Duration != "" {
-			currentAction += " (" + current.Duration + ")"
-		}
+		st := loadBlacklistState(chatID)
+		m.Reply(fmt.Sprintf(`<b>Blacklist action</b>
 
-		m.Reply(fmt.Sprintf(`<b>Blacklist Action Settings</b>
+Current: <b>%s</b>
 
-Current action: <b>%s</b>
+<b>Usage:</b> <code>/setblaction &lt;action&gt; [duration]</code>
+ • <code>delete</code> - only delete the message (default)
+ • <code>ban</code> - delete and ban the sender
+ • <code>mute</code> - delete and mute the sender
+ • <code>tban 1d</code> - delete and ban for a time
+ • <code>tmute 2h</code> - delete and mute for a time
 
-Usage: /setblaction <action> [duration]
-
-<b>Available actions:</b>
- - <code>delete</code> - Delete the message (default)
- - <code>ban</code> - Ban the user
- - <code>mute</code> - Mute the user permanently
- - <code>tban</code> - Temporary ban (requires duration)
- - <code>tmute</code> - Temporary mute (requires duration)
-
-<b>Duration examples:</b> 1h, 2d, 1w, 30m`, currentAction))
+Durations: 30m, 2h, 3d, 1w`, blacklistActionLabel(st.settings)))
 		return nil
 	}
 
-	action := args[0]
-	duration := ""
-
-	if len(args) > 1 {
-		duration = args[1]
-	}
-
-	var blAction db.BlacklistAction
-	switch action {
+	settings := &db.BlacklistSettings{}
+	switch args[0] {
 	case "delete", "del":
-		blAction = db.ActionDelete
+		settings.Action = db.ActionDelete
 	case "ban":
-		blAction = db.ActionBan
+		settings.Action = db.ActionBan
 	case "mute":
-		blAction = db.ActionMute
-	case "tban":
-		if duration == "" {
-			m.Reply("tban requires a duration. Example: /setblaction tban 1h")
+		settings.Action = db.ActionMute
+	case "tban", "tmute":
+		if len(args) < 2 {
+			m.Reply(fmt.Sprintf("%s needs a duration, e.g. <code>/setblaction %s 1h</code>", args[0], args[0]))
 			return nil
 		}
-		blAction = db.ActionTBan
-	case "tmute":
-		if duration == "" {
-			m.Reply("tmute requires a duration. Example: /setblaction tmute 1d")
+		if _, err := modules.ParseTempDuration(args[1]); err != nil {
+			m.Reply(modules.AdminFriendlyError(err, "set the action"))
 			return nil
 		}
-		blAction = db.ActionTMute
+		settings.Action = db.BlacklistAction(args[0])
+		settings.Duration = args[1]
 	default:
-		m.Reply("Unknown action. Use: delete, ban, mute, tban, tmute")
+		m.Reply("Unknown action. Use one of: <code>delete</code>, <code>ban</code>, <code>mute</code>, <code>tban</code>, <code>tmute</code>.")
 		return nil
 	}
 
-	settings := &db.BlacklistSettings{
-		Action:   blAction,
-		Duration: duration,
-	}
-
-	if err := db.SetBlacklistSettings(m.ChatID(), settings); err != nil {
-		m.Reply("Failed to update settings")
+	if err := db.SetBlacklistSettings(chatID, settings); err != nil {
+		m.Reply("I couldn't save the setting right now. Please try again.")
 		return nil
 	}
-
-	actionMsg := string(blAction)
-	if duration != "" {
-		actionMsg += " (" + duration + ")"
-	}
-
-	m.Reply(fmt.Sprintf("Blacklist action set to: <b>%s</b>", actionMsg))
+	invalidateBlacklist(chatID)
+	m.Reply("Blacklist action set to <b>" + blacklistActionLabel(*settings) + "</b>.")
 	return nil
 }
 
+var (
+	blNoticeMu   sync.Mutex
+	blNoticeLast = map[string]time.Time{}
+)
+
+// shouldNotify throttles action notices so a flood of offending messages produces one reply.
+func shouldNotify(chatID, userID int64) bool {
+	key := strconv.FormatInt(chatID, 10) + ":" + strconv.FormatInt(userID, 10)
+	blNoticeMu.Lock()
+	defer blNoticeMu.Unlock()
+	now := time.Now()
+	if t, ok := blNoticeLast[key]; ok && now.Sub(t) < 30*time.Second {
+		return false
+	}
+	if len(blNoticeLast) > 5000 {
+		blNoticeLast = map[string]time.Time{}
+	}
+	blNoticeLast[key] = now
+	return true
+}
+
 func BlacklistWatcher(m *tg.NewMessage) error {
-	if m.IsPrivate() {
+	if m == nil || m.Message == nil || m.Message.Out || m.Action != nil || !modules.IsGroupChat(m) {
 		return nil
 	}
-	if m.Sender == nil {
+	st := loadBlacklistState(m.ChatID())
+	if len(st.triggers) == 0 && len(st.media) == 0 {
+		return nil
+	}
+	if _, ok := st.match(m); !ok {
+		return nil
+	}
+	chat := m.ChannelID()
+	if _, err := m.Delete(); err != nil {
+		return fmt.Errorf("blacklist: delete message %d in chat %d: %w", m.ID, chat, err)
+	}
+
+	action := st.settings.Action
+	if action == "" || action == db.ActionDelete {
+		return nil
+	}
+	senderID := m.SenderID()
+	if modules.IsAnonAdmin(m) || senderID > 0 && modules.IsChatAdmin(m.Client, chat, senderID) {
+		return nil
+	}
+	target, err := modules.TargetFromMessage(m, m)
+	if err != nil || !modules.BotHasRight(m.Client, chat, "ban") {
 		return nil
 	}
 
-	entries, err := db.GetBlacklist(m.ChatID())
-	if err != nil || len(entries) == 0 {
-		return nil
-	}
-
-	if modules.IsUserAdmin(m.Client, m.SenderID(), m.ChatID(), "") {
-		return nil
-	}
-
-	var matchedWord string
-
-	// Check media files first
-	if m.IsMedia() && m.File != nil && m.File.FileID != "" {
-		for _, entry := range entries {
-			if entry.FileID != "" && entry.FileID == m.File.FileID {
-				matchedWord = "media"
-				break
-			}
+	var d time.Duration
+	if action == db.ActionTBan || action == db.ActionTMute {
+		d, err = modules.ParseTempDuration(st.settings.Duration)
+		if err != nil {
+			d = time.Hour
 		}
 	}
-
-	if matchedWord == "" && m.Text() != "" {
-		msgText := m.Text()
-		msgLower := strings.ToLower(msgText)
-		for _, entry := range entries {
-			if entry.FileID != "" {
-				continue
-			}
-			if isBlacklistRegexPattern(entry.Word) {
-				re := blacklistCompilePattern(entry.Word)
-				if re != nil && re.MatchString(msgText) {
-					matchedWord = entry.Word
-					break
-				}
-				continue
-			}
-			if strings.Contains(msgLower, entry.Word) {
-				matchedWord = entry.Word
-				break
-			}
+	var verb string
+	switch action {
+	case db.ActionBan, db.ActionTBan:
+		err, verb = modules.BanMember(m.Client, chat, target.Peer, d), "banned"
+	case db.ActionMute, db.ActionTMute:
+		if target.IsChannel {
+			return nil
 		}
-	}
-
-	if matchedWord == "" {
+		err, verb = modules.MuteMember(m.Client, chat, target.Peer, d), "muted"
+	default:
 		return nil
 	}
-
-	m.Delete()
-
-	settings, _ := db.GetBlacklistSettings(m.ChatID())
-
-	user, err := m.Client.ResolvePeer(m.SenderID())
-	if err != nil {
+	if err != nil || !shouldNotify(chat, target.ID) {
 		return nil
 	}
-
-	switch settings.Action {
-	case db.ActionBan:
-		m.Client.EditBanned(m.ChatID(), user, &tg.BannedOptions{Ban: true})
-		m.Respond(fmt.Sprintf("<b>%s</b> was banned for using blacklisted word", m.Sender.FirstName))
-
-	case db.ActionMute:
-		m.Client.EditBanned(m.ChatID(), user, &tg.BannedOptions{Mute: true})
-		m.Respond(fmt.Sprintf("<b>%s</b> was muted for using blacklisted word", m.Sender.FirstName))
-
-	case db.ActionTBan:
-		duration, err := modules.ParseAdminDuration(settings.Duration)
-		if err != nil || duration == 0 {
-			duration = time.Hour
-		}
-		untilDate := int32(time.Now().Add(duration).Unix())
-		m.Client.EditBanned(m.ChatID(), user, &tg.BannedOptions{Ban: true, TillDate: untilDate})
-		m.Respond(fmt.Sprintf("<b>%s</b> was banned for %s for using blacklisted word", m.Sender.FirstName, duration.String()))
-
-	case db.ActionTMute:
-		duration, err := modules.ParseAdminDuration(settings.Duration)
-		if err != nil || duration == 0 {
-			duration = time.Hour
-		}
-		untilDate := int32(time.Now().Add(duration).Unix())
-		m.Client.EditBanned(m.ChatID(), user, &tg.BannedOptions{Mute: true, TillDate: untilDate})
-		m.Respond(fmt.Sprintf("<b>%s</b> was muted for %s for using blacklisted word", m.Sender.FirstName, duration.String()))
-
-	case db.ActionDelete:
+	msg := fmt.Sprintf("%s was %s for using a blacklisted word", target.Mention(), verb)
+	if d > 0 {
+		msg += " for " + formatSpan(d)
 	}
-
+	m.Respond(msg + ".")
 	return nil
 }
 
 func ClearBlacklistHandler(m *tg.NewMessage) error {
-	if m.IsPrivate() {
-		m.Reply("Blacklist can only be used in groups")
+	if !blacklistAdminGate(m) {
 		return nil
 	}
-
-	if !modules.IsUserAdmin(m.Client, m.SenderID(), m.ChatID(), "ban") {
-		m.Reply("You need Ban Users permission to clear blacklist")
-		return nil
-	}
-
-	count, _ := db.GetBlacklistCount(m.ChatID())
+	count := len(loadBlacklistState(m.ChatID()).entries)
 	if count == 0 {
-		m.Reply("Blacklist is already empty")
+		m.Reply("The blacklist is already empty.")
 		return nil
 	}
-
 	b := tg.Button
 	m.Reply(
-		fmt.Sprintf("<b>Are you sure you want to clear all %d blacklisted words?</b>", count),
+		fmt.Sprintf("<b>Clear all %d blacklisted items?</b> This can't be undone.", count),
 		&tg.SendOptions{
 			ReplyMarkup: tg.NewKeyboard().AddRow(
 				b.Data("Yes, clear all", fmt.Sprintf("clearbl_%d", m.SenderID())),
@@ -439,237 +718,181 @@ func ClearBlacklistHandler(m *tg.NewMessage) error {
 			).Build(),
 		},
 	)
-
 	return nil
 }
 
-// BlacklistRemovalMenu shows numbered media entries with buttons to remove them
 func BlacklistRemovalMenu(m *tg.NewMessage) error {
-	if m.IsPrivate() {
-		m.Reply("Blacklist can only be used in groups")
+	if !blacklistAdminGate(m) {
+		return nil
+	}
+	st := loadBlacklistState(m.ChatID())
+	if len(st.entries) == 0 {
+		m.Reply("The blacklist is empty.")
 		return nil
 	}
 
-	if !modules.IsUserAdmin(m.Client, m.SenderID(), m.ChatID(), "ban") {
-		m.Reply("You need Ban Users permission to modify blacklist")
-		return nil
-	}
-
-	entries, err := db.GetBlacklist(m.ChatID())
-	if err != nil || len(entries) == 0 {
-		m.Reply("Blacklist is empty")
-		return nil
-	}
-
-	// Separate media and words
-	var mediaEntries []*db.BlacklistEntry
-	var wordEntries []*db.BlacklistEntry
-
-	for _, entry := range entries {
-		if entry.FileID != "" {
-			mediaEntries = append(mediaEntries, entry)
+	var media []*db.BlacklistEntry
+	words := 0
+	for _, e := range st.entries {
+		if e.FileID != "" {
+			media = append(media, e)
 		} else {
-			wordEntries = append(wordEntries, entry)
+			words++
 		}
 	}
+	if len(media) == 0 {
+		m.Reply(fmt.Sprintf("No blacklisted media. There are <b>%d</b> blacklisted words; remove them with <code>/rmbl word</code>.", words))
+		return nil
+	}
 
+	shown := min(len(media), 20)
 	var resp strings.Builder
-	resp.WriteString("<b>Blacklist Items</b>\n\n")
-
-	// Show words
-	if len(wordEntries) > 0 {
-		resp.WriteString("<b>Words/Phrases:</b>\n")
-		for _, entry := range wordEntries {
-			resp.WriteString(fmt.Sprintf("• <code>%s</code>\n", entry.Word))
+	fmt.Fprintf(&resp, "<b>Blacklisted media (%d):</b>\n\n", len(media))
+	kb := tg.NewKeyboard()
+	var row []tg.KeyboardInlineButton
+	for i := 0; i < shown; i++ {
+		e := media[i]
+		if e.MessageLink != "" {
+			fmt.Fprintf(&resp, "%d. <a href=\"%s\">View media</a>\n", i+1, html.EscapeString(e.MessageLink))
+		} else {
+			fmt.Fprintf(&resp, "%d. Media (no link)\n", i+1)
 		}
-		resp.WriteString("\n")
-	}
-
-	// Show media with removal buttons and links
-	if len(mediaEntries) > 0 {
-		fmt.Fprintf(&resp, "<b>Blacklisted Media (%d items):</b>\n\n", len(mediaEntries))
-
-		// Show clickable links for each media (max 10 displayed)
-		maxDisplay := min(len(mediaEntries), 10)
-
-		for i := range maxDisplay {
-			entry := mediaEntries[i]
-			if entry.MessageLink != "" {
-				fmt.Fprintf(&resp, "%d. <a href=\"%s\">View Media</a>\n", i+1, entry.MessageLink)
-			} else {
-				fmt.Fprintf(&resp, "%d. Media (no link)\n", i+1)
-			}
-		}
-
-		if len(mediaEntries) > maxDisplay {
-			fmt.Fprintf(&resp, "\n<i>Showing %d of %d media items</i>\n", maxDisplay, len(mediaEntries))
-		}
-
-		resp.WriteString("\n<b>Remove media:</b>\n")
-
-		// Show removal buttons (up to 10)
-		kb := tg.NewKeyboard()
-		b := tg.Button
-
-		for i := 0; i < maxDisplay && i < 10; i += 2 {
-			// Create row with up to 2 delete buttons
-			removeButton := b.Data(fmt.Sprintf("Remove %d", i+1), fmt.Sprintf("rmblmedia_%d_%d", m.ChatID(), i))
-			removeButton.Style = &tg.KeyboardButtonStyle{BgDanger: true}
-			row := []tg.KeyboardInlineButton{removeButton}
-			if i+1 < maxDisplay {
-				nextButton := b.Data(fmt.Sprintf("Remove %d", i+2), fmt.Sprintf("rmblmedia_%d_%d", m.ChatID(), i+1))
-				nextButton.Style = &tg.KeyboardButtonStyle{BgDanger: true}
-				row = append(row, nextButton)
-			}
+		btn := tg.Button.Data(fmt.Sprintf("Remove %d", i+1), fmt.Sprintf("rmblmedia_%d", fileIDUniqueID(e.FileID)))
+		btn.Style = &tg.KeyboardButtonStyle{BgDanger: true}
+		row = append(row, btn)
+		if len(row) == 2 {
 			kb.AddRow(row...)
+			row = nil
 		}
-
-		resp.WriteString(fmt.Sprintf("\nTotal: <b>%d media</b>, <b>%d words</b>", len(mediaEntries), len(wordEntries)))
-
-		m.Reply(resp.String(), &tg.SendOptions{
-			ReplyMarkup: kb.Build(),
-			ParseMode:   "HTML",
-		})
-
-	} else {
-		resp.WriteString(fmt.Sprintf("Total: <b>%d words</b>\n\n", len(wordEntries)))
-		resp.WriteString("Use /rmbl <word> to remove words")
-		m.Reply(resp.String())
 	}
-
+	if len(row) > 0 {
+		kb.AddRow(row...)
+	}
+	if len(media) > shown {
+		fmt.Fprintf(&resp, "\n<i>Showing %d of %d. Reply to media with /rmbl to remove others.</i>\n", shown, len(media))
+	}
+	fmt.Fprintf(&resp, "\nWords: <b>%d</b> (remove with <code>/rmbl word</code>)", words)
+	m.Reply(resp.String(), &tg.SendOptions{ReplyMarkup: kb.Build()})
 	return nil
 }
 
-// HandleBlacklistMediaRemoval handles removal of blacklisted media via callback
 func HandleBlacklistMediaRemoval(c *tg.CallbackQuery) error {
-	data := c.DataString()
-
-	if !strings.HasPrefix(data, "rmblmedia_") {
+	data := strings.TrimPrefix(c.DataString(), "rmblmedia_")
+	if strings.Contains(data, "_") {
+		c.Answer("This menu is outdated. Run /rmblmenu again.", &tg.CallbackOptions{Alert: true})
 		return nil
 	}
-
-	parts := strings.Split(strings.TrimPrefix(data, "rmblmedia_"), "_")
-	if len(parts) != 2 {
-		c.Answer("Invalid data", &tg.CallbackOptions{Alert: true})
-		return nil
-	}
-
-	var chatID int64
-	var mediaIndex int
-	if _, err := fmt.Sscanf(parts[0]+" "+parts[1], "%d %d", &chatID, &mediaIndex); err != nil {
-		c.Answer("Error processing request", &tg.CallbackOptions{Alert: true})
-		return nil
-	}
-
-	entries, err := db.GetBlacklist(chatID)
+	uid, err := strconv.ParseInt(data, 10, 64)
 	if err != nil {
-		c.Answer("Failed to get blacklist", &tg.CallbackOptions{Alert: true})
+		c.Answer("Invalid button.", &tg.CallbackOptions{Alert: true})
 		return nil
 	}
-
-	// Find media entries and get the one at mediaIndex
-	var mediaEntries []*db.BlacklistEntry
-	for _, entry := range entries {
-		if entry.FileID != "" {
-			mediaEntries = append(mediaEntries, entry)
+	if !modules.CallbackHasRight(c, "ban") {
+		c.Answer("You need the Ban Users admin right to do this.", &tg.CallbackOptions{Alert: true})
+		return nil
+	}
+	chatID := c.ChatID
+	for _, e := range loadBlacklistState(chatID).entries {
+		if e.FileID != "" && fileIDUniqueID(e.FileID) == uid {
+			if err := db.RemoveBlacklist(chatID, e.Word); err != nil {
+				c.Answer("I couldn't update the blacklist. Try again.", &tg.CallbackOptions{Alert: true})
+				return nil
+			}
+			invalidateBlacklist(chatID)
+			c.Answer("Media removed from the blacklist.")
+			return nil
 		}
 	}
-
-	if mediaIndex < 0 || mediaIndex >= len(mediaEntries) {
-		c.Answer("Media entry not found", &tg.CallbackOptions{Alert: true})
-		return nil
-	}
-
-	targetFileID := mediaEntries[mediaIndex].FileID
-
-	if err := db.RemoveBlacklist(chatID, targetFileID); err != nil {
-		c.Answer("Failed to remove media", &tg.CallbackOptions{Alert: true})
-		return nil
-	}
-
-	c.Answer("✓ Media removed from blacklist", &tg.CallbackOptions{Alert: false})
-	c.Edit("Media removed from blacklist!")
-
+	c.Answer("That media is no longer blacklisted.", &tg.CallbackOptions{Alert: true})
 	return nil
 }
 
 func ClearBlacklistCallback(c *tg.CallbackQuery) error {
 	data := c.DataString()
-
-	if strings.HasPrefix(data, "cancelbl_") {
-		userID := strings.TrimPrefix(data, "cancelbl_")
-		if fmt.Sprint(c.SenderID) != userID {
-			c.Answer("This is not for you", &tg.CallbackOptions{Alert: true})
-			return nil
-		}
-		c.Edit("Operation cancelled")
+	owner := ""
+	if after, ok := strings.CutPrefix(data, "cancelbl_"); ok {
+		owner = after
+	} else if after, ok := strings.CutPrefix(data, "clearbl_"); ok {
+		owner = after
+	}
+	if strconv.FormatInt(c.GetSenderID(), 10) != owner {
+		c.Answer("This button isn't for you.", &tg.CallbackOptions{Alert: true})
 		return nil
 	}
-
-	if strings.HasPrefix(data, "clearbl_") {
-		userID := strings.TrimPrefix(data, "clearbl_")
-		if fmt.Sprint(c.SenderID) != userID {
-			c.Answer("This is not for you", &tg.CallbackOptions{Alert: true})
-			return nil
-		}
-
-		chatID := c.ChatID
-		count, _ := db.GetBlacklistCount(chatID)
-
-		if err := db.ClearBlacklist(chatID); err != nil {
-			c.Edit("Failed to clear blacklist")
-			return nil
-		}
-
-		c.Edit(fmt.Sprintf("Cleared <b>%d</b> blacklisted words", count))
+	if strings.HasPrefix(data, "cancelbl_") {
+		c.Edit("Cancelled.")
+		return nil
 	}
-
+	if !modules.CallbackHasRight(c, "ban") {
+		c.Answer("You no longer have the Ban Users admin right.", &tg.CallbackOptions{Alert: true})
+		return nil
+	}
+	chatID := c.ChatID
+	count := len(loadBlacklistState(chatID).entries)
+	if err := db.ClearBlacklist(chatID); err != nil {
+		c.Edit("I couldn't clear the blacklist right now. Please try again.")
+		return nil
+	}
+	invalidateBlacklist(chatID)
+	c.Edit(fmt.Sprintf("Cleared <b>%d</b> blacklisted items.", count))
 	return nil
 }
 
 func registerBlacklistHandlers() {
 	c := modules.Client
-	if c != nil {
-		c.On("cmd:addbl", AddBlacklistHandler)
-		c.On("cmd:addblacklist", AddBlacklistHandler)
-		c.On("cmd:rmbl", RemoveBlacklistHandler)
-		c.On("cmd:rmblacklist", RemoveBlacklistHandler)
-		c.On("cmd:listbl", ListBlacklistHandler)
-		c.On("cmd:blacklist", ListBlacklistHandler)
-		c.On("cmd:rmblmenu", BlacklistRemovalMenu)
-		c.On("cmd:setblaction", SetBlacklistActionHandler)
-		c.On("cmd:clearbl", ClearBlacklistHandler)
-		c.On("callback:clearbl_", ClearBlacklistCallback)
-		c.On("callback:cancelbl_", ClearBlacklistCallback)
-		c.On("callback:rmblmedia_", HandleBlacklistMediaRemoval)
-		c.On(tg.OnNewMessage, BlacklistWatcher)
+	if c == nil {
+		return
 	}
+	modules.OnCommand(c, "cmd:addbl", AddBlacklistHandler)
+	modules.OnCommand(c, "cmd:addblacklist", AddBlacklistHandler)
+	modules.OnCommand(c, "cmd:rmbl", RemoveBlacklistHandler)
+	modules.OnCommand(c, "cmd:rmblacklist", RemoveBlacklistHandler)
+	modules.OnCommand(c, "cmd:unblacklist", RemoveBlacklistHandler)
+	modules.OnCommand(c, "cmd:listbl", ListBlacklistHandler)
+	modules.OnCommand(c, "cmd:blacklist", ListBlacklistHandler)
+	modules.OnCommand(c, "cmd:rmblmenu", BlacklistRemovalMenu)
+	modules.OnCommand(c, "cmd:setblaction", SetBlacklistActionHandler)
+	modules.OnCommand(c, "cmd:blaction", SetBlacklistActionHandler)
+	modules.OnCommand(c, "cmd:clearbl", ClearBlacklistHandler)
+	c.On("callback:clearbl_", ClearBlacklistCallback)
+	c.On("callback:cancelbl_", ClearBlacklistCallback)
+	c.On("callback:rmblmedia_", HandleBlacklistMediaRemoval)
+	c.On(tg.OnNewMessage, BlacklistWatcher)
+	c.On(tg.OnEditMessage, BlacklistWatcher)
 }
 
 func init() {
 	modules.QueueHandlerRegistration(registerBlacklistHandlers)
 
-	modules.Mods.AddModule("Blacklist", `<b>Blacklist Module</b>
+	modules.Mods.AddModule("Blacklist", `<b>Blacklist</b>
+Automatically delete messages containing banned words, patterns or media, including posts from admins. Optional bans and mutes apply only to non-admin members.
 
-Block specific words/phrases or media in your group.
+<b>Commands</b> (Ban Users right needed to change):
+ • <code>/addbl &lt;word or phrase&gt;</code> - blacklist a word/phrase. Put several on separate lines to add many at once.
+ • <code>/addbl regex:&lt;pattern&gt;</code> - blacklist a regular expression.
+ • <code>/addbl</code> (reply to a sticker/photo/GIF/file) - blacklist that media.
+ • <code>/rmbl &lt;word | regex:pattern&gt;</code> - remove items (one per line), or reply to media.
+ • <code>/blacklist</code> or <code>/listbl</code> - list everything that is blacklisted.
+ • <code>/rmblmenu</code> - buttons to remove blacklisted media.
+ • <code>/setblaction &lt;action&gt; [duration]</code> - what to do to offenders.
+ • <code>/clearbl</code> - remove every item (asks for confirmation).
+Aliases: /addblacklist, /rmblacklist, /unblacklist, /blaction.
 
-<b>Commands:</b>
- - /addbl <word> - Add word to blacklist
- - /addbl [reply to media] - Add media to blacklist
- - /addblacklist <word> - Same as above
- - /rmbl <word> - Remove word from blacklist
- - /rmblacklist <word> - Same as above
- - /listbl - List all blacklisted items
- - /blacklist - Same as above
- - /setblaction <action> - Set action for violations
- - /clearbl - Clear all blacklisted items
+<b>Matching</b>
+ • Words match case-insensitively as whole words: <code>bad</code> matches "so BAD!" but not "badge". Phrases and non-Latin scripts work too.
+ • <code>regex:</code> patterns use Go (RE2) syntax, are case-insensitive, max 256 characters, and are checked against the first 4096 characters of a message. Patterns that match everything are rejected. The old <code>/pattern/</code> form is still accepted.
 
-<b>Actions:</b>
- - delete - Delete message (default)
- - ban - Ban the user
- - mute - Mute forever
- - tban <duration> - Temporary ban
- - tmute <duration> - Temporary mute
+<b>Actions</b>
+ • <code>delete</code> - delete only (default)
+ • <code>ban</code> / <code>mute</code> - delete and ban/mute
+ • <code>tban &lt;time&gt;</code> / <code>tmute &lt;time&gt;</code> - temporary ban/mute (e.g. 30m, 2h, 3d, 1w)
 
-<b>Note:</b> Admins are exempt from blacklist checks.`)
+<b>Examples</b>
+<code>/addbl casino</code>
+<code>/addbl regex:t\.me/\w+</code>
+<code>/addbl regex:fr[e3]{2}\s*m[o0]ney</code>
+<code>/rmbl casino</code>
+<code>/setblaction tmute 1h</code>
+
+I need the Delete Messages right (and Ban Users for ban/mute actions).`)
 }

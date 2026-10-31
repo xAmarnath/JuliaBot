@@ -12,8 +12,8 @@ import (
 
 	"main/modules/db"
 
-	tg "github.com/amarnathcjd/gogram/telegram"
-	bolt "go.etcd.io/bbolt"
+	tg "github.com/xAmarnath/gogram/telegram"
+	"main/internal/mongostore"
 	modules "main/modules"
 )
 
@@ -58,8 +58,8 @@ func reportRateAllowed(chatID, userID int64) (bool, time.Duration) {
 	return true, 0
 }
 
-func ensureReportBuckets(database *bolt.DB) error {
-	return database.Update(func(tx *bolt.Tx) error {
+func ensureReportBuckets(database *mongostore.DB) error {
+	return database.Update(func(tx *mongostore.Tx) error {
 		if _, err := tx.CreateBucketIfNotExists([]byte(reportCfgBucket)); err != nil {
 			return err
 		}
@@ -77,7 +77,7 @@ func getReportCfg(chatID int64) bool {
 		return true
 	}
 	enabled := true
-	database.View(func(tx *bolt.Tx) error {
+	database.View(func(tx *mongostore.Tx) error {
 		b := tx.Bucket([]byte(reportCfgBucket))
 		if b == nil {
 			return nil
@@ -102,7 +102,7 @@ func setReportCfg(chatID int64, enabled bool) error {
 	if err := ensureReportBuckets(database); err != nil {
 		return err
 	}
-	return database.Update(func(tx *bolt.Tx) error {
+	return database.Update(func(tx *mongostore.Tx) error {
 		b := tx.Bucket([]byte(reportCfgBucket))
 		val := []byte("on")
 		if !enabled {
@@ -120,7 +120,7 @@ func saveReport(chatID int64, entry *reportEntry) error {
 	if err := ensureReportBuckets(database); err != nil {
 		return err
 	}
-	return database.Update(func(tx *bolt.Tx) error {
+	return database.Update(func(tx *mongostore.Tx) error {
 		root := tx.Bucket([]byte(reportsBucket))
 		cb, err := root.CreateBucketIfNotExists([]byte(strconv.FormatInt(chatID, 10)))
 		if err != nil {
@@ -166,7 +166,7 @@ func getRecentReports(chatID int64, limit int) ([]*reportEntry, error) {
 		return nil, err
 	}
 	var out []*reportEntry
-	err = database.View(func(tx *bolt.Tx) error {
+	err = database.View(func(tx *mongostore.Tx) error {
 		root := tx.Bucket([]byte(reportsBucket))
 		if root == nil {
 			return nil
@@ -222,7 +222,7 @@ func ReportHandler(m *tg.NewMessage) error {
 		m.Reply("You cannot report yourself")
 		return nil
 	}
-	if modules.IsUserAdmin(m.Client, offenderID, m.ChatID(), "") {
+	if modules.IsUserAdmin(m.Client, offenderID, m.ChannelID(), "") {
 		m.Reply("Admins cannot be reported")
 		return nil
 	}
@@ -326,7 +326,7 @@ func ReportCfgHandler(m *tg.NewMessage) error {
 		m.Reply("Report config is per-group")
 		return nil
 	}
-	if !modules.IsUserAdmin(m.Client, m.SenderID(), m.ChatID(), "change_info") {
+	if !modules.IsUserAdmin(m.Client, m.SenderID(), m.ChannelID(), "change_info") {
 		m.Reply("You need Change Info permission to toggle reports")
 		return nil
 	}
@@ -364,7 +364,7 @@ func ReportsListHandler(m *tg.NewMessage) error {
 		m.Reply("Reports are tracked per-group")
 		return nil
 	}
-	if !modules.IsUserAdmin(m.Client, m.SenderID(), m.ChatID(), "ban") {
+	if !modules.IsUserAdmin(m.Client, m.SenderID(), m.ChannelID(), "ban") {
 		m.Reply("You need Ban Users permission to view reports")
 		return nil
 	}
@@ -395,9 +395,9 @@ func ReportsListHandler(m *tg.NewMessage) error {
 
 func registerReportHandlers() {
 	c := modules.Client
-	c.On("cmd:report", ReportHandler)
-	c.On("cmd:reportcfg", ReportCfgHandler)
-	c.On("cmd:reports", ReportsListHandler)
+	modules.OnCommand(c, "cmd:report", ReportHandler)
+	modules.OnCommand(c, "cmd:reportcfg", ReportCfgHandler)
+	modules.OnCommand(c, "cmd:reports", ReportsListHandler)
 }
 
 func init() {

@@ -17,7 +17,7 @@ import (
 	"strings"
 	"time"
 
-	tg "github.com/amarnathcjd/gogram/telegram"
+	tg "github.com/xAmarnath/gogram/telegram"
 )
 
 func ShellHandle(m *tg.NewMessage) error {
@@ -60,7 +60,7 @@ func ShellHandle(m *tg.NewMessage) error {
 
 	if len(result) > 4000 {
 		os.WriteFile("tmp/shell_out.txt", []byte(result), 0644)
-		m.ReplyMedia("tmp/shell_out.txt", &tg.MediaOptions{Caption: "Output"})
+		TransferReplyMedia(m, "tmp/shell_out.txt", &tg.MediaOptions{Caption: "Output"})
 		os.Remove("tmp/shell_out.txt")
 		return nil
 	}
@@ -85,81 +85,6 @@ func evalCode() {
 }
 
 func main() {
-	fmt.Println("output-start")
-	evalCode()
-}
-`
-
-const boiler_code_for_eval = `
-package main
-
-import (
-	"bufio"
-	"fmt"
-	"os"
-	tg "github.com/amarnathcjd/gogram/telegram"
-)
-
-%s
-
-var msgID int32 = %d
-var chatID int64 = %d
-var cacheJSON string
-
-var client *tg.Client
-var message *tg.NewMessage
-var m *tg.NewMessage
-var r *tg.NewMessage
-
-func evalCode() {
-	%s
-}
-
-func readStdinValue() string {
-	r := bufio.NewReader(os.Stdin)
-	s, _ := r.ReadString('\x00')
-	if len(s) > 0 && s[len(s)-1] == '\x00' {
-		s = s[:len(s)-1]
-	}
-	return s
-}
-
-func main() {
-	sessionString := readStdinValue()
-	cacheJSON = readStdinValue()
-
-	var err error
-	client, err = tg.NewClient(tg.ClientConfig{
-		StringSession: sessionString,
-		MemorySession: true,
-		LogLevel:      tg.LogDisable,
-	})
-	if err != nil {
-		fmt.Println("Client error:", err)
-		return
-	}
-
-	if cacheJSON != "" {
-		client.Cache.ImportJSON([]byte(cacheJSON))
-	}
-
-	if _, err := client.Conn(); err != nil {
-		fmt.Println("Connection error:", err)
-		return
-	}
-
-	msgs, err := client.GetMessages(chatID, &tg.SearchOption{
-		IDs: int(msgID),
-	})
-	if err != nil || len(msgs) == 0 {
-		fmt.Println("Failed to get message:", err)
-		return
-	}
-
-	message = &msgs[0]
-	m = message
-	r, _ = message.GetReplyMessage()
-
 	fmt.Println("output-start")
 	evalCode()
 }
@@ -196,7 +121,7 @@ func EvalHandle(m *tg.NewMessage) error {
 
 	resp, isfile := perfomEval(code, m, imports)
 	if isfile {
-		if _, err := m.ReplyMedia(resp, &tg.MediaOptions{Caption: "Output"}); err != nil {
+		if _, err := TransferReplyMedia(m, resp, &tg.MediaOptions{Caption: "Output"}); err != nil {
 			m.Reply("Error: " + err.Error())
 		}
 		os.Remove(resp)
@@ -216,7 +141,7 @@ const goModContents = `module main
 
 go 1.25.0
 
-require github.com/amarnathcjd/gogram v1.8.0-beta.1
+require github.com/xAmarnath/gogram v1.8.0-beta.14
 `
 
 func perfomEval(code string, m *tg.NewMessage, imports []string) (string, bool) {
@@ -242,7 +167,11 @@ func perfomEval(code string, m *tg.NewMessage, imports []string) (string, bool) 
 
 	var code_file string
 	if needsClient {
-		code_file = fmt.Sprintf(boiler_code_for_eval, importStatement, m.ID, chatID, code)
+		peerLiteral, err := evalPeerLiteral(m)
+		if err != nil {
+			return "Eval bootstrap error: " + err.Error(), false
+		}
+		code_file = fmt.Sprintf(boiler_code_for_eval, importStatement, m.ID, chatID, peerLiteral, code)
 	} else {
 		code_file = fmt.Sprintf(boiler_code_for_eval_fast, importStatement, code)
 	}
@@ -304,7 +233,10 @@ func perfomEval(code string, m *tg.NewMessage, imports []string) (string, bool) 
 
 	if needsClient {
 		sessionString := m.Client.ExportSession()
-		cacheJSON, _ := m.Client.Cache.ExportJSON()
+		cacheJSON, err := m.Client.Cache.ExportJSON()
+		if err != nil {
+			return "Failed to export eval cache: " + err.Error(), false
+		}
 		cmd.Stdin = strings.NewReader(sessionString + "\x00" + string(cacheJSON) + "\x00")
 	}
 
@@ -417,7 +349,7 @@ func JsonHandle(m *tg.NewMessage) error {
 			return nil
 		}
 
-		_, err = m.ReplyMedia(tmpFile.Name(), &tg.MediaOptions{Caption: "Message JSON"})
+		_, err = TransferReplyMedia(m, tmpFile.Name(), &tg.MediaOptions{Caption: "Message JSON"})
 		if err != nil {
 			m.Reply("Error: " + err.Error())
 		}
@@ -703,7 +635,7 @@ func MediaInfoHandler(m *tg.NewMessage) error {
 	truncated := false
 	var downloadedFileName string
 	if !forceFull && r.File != nil && r.File.Size > 40*1024*1024 {
-		buf, _, err := m.Client.DownloadChunk(r.Media(), 0, 40*1024*1024, 512*1024)
+		buf, _, err := TransferDownloadChunk(context.Background(), r, 0, 40*1024*1024, 512*1024)
 		if err != nil {
 			msg.Edit("Error: " + err.Error())
 			return nil
@@ -715,7 +647,7 @@ func MediaInfoHandler(m *tg.NewMessage) error {
 		downloadedFileName = targetPath
 		truncated = true
 	} else {
-		fi, err := m.Client.DownloadMedia(r.Media(), &tg.DownloadOptions{FileName: targetPath})
+		fi, err := TransferDownload(r, &tg.DownloadOptions{FileName: targetPath})
 		if err != nil {
 			msg.Edit("Error: " + err.Error())
 			return nil
@@ -1037,7 +969,7 @@ func SetBotPfpHandler(m *tg.NewMessage) error {
 		return nil
 	}
 
-	fi, err := m.Client.DownloadMedia(r.Media())
+	fi, err := TransferDownload(r)
 	if err != nil {
 		m.Reply("Error: " + err.Error())
 		return nil
@@ -1081,7 +1013,7 @@ func SpectrogramHandler(m *tg.NewMessage) error {
 	}
 
 	msg, _ := m.Reply("<code>Generating spectrogram...</code>")
-	fi, err := m.Client.DownloadMedia(r.Media())
+	fi, err := TransferDownload(r)
 	if err != nil {
 		msg.Edit("Error downloading file: " + err.Error())
 		return nil
@@ -1128,7 +1060,7 @@ func SpectrogramHandler(m *tg.NewMessage) error {
 		return nil
 	}
 
-	_, err = m.ReplyMedia(outputFile, &tg.MediaOptions{
+	_, err = TransferReplyMedia(m, outputFile, &tg.MediaOptions{
 		Caption: "🎵 Audio Spectrogram",
 	})
 	if err != nil {
@@ -1254,7 +1186,7 @@ func HandlePostCommand(m *tg.NewMessage) error {
 	opts := &tg.SendOptions{}
 
 	if hasMedia {
-		_, err := m.Client.SendMedia(targetChannelID, media, &tg.MediaOptions{
+		_, err := TransferSendMedia(m.Client, targetChannelID, media, &tg.MediaOptions{
 			Caption: contentText,
 		})
 		if err != nil {
@@ -1342,7 +1274,7 @@ func warmEvalBuildCache() {
 		cancel()
 	}
 	warmFile := tmp_dir + "/eval_warm.go"
-	warmSrc := fmt.Sprintf(boiler_code_for_eval, "", 0, int64(0), "_ = 0")
+	warmSrc := fmt.Sprintf(boiler_code_for_eval, "", 0, int64(0), "&tg.InputPeerSelf{}", "_ = 0")
 	if err := os.WriteFile(warmFile, []byte(warmSrc), 0644); err != nil {
 		return
 	}
@@ -1362,17 +1294,17 @@ func warmEvalBuildCache() {
 func registerDevHandlers() {
 	c := Client
 	go warmEvalBuildCache()
-	c.On("cmd:sh", ShellHandle, tg.CustomFilter(FilterOwner))
-	c.On("cmd:bash", ShellHandle, tg.CustomFilter(FilterOwner))
-	c.On("cmd:eval", EvalHandle, tg.CustomFilter(FilterOwnerNoReply))
-	c.On("cmd:go", GoHandler)
-	c.On("cmd:json", JsonHandle)
-	c.On("cmd:ls", LsHandler, tg.CustomFilter(FilterOwner))
-	c.On("cmd:sessgen", GenStringSessionHandler)
-	c.On("cmd:setpfp", SetBotPfpHandler, tg.CustomFilter(FilterOwner))
-	c.On("cmd:spec", SpectrogramHandler)
-	c.On("cmd:upd", UpdateSourceCodeHandle, tg.CustomFilter(FilterOwnerNoReply))
-	c.On("cmd:post", HandlePostCommand, tg.CustomFilter(FilterOwner))
-	c.On("cmd:mediainfo", MediaInfoHandler)
-	c.On("cmd:media", MediaInfoHandler)
+	OnCommand(c, "cmd:sh", ShellHandle, tg.CustomFilter(FilterOwner))
+	OnCommand(c, "cmd:bash", ShellHandle, tg.CustomFilter(FilterOwner))
+	OnCommand(c, "cmd:eval", EvalHandle, tg.CustomFilter(FilterOwnerNoReply))
+	OnCommand(c, "cmd:go", GoHandler)
+	OnCommand(c, "cmd:json", JsonHandle)
+	OnCommand(c, "cmd:ls", LsHandler, tg.CustomFilter(FilterOwner))
+	OnCommand(c, "cmd:sessgen", GenStringSessionHandler)
+	OnCommand(c, "cmd:setpfp", SetBotPfpHandler, tg.CustomFilter(FilterOwner))
+	OnCommand(c, "cmd:spec", SpectrogramHandler)
+	OnCommand(c, "cmd:upd", UpdateSourceCodeHandle, tg.CustomFilter(FilterOwnerNoReply))
+	OnCommand(c, "cmd:post", HandlePostCommand, tg.CustomFilter(FilterOwner))
+	OnCommand(c, "cmd:mediainfo", MediaInfoHandler)
+	OnCommand(c, "cmd:media", MediaInfoHandler)
 }

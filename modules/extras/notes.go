@@ -4,9 +4,9 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
-	tg "github.com/amarnathcjd/gogram/telegram"
-	"go.etcd.io/bbolt"
+	tg "github.com/xAmarnath/gogram/telegram"
 	"html"
+	"main/internal/mongostore"
 	modules "main/modules"
 	"main/modules/db"
 	"regexp"
@@ -113,7 +113,7 @@ func SaveNoteHandler(m *tg.NewMessage) error {
 		return nil
 	}
 
-	if !modules.IsUserAdmin(m.Client, m.SenderID(), m.ChatID(), "change_info") {
+	if !modules.IsUserAdmin(m.Client, m.SenderID(), m.ChannelID(), "change_info") {
 		m.Reply("<b>Permission denied.</b> You need Change Info permission.")
 		return nil
 	}
@@ -284,7 +284,7 @@ func sendNote(m *tg.NewMessage, noteName string) error {
 	}
 
 	// Check admin-only restriction
-	if note.AdminOnly && !modules.IsUserAdmin(m.Client, m.SenderID(), m.ChatID(), "") {
+	if note.AdminOnly && !modules.IsUserAdmin(m.Client, m.SenderID(), m.ChannelID(), "") {
 		m.Reply("<b>Admin-only note.</b> Only admins can view this.")
 		return nil
 	}
@@ -310,7 +310,7 @@ func sendNote(m *tg.NewMessage, noteName string) error {
 			m.Reply("<b>Media not found.</b> The media may have been deleted.")
 			return nil
 		}
-		m.ReplyMedia(media, opts)
+		modules.TransferReplyMedia(m, media, opts)
 		return nil
 	}
 
@@ -403,7 +403,7 @@ func ClearNoteHandler(m *tg.NewMessage) error {
 		return nil
 	}
 
-	if !modules.IsUserAdmin(m.Client, m.SenderID(), m.ChatID(), "change_info") {
+	if !modules.IsUserAdmin(m.Client, m.SenderID(), m.ChannelID(), "change_info") {
 		m.Reply("<b>Permission denied.</b> You need Change Info permission.")
 		return nil
 	}
@@ -435,7 +435,7 @@ func ClearAllNotesHandler(m *tg.NewMessage) error {
 		return nil
 	}
 
-	if !modules.IsUserAdmin(m.Client, m.SenderID(), m.ChatID(), "change_info") {
+	if !modules.IsUserAdmin(m.Client, m.SenderID(), m.ChannelID(), "change_info") {
 		m.Reply("<b>Permission denied.</b> You need Change Info permission.")
 		return nil
 	}
@@ -501,7 +501,7 @@ func SaveTempNoteHandler(m *tg.NewMessage) error {
 		return nil
 	}
 
-	if !modules.IsUserAdmin(m.Client, m.SenderID(), m.ChatID(), "change_info") {
+	if !modules.IsUserAdmin(m.Client, m.SenderID(), m.ChannelID(), "change_info") {
 		m.Reply("<b>Permission denied.</b> You need Change Info permission.")
 		return nil
 	}
@@ -594,12 +594,12 @@ func SaveTempNoteHandler(m *tg.NewMessage) error {
 
 func registerNoteHandlers() {
 	c := modules.Client
-	c.On("cmd:save", SaveNoteHandler)
-	c.On("cmd:note", GetNoteHandler)
-	c.On("cmd:notes", ListNotesHandler)
-	c.On("cmd:listnotes", ListNotesHandler)
-	c.On("cmd:clear", ClearNoteHandler)
-	c.On("cmd:clearallnotes", ClearAllNotesHandler)
+	modules.OnCommand(c, "cmd:save", SaveNoteHandler)
+	modules.OnCommand(c, "cmd:note", GetNoteHandler)
+	modules.OnCommand(c, "cmd:notes", ListNotesHandler)
+	modules.OnCommand(c, "cmd:listnotes", ListNotesHandler)
+	modules.OnCommand(c, "cmd:clear", ClearNoteHandler)
+	modules.OnCommand(c, "cmd:clearallnotes", ClearAllNotesHandler)
 	c.On("callback:clearallnotes_", ClearAllNotesCallback)
 	c.On("callback:cancelnotes_", ClearAllNotesCallback)
 	c.On("message:^#", NoteHashHandler)
@@ -732,7 +732,7 @@ func saveReminder(entry *reminderEntry) error {
 	if err != nil || database == nil {
 		return fmt.Errorf("db error")
 	}
-	return database.Update(func(tx *bbolt.Tx) error {
+	return database.Update(func(tx *mongostore.Tx) error {
 		bkt, err := tx.CreateBucketIfNotExists([]byte(remindersBucket))
 		if err != nil {
 			return err
@@ -754,7 +754,7 @@ func deleteReminder(id uint64) error {
 	if err != nil || database == nil {
 		return fmt.Errorf("db error")
 	}
-	return database.Update(func(tx *bbolt.Tx) error {
+	return database.Update(func(tx *mongostore.Tx) error {
 		bkt := tx.Bucket([]byte(remindersBucket))
 		if bkt == nil {
 			return nil
@@ -769,7 +769,7 @@ func listReminders(userID int64) ([]*reminderEntry, error) {
 		return nil, fmt.Errorf("db error")
 	}
 	var out []*reminderEntry
-	err = database.View(func(tx *bbolt.Tx) error {
+	err = database.View(func(tx *mongostore.Tx) error {
 		bkt := tx.Bucket([]byte(remindersBucket))
 		if bkt == nil {
 			return nil
@@ -932,9 +932,9 @@ func bootstrapReminders() {
 
 func registerRemindersHandlers() {
 	c := modules.Client
-	c.On("cmd:remind", RemindHandler)
-	c.On("cmd:reminders", RemindersHandler)
-	c.On("cmd:delremind", DelRemindHandler)
+	modules.OnCommand(c, "cmd:remind", RemindHandler)
+	modules.OnCommand(c, "cmd:reminders", RemindersHandler)
+	modules.OnCommand(c, "cmd:delremind", DelRemindHandler)
 	go bootstrapReminders()
 }
 
@@ -1025,7 +1025,7 @@ func sendTimerNotification(timerID string) {
 	keyboard := tg.NewKeyboard().AddRow(snoozeBtn).AddRow(dismissBtn).Build()
 
 	if timer.media != nil {
-		timer.client.SendMedia(timer.chatID, timer.media, &tg.MediaOptions{
+		modules.TransferSendMedia(timer.client, timer.chatID, timer.media, &tg.MediaOptions{
 			Caption:     text,
 			ReplyMarkup: keyboard,
 		})

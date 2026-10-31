@@ -4,9 +4,8 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
-	tg "github.com/amarnathcjd/gogram/telegram"
-	"go.etcd.io/bbolt"
 	"html"
+	"main/internal/mongostore"
 	modules "main/modules"
 	"main/modules/db"
 	"regexp"
@@ -14,66 +13,66 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
+
+	tg "github.com/xAmarnath/gogram/telegram"
 )
 
-func parseButtons(content string) (string, [][]tg.KeyboardInlineButton) {
-	btnRegex := regexp.MustCompile(`\[([^\]]+)\]\(([^)]+)\)`)
-	matches := btnRegex.FindAllStringSubmatch(content, -1)
+var (
+	buttonSyntax   = regexp.MustCompile(`\[([^\[\]]+)\]\(([^()\s]+)\)`)
+	manyNewlines   = regexp.MustCompile(`\n{3,}`)
+	htmlTagPattern = regexp.MustCompile(`<[^>]+>`)
+)
 
-	if len(matches) == 0 {
+// parseButtons extracts [Text](url), [same:Text](url) and [Text](rules) buttons from content.
+// Anything else in brackets is left as text.
+func parseButtons(content string) (string, [][]tg.KeyboardInlineButton) {
+	var rows [][]tg.KeyboardInlineButton
+	var row []tg.KeyboardInlineButton
+	clean := buttonSyntax.ReplaceAllStringFunc(content, func(match string) string {
+		sub := buttonSyntax.FindStringSubmatch(match)
+		label := strings.TrimSpace(html.UnescapeString(htmlTagPattern.ReplaceAllString(sub[1], "")))
+		action := html.UnescapeString(htmlTagPattern.ReplaceAllString(sub[2], ""))
+		sameRow := false
+		if after, ok := strings.CutPrefix(label, "same:"); ok {
+			label, sameRow = strings.TrimSpace(after), true
+		}
+		if label == "" {
+			return match
+		}
+		var btn tg.KeyboardInlineButton
+		switch {
+		case action == "rules":
+			btn = tg.Button.Data(label, "rules_show")
+		case strings.HasPrefix(action, "https://"), strings.HasPrefix(action, "http://"), strings.HasPrefix(action, "tg://"):
+			btn = tg.Button.URL(label, action)
+		default:
+			return match
+		}
+		if sameRow && len(row) > 0 && len(row) < 8 {
+			row = append(row, btn)
+		} else {
+			if len(row) > 0 {
+				rows = append(rows, row)
+			}
+			row = []tg.KeyboardInlineButton{btn}
+		}
+		return ""
+	})
+	if len(row) > 0 {
+		rows = append(rows, row)
+	}
+	if len(rows) == 0 {
 		return content, nil
 	}
-
-	cleanContent := content
-	var rows [][]tg.KeyboardInlineButton
-	var currentRow []tg.KeyboardInlineButton
-
-	for _, match := range matches {
-		fullMatch := match[0]
-		label := match[1]
-		action := match[2]
-
-		cleanContent = strings.Replace(cleanContent, fullMatch, "", 1)
-
-		sameRow := strings.HasPrefix(label, "same:")
-		if sameRow {
-			label = strings.TrimPrefix(label, "same:")
-		}
-
-		var btn tg.KeyboardInlineButton
-		if action == "rules" {
-			btn = tg.Button.Data(label, "rules_show")
-		} else if strings.HasPrefix(action, "http://") || strings.HasPrefix(action, "https://") {
-			btn = tg.Button.URL(label, action)
-		} else {
-			btn = tg.Button.Data(label, "btn_"+action)
-		}
-
-		if sameRow && len(currentRow) > 0 {
-			currentRow = append(currentRow, btn)
-		} else {
-			if len(currentRow) > 0 {
-				rows = append(rows, currentRow)
-			}
-			currentRow = []tg.KeyboardInlineButton{btn}
-		}
-	}
-
-	if len(currentRow) > 0 {
-		rows = append(rows, currentRow)
-	}
-
-	cleanContent = strings.TrimSpace(cleanContent)
-	cleanContent = regexp.MustCompile(`\n{3,}`).ReplaceAllString(cleanContent, "\n\n")
-
-	return cleanContent, rows
+	clean = manyNewlines.ReplaceAllString(strings.TrimSpace(clean), "\n\n")
+	return clean, rows
 }
 
 func buildKeyboard(rows [][]tg.KeyboardInlineButton) *tg.ReplyInlineMarkup {
 	if len(rows) == 0 {
 		return nil
 	}
-
 	kb := tg.NewKeyboard()
 	for _, row := range rows {
 		kb.AddRow(row...)
@@ -81,226 +80,196 @@ func buildKeyboard(rows [][]tg.KeyboardInlineButton) *tg.ReplyInlineMarkup {
 	return kb.Build()
 }
 
+func serializeButtonRows(rows [][]tg.KeyboardInlineButton) string {
+	var lines []string
+	for _, row := range rows {
+		var parts []string
+		for i, btn := range row {
+			label := btn.Text
+			if i > 0 {
+				label = "same:" + label
+			}
+			switch b := btn.Type.(type) {
+			case *tg.InlineButtonTypeURL:
+				parts = append(parts, fmt.Sprintf("[%s](%s)", label, b.URL))
+			case *tg.InlineButtonTypeCallback:
+				if string(b.Data) == "rules_show" {
+					parts = append(parts, fmt.Sprintf("[%s](rules)", label))
+				}
+			}
+		}
+		lines = append(lines, strings.Join(parts, " "))
+	}
+	return strings.Join(lines, "\n")
+}
+
+func chatTitle(m *tg.NewMessage) string {
+	if m.Channel != nil && m.Channel.Title != "" {
+		return m.Channel.Title
+	}
+	if m.Chat != nil && m.Chat.Title != "" {
+		return m.Chat.Title
+	}
+	return "this chat"
+}
+
+func plainFromHTML(s string) string {
+	return strings.TrimSpace(html.UnescapeString(htmlTagPattern.ReplaceAllString(s, "")))
+}
+
 func SetRulesHandler(m *tg.NewMessage) error {
-	if m.IsPrivate() {
-		m.Reply("Rules can only be set in groups")
+	if !modules.RequireGroup(m) {
 		return nil
 	}
-
-	if !modules.IsUserAdmin(m.Client, m.SenderID(), m.ChatID(), "change_info") {
-		m.Reply("You need Change Info permission to set rules")
+	if !modules.SenderHasRight(m, "change_info") {
+		m.Reply("You need the <b>Change Info</b> admin right to set rules.")
 		return nil
 	}
 
 	rules := &db.Rules{}
-
+	text := m.Text()
+	if modules.CommandArgs(text) != "" {
+		rules.Content = formattedTail(text, m.Message.Entities, argsStart(text))
+	}
 	if m.IsReply() {
 		reply, err := m.GetReplyMessage()
-		if err != nil {
-			m.Reply("Error getting reply message")
+		if err != nil || reply == nil {
+			m.Reply("I couldn't read the replied message. Please try again.")
 			return nil
 		}
-
-		if reply.IsMedia() {
-			if reply.Photo() != nil {
-				rules.MediaType = "photo"
-				rules.FileID = reply.File.FileID
-			} else if reply.Document() != nil {
-				rules.MediaType = "document"
-				rules.FileID = reply.File.FileID
-			} else if reply.Video() != nil {
-				rules.MediaType = "video"
-				rules.FileID = reply.File.FileID
-			} else if reply.Animation() != nil {
-				rules.MediaType = "animation"
-				rules.FileID = reply.File.FileID
-			}
+		media := mediaOfMessage(reply)
+		switch media.kind {
+		case "photo", "document", "video", "animation":
+			rules.MediaType, rules.FileID = media.kind, media.fileID
 		}
-
-		rules.Content = reply.RawText()
-		if m.Args() != "" {
-			rules.Content = m.Args()
+		if rules.Content == "" && reply.Message != nil {
+			rules.Content = formattedTail(reply.Text(), reply.Message.Entities, 0)
 		}
-	} else {
-		rules.Content = m.Args()
 	}
 
 	if rules.Content == "" && rules.FileID == "" {
-		m.Reply("Usage: /setrules <rules text> or reply to a message with /setrules\n\n<b>Button Format:</b>\n[Button Name](https://url)\n[same:Button 2](https://url2) - same row\n[Rules](rules) - shows rules popup")
+		m.Reply("<b>Usage:</b> <code>/setrules &lt;rules text&gt;</code> or reply to a message with <code>/setrules</code>.\n\n<b>Buttons:</b>\n<code>[Button](https://url)</code>\n<code>[same:Button 2](https://url2)</code> - same row\n<code>[Rules](rules)</code> - show rules popup")
 		return nil
 	}
 
-	cleanContent, buttons := parseButtons(rules.Content)
-	rules.Content = cleanContent
-	if len(buttons) > 0 {
-		var btnStr []string
-		for _, row := range buttons {
-			var rowStr []string
-			for _, btn := range row {
-				switch b := btn.Type.(type) {
-				case *tg.InlineButtonTypeURL:
-					rowStr = append(rowStr, fmt.Sprintf("[%s](%s)", btn.Text, b.URL))
-				case *tg.InlineButtonTypeCallback:
-					if string(b.Data) == "rules_show" {
-						rowStr = append(rowStr, fmt.Sprintf("[%s](rules)", btn.Text))
-					} else {
-						rowStr = append(rowStr, fmt.Sprintf("[%s](%s)", btn.Text, string(b.Data)))
-					}
-				}
-			}
-			btnStr = append(btnStr, strings.Join(rowStr, " "))
-		}
-		rules.Buttons = strings.Join(btnStr, "\n")
+	clean, rows := parseButtons(rules.Content)
+	rules.Content = clean
+	if len(rows) > 0 {
+		rules.Buttons = serializeButtonRows(rows)
+	}
+	if utf8.RuneCountInString(rules.Content) > 4000 {
+		m.Reply("The rules are too long; please keep them under 4000 characters.")
+		return nil
 	}
 
 	if err := db.SetRulesWithMedia(m.ChatID(), rules); err != nil {
-		m.Reply("Failed to save rules")
+		m.Reply("I couldn't save the rules right now. Please try again.")
 		return nil
 	}
-
-	mediaTag := ""
+	tag := ""
 	if rules.FileID != "" {
-		mediaTag = " [with media]"
+		tag = " (with media)"
 	}
-
-	m.Reply(fmt.Sprintf("Rules have been saved%s\nUse /rules to view them", mediaTag))
+	m.Reply("Rules saved" + tag + ". Use /rules to view them.")
 	return nil
 }
 
 func GetRulesHandler(m *tg.NewMessage) error {
-	if m.IsPrivate() {
-		m.Reply("Rules can only be viewed in groups")
+	if !modules.RequireGroup(m) {
 		return nil
 	}
-
 	rules, err := db.GetRulesWithMedia(m.ChatID())
 	if err != nil || rules == nil || (rules.Content == "" && rules.FileID == "") {
-		m.Reply("No rules set for this chat\nAdmins can use /setrules to set rules")
+		m.Reply("No rules have been set for this chat.\nAdmins can set them with /setrules.")
 		return nil
 	}
 
-	var chatName string
-	if m.Channel != nil {
-		chatName = m.Channel.Title
-	} else if m.Chat != nil {
-		chatName = m.Chat.Title
-	} else {
-		chatName = "this chat"
-	}
-
-	response := fmt.Sprintf("<b>Rules for %s:</b>\n\n%s", chatName, rules.Content)
-
+	response := fmt.Sprintf("<b>Rules for %s:</b>\n\n%s", html.EscapeString(chatTitle(m)), rules.Content)
 	var keyboard *tg.ReplyInlineMarkup
 	if rules.Buttons != "" {
-		_, buttons := parseButtons(rules.Buttons)
-		keyboard = buildKeyboard(buttons)
+		_, rows := parseButtons(rules.Buttons)
+		keyboard = buildKeyboard(rows)
 	}
 
+	if rules.FileID != "" {
+		if media, err := tg.ResolveBotFileID(rules.FileID); err == nil {
+			opts := &tg.MediaOptions{ReplyMarkup: keyboard}
+			fits := utf8.RuneCountInString(plainFromHTML(response)) <= 1024
+			if fits {
+				opts.Caption = response
+			}
+			if _, err := modules.TransferReplyMedia(m, media, opts); err == nil {
+				if !fits {
+					m.Reply(response)
+				}
+				return nil
+			}
+		}
+	}
 	opts := &tg.SendOptions{}
 	if keyboard != nil {
 		opts.ReplyMarkup = keyboard
 	}
-
-	if rules.FileID != "" {
-		media, err := tg.ResolveBotFileID(rules.FileID)
-		if err == nil {
-			m.ReplyMedia(media, &tg.MediaOptions{Caption: response, ReplyMarkup: keyboard})
-			return nil
-		}
+	if _, err := m.Reply(response, opts); err != nil {
+		m.Reply(html.EscapeString(plainFromHTML(response)), opts)
 	}
-
-	m.Reply(response, opts)
 	return nil
 }
 
 func ClearRulesHandler(m *tg.NewMessage) error {
-	if m.IsPrivate() {
-		m.Reply("Rules can only be cleared in groups")
+	if !modules.RequireGroup(m) {
 		return nil
 	}
-
-	if !modules.IsUserAdmin(m.Client, m.SenderID(), m.ChatID(), "change_info") {
-		m.Reply("You need Change Info permission to clear rules")
+	if !modules.SenderHasRight(m, "change_info") {
+		m.Reply("You need the <b>Change Info</b> admin right to clear rules.")
 		return nil
 	}
-
-	if !db.HasRules(m.ChatID()) {
-		m.Reply("No rules set for this chat")
+	rules, _ := db.GetRulesWithMedia(m.ChatID())
+	if rules == nil || (rules.Content == "" && rules.FileID == "") {
+		m.Reply("No rules are set for this chat.")
 		return nil
 	}
-
 	if err := db.DeleteRules(m.ChatID()); err != nil {
-		m.Reply("Failed to clear rules")
+		m.Reply("I couldn't clear the rules right now. Please try again.")
 		return nil
 	}
-
-	m.Reply("Rules have been cleared")
+	m.Reply("Rules cleared.")
 	return nil
 }
 
 func RulesButtonCallback(c *tg.CallbackQuery) error {
-	data := c.DataString()
-	if data != "rules_show" && !strings.HasPrefix(data, "rules_") {
+	if c.DataString() != "rules_show" {
 		return nil
 	}
 	rules, err := db.GetRulesWithMedia(c.ChatID)
-	if err != nil || rules == nil || rules.Content == "" {
-		c.Answer("No rules set for this chat", &tg.CallbackOptions{Alert: true})
+	if err != nil || rules == nil || (rules.Content == "" && rules.FileID == "") {
+		c.Answer("No rules have been set for this chat.", &tg.CallbackOptions{Alert: true})
 		return nil
 	}
-
-	if len(rules.Content) < 200 {
-		c.Answer(rules.Content, &tg.CallbackOptions{Alert: true})
+	plain := plainFromHTML(rules.Content)
+	if plain != "" && utf8.RuneCountInString(plain) <= 190 {
+		c.Answer(plain, &tg.CallbackOptions{Alert: true})
 		return nil
 	}
-
-	msg := "<b>Rules:</b>\n\n" + rules.Content
-	if _, err := c.Client.SendMessage(c.SenderID, msg, &tg.SendOptions{ParseMode: "HTML"}); err == nil {
-		c.Answer("Rules sent to your DM.")
+	if _, err := c.Client.SendMessage(c.GetSenderID(), "<b>Rules:</b>\n\n"+rules.Content); err == nil {
+		c.Answer("I've sent you the rules in private.", &tg.CallbackOptions{Alert: true})
 		return nil
 	}
-
-	me := c.Client.Me()
-	if me != nil && me.Username != "" {
-		b := tg.Button
-		kb := tg.NewKeyboard().AddRow(
-			b.URL("Open bot to see rules", "https://t.me/"+me.Username+"?start=rules"),
-		).Build()
-		c.Edit("Please open the bot in DM to see the rules.", &tg.SendOptions{ReplyMarkup: kb})
-		c.Answer("Open the bot in DM to view rules.", &tg.CallbackOptions{Alert: true})
-		return nil
+	hint := "Start a private chat with me first, then tap again. Or use /rules in the group."
+	if me := c.Client.Me(); me != nil && me.Username != "" {
+		hint = "Start a private chat with @" + me.Username + " first, then tap again. Or use /rules in the group."
 	}
-
-	c.Answer("Open the bot in DM first, then click again.", &tg.CallbackOptions{Alert: true})
+	c.Answer(hint, &tg.CallbackOptions{Alert: true})
 	return nil
 }
 
 func registerRuleHandlers() {
 	c := modules.Client
-	c.On("cmd:setrules", SetRulesHandler)
-	c.On("cmd:rules", GetRulesHandler)
-	c.On("cmd:clearrules", ClearRulesHandler)
-	c.On("callback:rules_", RulesButtonCallback)
-}
-
-func initFromSrc_rules_0_1() {
-	modules.QueueHandlerRegistration(registerRuleHandlers)
-
-	modules.Mods.AddModule("Rules", `<b>Rules Module</b>
-
-Set and display group rules with optional media.
-
-<b>Commands:</b>
- - /setrules <text> - Set the group rules (or reply to a message)
- - /rules - Display the group rules
- - /clearrules - Clear the rules
-
-<b>Button Format:</b>
- - [Button Text](https://url) - URL button
- - [same:Button](https://url) - Same row as previous
- - [Rules](rules) - Shows rules popup
-
-<b>Note:</b> Only admins with Change Info permission can modify rules.`)
+	modules.OnCommand(c, "cmd:setrules", SetRulesHandler)
+	modules.OnCommand(c, "cmd:rules", GetRulesHandler)
+	modules.OnCommand(c, "cmd:clearrules", ClearRulesHandler)
+	modules.OnCommand(c, "cmd:resetrules", ClearRulesHandler)
+	c.On("callback:rules_show", RulesButtonCallback)
 }
 
 const tmpRulesBucket = "tmprules"
@@ -308,10 +277,19 @@ const tmpRulesBucket = "tmprules"
 type tmpRule struct {
 	ID        int64  `json:"id"`
 	ChatID    int64  `json:"chat_id"`
+	Peer      int64  `json:"peer,omitempty"`
 	MsgID     int32  `json:"msg_id"`
 	Text      string `json:"text"`
 	ExpiresAt int64  `json:"expires_at"`
 	CreatedBy int64  `json:"created_by"`
+}
+
+// peerID returns the Bot-API chat ID; older records only stored the raw (supergroup) ID.
+func (r *tmpRule) peerID() int64 {
+	if r.Peer != 0 {
+		return r.Peer
+	}
+	return modules.NormChatID(r.ChatID)
 }
 
 var (
@@ -319,86 +297,82 @@ var (
 	tmpRuleTimersMu sync.Mutex
 )
 
+func tmpRuleKey(id int64) []byte {
+	key := make([]byte, 8)
+	binary.BigEndian.PutUint64(key, uint64(id))
+	return key
+}
+
 func saveTmpRule(r *tmpRule) error {
 	database, err := db.GetDB()
-	if err != nil || database == nil {
-		return fmt.Errorf("db error")
+	if err != nil {
+		return err
 	}
-	return database.Update(func(tx *bbolt.Tx) error {
+	return database.Update(func(tx *mongostore.Tx) error {
 		b, err := tx.CreateBucketIfNotExists([]byte(tmpRulesBucket))
 		if err != nil {
 			return err
 		}
-		key := make([]byte, 8)
-		binary.BigEndian.PutUint64(key, uint64(r.ID))
 		data, err := json.Marshal(r)
 		if err != nil {
 			return err
 		}
-		return b.Put(key, data)
+		return b.Put(tmpRuleKey(r.ID), data)
 	})
 }
 
 func deleteTmpRule(id int64) error {
 	database, err := db.GetDB()
-	if err != nil || database == nil {
-		return fmt.Errorf("db error")
+	if err != nil {
+		return err
 	}
-	return database.Update(func(tx *bbolt.Tx) error {
+	return database.Update(func(tx *mongostore.Tx) error {
 		b := tx.Bucket([]byte(tmpRulesBucket))
 		if b == nil {
 			return nil
 		}
-		key := make([]byte, 8)
-		binary.BigEndian.PutUint64(key, uint64(id))
-		return b.Delete(key)
+		return b.Delete(tmpRuleKey(id))
 	})
 }
 
 func getTmpRule(id int64) *tmpRule {
 	database, err := db.GetDB()
-	if err != nil || database == nil {
+	if err != nil {
 		return nil
 	}
 	var r *tmpRule
-	_ = database.View(func(tx *bbolt.Tx) error {
+	_ = database.View(func(tx *mongostore.Tx) error {
 		b := tx.Bucket([]byte(tmpRulesBucket))
 		if b == nil {
 			return nil
 		}
-		key := make([]byte, 8)
-		binary.BigEndian.PutUint64(key, uint64(id))
-		v := b.Get(key)
+		v := b.Get(tmpRuleKey(id))
 		if len(v) == 0 {
 			return nil
 		}
 		var tmp tmpRule
-		if err := json.Unmarshal(v, &tmp); err != nil {
-			return nil
+		if json.Unmarshal(v, &tmp) == nil {
+			r = &tmp
 		}
-		r = &tmp
 		return nil
 	})
 	return r
 }
 
-func listTmpRulesForChat(chatID int64) []*tmpRule {
+func listTmpRules(match func(*tmpRule) bool) []*tmpRule {
 	database, err := db.GetDB()
-	if err != nil || database == nil {
+	if err != nil {
 		return nil
 	}
 	var out []*tmpRule
-	_ = database.View(func(tx *bbolt.Tx) error {
+	_ = database.View(func(tx *mongostore.Tx) error {
 		b := tx.Bucket([]byte(tmpRulesBucket))
 		if b == nil {
 			return nil
 		}
 		return b.ForEach(func(_, v []byte) error {
 			var tmp tmpRule
-			if err := json.Unmarshal(v, &tmp); err != nil {
-				return nil
-			}
-			if tmp.ChatID == chatID {
+			if json.Unmarshal(v, &tmp) == nil && (match == nil || match(&tmp)) {
 				out = append(out, &tmp)
 			}
 			return nil
@@ -407,205 +381,171 @@ func listTmpRulesForChat(chatID int64) []*tmpRule {
 	return out
 }
 
-func listAllTmpRules() []*tmpRule {
-	database, err := db.GetDB()
-	if err != nil || database == nil {
-		return nil
-	}
-	var out []*tmpRule
-	_ = database.View(func(tx *bbolt.Tx) error {
-		b := tx.Bucket([]byte(tmpRulesBucket))
-		if b == nil {
-			return nil
-		}
-		return b.ForEach(func(_, v []byte) error {
-			var tmp tmpRule
-			if err := json.Unmarshal(v, &tmp); err != nil {
-				return nil
-			}
-			out = append(out, &tmp)
-			return nil
-		})
-	})
-	return out
-}
-
 func scheduleTmpRule(r *tmpRule) {
-	delay := time.Until(time.Unix(r.ExpiresAt, 0))
-	if delay < 0 {
-		delay = 0
-	}
+	delay := max(time.Until(time.Unix(r.ExpiresAt, 0)), 0)
+	id := r.ID
 	tmpRuleTimersMu.Lock()
-	if existing, ok := tmpRuleTimers[r.ID]; ok {
+	if existing, ok := tmpRuleTimers[id]; ok {
 		existing.Stop()
 	}
-	tmpRuleTimers[r.ID] = time.AfterFunc(delay, func() {
-		expireTmpRule(r.ID)
-	})
+	tmpRuleTimers[id] = time.AfterFunc(delay, func() { expireTmpRule(id) })
 	tmpRuleTimersMu.Unlock()
 }
 
+func removeTmpRuleMessage(r *tmpRule) {
+	if modules.Client == nil {
+		return
+	}
+	_, _ = modules.Client.UnpinMessage(r.peerID(), r.MsgID)
+	_, _ = modules.Client.DeleteMessages(r.peerID(), []int32{r.MsgID})
+}
+
 func expireTmpRule(id int64) {
+	tmpRuleTimersMu.Lock()
+	delete(tmpRuleTimers, id)
+	tmpRuleTimersMu.Unlock()
 	r := getTmpRule(id)
 	if r == nil {
 		return
 	}
-	if modules.Client != nil {
-		_, _ = modules.Client.UnpinMessage(r.ChatID, r.MsgID)
-		_, _ = modules.Client.DeleteMessages(r.ChatID, []int32{r.MsgID})
-	}
+	removeTmpRuleMessage(r)
 	_ = deleteTmpRule(id)
-	tmpRuleTimersMu.Lock()
-	delete(tmpRuleTimers, id)
-	tmpRuleTimersMu.Unlock()
+}
+
+// formatSpan renders a duration as e.g. "1d 2h 5m".
+func formatSpan(d time.Duration) string {
+	d = d.Round(time.Second)
+	var parts []string
+	for _, u := range []struct {
+		unit time.Duration
+		name string
+	}{{7 * 24 * time.Hour, "w"}, {24 * time.Hour, "d"}, {time.Hour, "h"}, {time.Minute, "m"}, {time.Second, "s"}} {
+		if n := d / u.unit; n > 0 {
+			parts = append(parts, fmt.Sprintf("%d%s", n, u.name))
+			d -= n * u.unit
+		}
+	}
+	if len(parts) == 0 {
+		return "0s"
+	}
+	return strings.Join(parts, " ")
 }
 
 func TmpRuleHandler(m *tg.NewMessage) error {
-	if m.IsPrivate() {
-		m.Reply("<b>This command only works in groups.</b>")
+	if !modules.RequireGroup(m) {
 		return nil
 	}
-	if !modules.IsUserAdmin(m.Client, m.SenderID(), m.ChatID(), "pin") {
-		m.Reply("<b>Permission denied.</b> You need Pin Messages permission.")
+	if !modules.SenderHasRight(m, "pin") {
+		m.Reply("You need the <b>Pin Messages</b> admin right to post temporary rules.")
 		return nil
 	}
-
-	args := strings.TrimSpace(m.Args())
-	if args == "" {
-		m.Reply("<b>Usage:</b> <code>/tmprule &lt;duration&gt; &lt;text&gt;</code>\n<b>Example:</b> <code>/tmprule 2h No spam allowed</code>")
+	durStr, text := modules.SplitFirstArg(modules.CommandArgs(m.Text()))
+	if durStr == "" || text == "" {
+		m.Reply("<b>Usage:</b> <code>/tmprule &lt;duration&gt; &lt;text&gt;</code>\n<b>Example:</b> <code>/tmprule 2h No memes until the event ends</code>")
 		return nil
 	}
-
-	parts := strings.SplitN(args, " ", 2)
-	if len(parts) < 2 {
-		m.Reply("<b>Usage:</b> <code>/tmprule &lt;duration&gt; &lt;text&gt;</code>")
-		return nil
-	}
-
-	duration, err := parseDuration(parts[0])
+	duration, err := modules.ParseTempDuration(durStr)
 	if err != nil {
-		m.Reply("<b>Error:</b> " + html.EscapeString(err.Error()))
+		m.Reply(modules.AdminFriendlyError(err, "post the rule"))
+		return nil
+	}
+	if utf8.RuneCountInString(text) > 3500 {
+		m.Reply("That rule is too long; keep it under 3500 characters.")
 		return nil
 	}
 
-	text := strings.TrimSpace(parts[1])
-	if text == "" {
-		m.Reply("<b>Error:</b> rule text required.")
-		return nil
-	}
-
-	body := fmt.Sprintf("<b>Temporary Rule</b>\n\n%s\n\n<i>Expires in %s</i>", html.EscapeString(text), formatDuration(duration))
+	body := fmt.Sprintf("<b>Temporary Rule</b>\n\n%s\n\n<i>Expires in %s</i>", html.EscapeString(text), formatSpan(duration))
 	sent, err := m.Reply(body)
 	if err != nil || sent == nil {
-		m.Reply("<b>Failed to post rule.</b>")
+		m.Reply("I couldn't post the rule.")
 		return nil
 	}
 
-	if modules.CanBot(m.Client, m.Channel, "pin") {
-		_, perr := m.Client.PinMessage(m.ChatID(), sent.ID, &tg.PinOptions{Silent: true})
-		if perr != nil {
-			m.Reply("<b>Rule posted.</b> <i>Could not pin: missing permission.</i>")
+	chat := m.ChannelID()
+	if modules.BotHasRight(m.Client, chat, "pin") {
+		if _, perr := m.Client.PinMessage(chat, sent.ID, &tg.PinOptions{Silent: true}); perr != nil {
+			m.Reply("Rule posted, but I couldn't pin it: " + modules.AdminFriendlyError(perr, "pin it"))
 		}
 	} else {
-		m.Reply("<b>Rule posted.</b> <i>I need pin permission to pin it.</i>")
+		m.Reply("Rule posted. Give me the Pin Messages right if you want it pinned.")
 	}
 
-	id := time.Now().UnixNano()
 	r := &tmpRule{
-		ID:        id,
+		ID:        time.Now().UnixNano(),
 		ChatID:    m.ChatID(),
+		Peer:      chat,
 		MsgID:     sent.ID,
 		Text:      text,
 		ExpiresAt: time.Now().Add(duration).Unix(),
 		CreatedBy: m.SenderID(),
 	}
-
 	if err := saveTmpRule(r); err != nil {
-		m.Reply("<b>Warning:</b> rule saved in memory only.")
+		m.Reply("Note: I couldn't save this rule, so it won't expire if I restart.")
 	}
 	scheduleTmpRule(r)
 	return nil
 }
 
 func TmpRulesListHandler(m *tg.NewMessage) error {
-	if m.IsPrivate() {
-		m.Reply("<b>This command only works in groups.</b>")
+	if !modules.RequireGroup(m) {
 		return nil
 	}
-
-	rules := listTmpRulesForChat(m.ChatID())
+	chatID := m.ChatID()
+	rules := listTmpRules(func(r *tmpRule) bool { return r.ChatID == chatID })
 	if len(rules) == 0 {
-		m.Reply("<b>No active temporary rules in this chat.</b>")
+		m.Reply("No temporary rules are active in this chat.")
 		return nil
 	}
-
-	var b strings.Builder
-	b.WriteString("<b>Active Temporary Rules:</b>\n\n")
+	lines := make([]string, 0, len(rules))
 	for _, r := range rules {
-		remaining := time.Until(time.Unix(r.ExpiresAt, 0))
-		if remaining < 0 {
-			remaining = 0
-		}
 		preview := r.Text
-		if len(preview) > 80 {
-			preview = preview[:80] + "..."
+		if utf8.RuneCountInString(preview) > 80 {
+			preview = string([]rune(preview)[:80]) + "..."
 		}
-		b.WriteString(fmt.Sprintf("<b>ID:</b> <code>%d</code>\n%s\n<i>Expires in %s</i>\n\n", r.ID, html.EscapeString(preview), formatDuration(remaining)))
+		lines = append(lines, fmt.Sprintf("<b>ID:</b> <code>%d</code>\n%s\n<i>Expires in %s</i>\n", r.ID, html.EscapeString(preview), formatSpan(max(time.Until(time.Unix(r.ExpiresAt, 0)), 0))))
 	}
-
-	m.Reply(b.String())
+	sendChunked(m, "<b>Active temporary rules:</b>\n\n", lines, "")
 	return nil
 }
 
 func RmTmpRuleHandler(m *tg.NewMessage) error {
-	if m.IsPrivate() {
-		m.Reply("<b>This command only works in groups.</b>")
+	if !modules.RequireGroup(m) {
 		return nil
 	}
-	if !modules.IsUserAdmin(m.Client, m.SenderID(), m.ChatID(), "pin") {
-		m.Reply("<b>Permission denied.</b> You need Pin Messages permission.")
+	if !modules.SenderHasRight(m, "pin") {
+		m.Reply("You need the <b>Pin Messages</b> admin right to remove temporary rules.")
 		return nil
 	}
-
-	args := strings.TrimSpace(m.Args())
-	if args == "" {
-		m.Reply("<b>Usage:</b> <code>/rmtmprule &lt;id&gt;</code>")
+	arg, _ := modules.SplitFirstArg(modules.CommandArgs(m.Text()))
+	if arg == "" {
+		m.Reply("<b>Usage:</b> <code>/rmtmprule &lt;id&gt;</code> (see /tmprules for IDs)")
 		return nil
 	}
-
-	id, err := strconv.ParseInt(args, 10, 64)
+	id, err := strconv.ParseInt(arg, 10, 64)
 	if err != nil {
-		m.Reply("<b>Error:</b> invalid id.")
+		m.Reply("That isn't a valid rule ID. See /tmprules.")
 		return nil
 	}
-
 	r := getTmpRule(id)
 	if r == nil || r.ChatID != m.ChatID() {
-		m.Reply("<b>No such temporary rule in this chat.</b>")
+		m.Reply("There's no temporary rule with that ID in this chat.")
 		return nil
 	}
-
 	tmpRuleTimersMu.Lock()
 	if t, ok := tmpRuleTimers[id]; ok {
 		t.Stop()
 		delete(tmpRuleTimers, id)
 	}
 	tmpRuleTimersMu.Unlock()
-
-	if modules.CanBot(m.Client, m.Channel, "pin") {
-		_, _ = m.Client.UnpinMessage(r.ChatID, r.MsgID)
-	}
-	_, _ = m.Client.DeleteMessages(r.ChatID, []int32{r.MsgID})
+	removeTmpRuleMessage(r)
 	_ = deleteTmpRule(id)
-
-	m.Reply("<b>Temporary rule removed.</b>")
+	m.Reply("Temporary rule removed.")
 	return nil
 }
 
 func rescheduleTmpRules() {
-	rules := listAllTmpRules()
 	now := time.Now().Unix()
-	for _, r := range rules {
+	for _, r := range listTmpRules(nil) {
 		if r.ExpiresAt <= now {
 			go expireTmpRule(r.ID)
 			continue
@@ -616,29 +556,45 @@ func rescheduleTmpRules() {
 
 func registerTmpRulesHandlers() {
 	c := modules.Client
-	c.On("cmd:tmprule", TmpRuleHandler)
-	c.On("cmd:tmprules", TmpRulesListHandler)
-	c.On("cmd:rmtmprule", RmTmpRuleHandler)
-
+	modules.OnCommand(c, "cmd:tmprule", TmpRuleHandler)
+	modules.OnCommand(c, "cmd:tmprules", TmpRulesListHandler)
+	modules.OnCommand(c, "cmd:rmtmprule", RmTmpRuleHandler)
 	go rescheduleTmpRules()
-
-	modules.Mods.AddModule("TempRules", `<b>Temporary Rules Module</b>
-
-Pin a rule for a limited time. After expiry it is auto-unpinned and deleted.
-
-<b>Commands:</b>
- - /tmprule &lt;duration&gt; &lt;text&gt; - Post a temporary rule (admin)
- - /tmprules - List active temporary rules
- - /rmtmprule &lt;id&gt; - Remove a temporary rule early (admin)
-
-<b>Duration format:</b> 30s, 5m, 2h, 1d, 1w`)
-}
-
-func initFromSrc_temprules_1_1() {
-	modules.QueueHandlerRegistration(registerTmpRulesHandlers)
 }
 
 func init() {
-	initFromSrc_rules_0_1()
-	initFromSrc_temprules_1_1()
+	modules.QueueHandlerRegistration(registerRuleHandlers)
+	modules.QueueHandlerRegistration(registerTmpRulesHandlers)
+
+	modules.Mods.AddModule("Rules", `<b>Rules</b>
+Save the group rules once and show them on demand.
+
+<b>Commands:</b>
+ • <code>/rules</code> - show the rules.
+ • <code>/setrules &lt;text&gt;</code> - set the rules. Formatting (bold, italic, links) is kept.
+ • <code>/setrules</code> (reply to a message) - use that message's text, and its photo/video/GIF/file if it has one. Text after the command overrides the replied text.
+ • <code>/clearrules</code> (or <code>/resetrules</code>) - delete the rules.
+Setting and clearing needs the Change Info admin right.
+
+<b>Buttons:</b>
+ • <code>[Text](https://link)</code> - link button on a new row
+ • <code>[same:Text](https://link)</code> - link button on the same row as the previous one
+ • <code>[Rules](rules)</code> - button that shows the rules in a popup (or in private if they're long)
+
+<b>Example:</b>
+<code>/setrules 1. Be nice
+2. No spam or ads
+[Full rules](https://example.com/rules)</code>`)
+
+	modules.Mods.AddModule("TempRules", `<b>Temporary Rules</b>
+Post a rule that is pinned for a limited time, then automatically unpinned and deleted (survives restarts).
+
+<b>Commands:</b>
+ • <code>/tmprule &lt;duration&gt; &lt;text&gt;</code> - post and pin a temporary rule (Pin Messages right needed).
+ • <code>/tmprules</code> - list active temporary rules with their IDs.
+ • <code>/rmtmprule &lt;id&gt;</code> - remove one early (Pin Messages right needed).
+
+<b>Durations:</b> 1m to 366d, e.g. <code>30m</code>, <code>2h</code>, <code>1d</code>, <code>1w</code>, <code>1h30m</code>.
+
+<b>Example:</b> <code>/tmprule 2h No off-topic during the AMA</code>`)
 }

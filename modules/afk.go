@@ -12,20 +12,30 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf16"
 
-	tg "github.com/amarnathcjd/gogram/telegram"
-	"go.etcd.io/bbolt"
+	tg "github.com/xAmarnath/gogram/telegram"
+	"main/internal/mongostore"
 )
 
 type AFK struct {
-	Name    string
-	Message string
-	Media   string
-	Time    int64
+	Name     string `json:"name"`
+	Username string `json:"username"`
+	Message  string `json:"message"`
+	Media    string `json:"media"`
+	Time     int64  `json:"time"`
 }
 
-var afkList = make(map[int64]AFK)
-var afkMu sync.RWMutex
+const afkBucket = "afk"
+
+var (
+	afkList       = make(map[int64]AFK)
+	afkByUsername = make(map[string]int64)
+	afkMu         sync.RWMutex
+	afkLoadOnce   sync.Once
+	afkNotified   = make(map[[2]int64][]time.Time)
+	afkNotifiedMu sync.Mutex
+)
 
 var randomAFKMessages = []string{
 	"<b>%s</b> is AFK since <b>%s</b>.",
@@ -36,196 +46,275 @@ var randomAFKMessages = []string{
 	"<b>%s</b> is currently AFK for <b>%s</b>.",
 }
 
+func afkLoad() {
+	afkLoadOnce.Do(func() {
+		database, err := db.GetDB()
+		if err != nil || database == nil {
+			return
+		}
+		_ = database.View(func(tx *mongostore.Tx) error {
+			b := tx.Bucket([]byte(afkBucket))
+			if b == nil {
+				return nil
+			}
+			return b.ForEach(func(k, v []byte) error {
+				id, err := strconv.ParseInt(string(k), 10, 64)
+				if err != nil {
+					return nil
+				}
+				var a AFK
+				if json.Unmarshal(v, &a) == nil {
+					afkMu.Lock()
+					afkList[id] = a
+					if a.Username != "" {
+						afkByUsername[a.Username] = id
+					}
+					afkMu.Unlock()
+				}
+				return nil
+			})
+		})
+	})
+}
+
+func afkPersist(id int64, a *AFK) {
+	go func() {
+		database, err := db.GetDB()
+		if err != nil || database == nil {
+			return
+		}
+		_ = database.Update(func(tx *mongostore.Tx) error {
+			b, err := tx.CreateBucketIfNotExists([]byte(afkBucket))
+			if err != nil {
+				return err
+			}
+			key := []byte(strconv.FormatInt(id, 10))
+			if a == nil {
+				return b.Delete(key)
+			}
+			data, err := json.Marshal(a)
+			if err != nil {
+				return err
+			}
+			return b.Put(key, data)
+		})
+	}()
+}
+
+func afkSet(id int64, a AFK) {
+	afkMu.Lock()
+	afkList[id] = a
+	if a.Username != "" {
+		afkByUsername[a.Username] = id
+	}
+	afkMu.Unlock()
+	afkPersist(id, &a)
+}
+
+func afkGet(id int64) (AFK, bool) {
+	afkMu.RLock()
+	a, ok := afkList[id]
+	afkMu.RUnlock()
+	return a, ok
+}
+
+func afkClear(id int64) (AFK, bool) {
+	afkMu.Lock()
+	a, ok := afkList[id]
+	if ok {
+		delete(afkList, id)
+		if a.Username != "" && afkByUsername[a.Username] == id {
+			delete(afkByUsername, a.Username)
+		}
+	}
+	afkMu.Unlock()
+	if ok {
+		afkPersist(id, nil)
+	}
+	return a, ok
+}
+
+func afkCount() int {
+	afkMu.RLock()
+	defer afkMu.RUnlock()
+	return len(afkList)
+}
+
+func afkDuration(since int64) string {
+	d := time.Since(time.Unix(since, 0))
+	if d < time.Minute {
+		return fmt.Sprintf("%ds", int(d.Seconds()))
+	}
+	days := int(d.Hours()) / 24
+	hours := int(d.Hours()) % 24
+	mins := int(d.Minutes()) % 60
+	switch {
+	case days > 0:
+		return fmt.Sprintf("%dd %dh", days, hours)
+	case hours > 0:
+		return fmt.Sprintf("%dh %dm", hours, mins)
+	default:
+		return fmt.Sprintf("%dm", mins)
+	}
+}
+
+func afkDisplayName(s *tg.UserObj) string {
+	if s == nil {
+		return "User"
+	}
+	name := strings.TrimSpace(strings.TrimSpace(s.FirstName + " " + s.LastName))
+	if name == "" && s.Username != "" {
+		name = s.Username
+	}
+	if name == "" {
+		name = strconv.FormatInt(s.ID, 10)
+	}
+	return name
+}
+
+func mentionUsername(text string, offset, length int32) string {
+	u := utf16.Encode([]rune(text))
+	if offset < 0 || length <= 0 || int(offset+length) > len(u) {
+		return ""
+	}
+	return strings.ToLower(strings.TrimPrefix(string(utf16.Decode(u[offset:offset+length])), "@"))
+}
+
+const (
+	afkPerUserPerMinute = 20
+	afkPerChatPerMinute = 30
+)
+
+func afkRecent(times []time.Time, now time.Time) []time.Time {
+	i := 0
+	for i < len(times) && now.Sub(times[i]) >= time.Minute {
+		i++
+	}
+	return times[i:]
+}
+
+func afkShouldNotify(chatID, senderID int64) bool {
+	afkNotifiedMu.Lock()
+	defer afkNotifiedMu.Unlock()
+	now := time.Now()
+	userKey, chatKey := [2]int64{chatID, senderID}, [2]int64{chatID, 0}
+	users, chats := afkRecent(afkNotified[userKey], now), afkRecent(afkNotified[chatKey], now)
+	if len(users) >= afkPerUserPerMinute || len(chats) >= afkPerChatPerMinute {
+		afkNotified[userKey], afkNotified[chatKey] = users, chats
+		return false
+	}
+	afkNotified[userKey], afkNotified[chatKey] = append(users, now), append(chats, now)
+	if len(afkNotified) > 8192 {
+		for k, v := range afkNotified {
+			if len(afkRecent(v, now)) == 0 {
+				delete(afkNotified, k)
+			}
+		}
+	}
+	return true
+}
+
+func afkNotify(m *tg.NewMessage, afk AFK) {
+	if !afkShouldNotify(m.ChatID(), m.SenderID()) {
+		return
+	}
+	msg := fmt.Sprintf(randomAFKMessages[rand.Intn(len(randomAFKMessages))], html.EscapeString(afk.Name), afkDuration(afk.Time))
+	if afk.Message != "" {
+		msg += "\n<b>Reason:</b> " + html.EscapeString(afk.Message)
+	}
+	if afk.Media != "" {
+		if media, err := tg.ResolveBotFileID(afk.Media); err == nil && media != nil {
+			if IsSticker(media) {
+				TransferReplyMedia(m, media)
+				m.Respond(msg)
+			} else {
+				TransferReplyMedia(m, media, &tg.MediaOptions{Caption: msg})
+			}
+			return
+		}
+	}
+	m.Reply(msg)
+}
+
+func isAFKCommand(text string) bool {
+	fields := strings.Fields(text)
+	if len(fields) == 0 {
+		return false
+	}
+	cmd := strings.ToLower(fields[0])
+	if i := strings.IndexByte(cmd, '@'); i > 0 {
+		cmd = cmd[:i]
+	}
+	return cmd == "/afk" || cmd == "!afk" || cmd == ".afk" || cmd == "brb"
+}
+
 func AFKHandler(m *tg.NewMessage) error {
-	if m.Sender == nil {
+	if m.Sender == nil || m.Message == nil {
 		return nil
 	}
-	text := m.Text()
-	cmd := ""
-	if fields := strings.Fields(text); len(fields) > 0 {
-		cmd = fields[0]
-	}
-	isAfkCmd := cmd == "/afk" || cmd == "!afk" || cmd == ".afk" ||
-		strings.HasPrefix(cmd, "/afk@") || strings.HasPrefix(cmd, "!afk@") || strings.HasPrefix(cmd, ".afk@")
-	if isAfkCmd {
+	afkLoad()
+
+	if isAFKCommand(m.Text()) {
 		media := ""
 		if m.IsReply() {
-			r, err := m.GetReplyMessage()
-			if err == nil {
-				if r.IsMedia() && r.File != nil {
-					media = r.File.FileID
-				}
+			if r, err := m.GetReplyMessage(); err == nil && r != nil && r.IsMedia() && r.File != nil {
+				media = r.File.FileID
 			}
 		}
-		afkMu.Lock()
-		afkList[m.Sender.ID] = AFK{
-			Name:    m.Sender.Username,
-			Message: m.Args(),
-			Media:   media,
-			Time:    time.Now().Unix(),
+		reason := m.Args()
+		if strings.HasPrefix(strings.ToLower(m.Text()), "brb") {
+			reason = strings.TrimSpace(m.Text()[3:])
 		}
-		afkMu.Unlock()
-
-		m.Reply("You are now AFK.")
+		afkSet(m.Sender.ID, AFK{
+			Name:     afkDisplayName(m.Sender),
+			Username: strings.ToLower(m.Sender.Username),
+			Message:  reason,
+			Media:    media,
+			Time:     time.Now().Unix(),
+		})
+		m.Reply(fmt.Sprintf("<b>%s</b> is now AFK.", html.EscapeString(afkDisplayName(m.Sender))))
 		return nil
-	} else {
-		afkMu.RLock()
-		afk, ok := afkList[m.SenderID()]
-		afkMu.RUnlock()
-		if ok {
-			afkMu.Lock()
-			delete(afkList, m.SenderID())
-			afkMu.Unlock()
-			duration := time.Since(time.Unix(afk.Time, 0)).String()
-			m.Reply(fmt.Sprintf("Welcome back <b>%s</b>! You were AFK for %s.", afk.Name, duration))
-		} else {
-			if m.IsReply() {
-				r, err := m.GetReplyMessage()
-				if err == nil {
-					afkMu.RLock()
-					afk, ok := afkList[r.SenderID()]
-					afkMu.RUnlock()
-					if ok {
-						duration := time.Since(time.Unix(afk.Time, 0)).String()
-						msg := randomAFKMessages[rand.Intn(len(randomAFKMessages))]
-						if afk.Media != "" {
-							var msg = fmt.Sprintf(msg, afk.Name, duration)
-							if afk.Message != "" {
-								msg += "\nReason: " + afk.Message
-							}
-							media, _ := tg.ResolveBotFileID(afk.Media)
-							if IsSticker(media) {
-								m.ReplyMedia(media)
-								m.Respond(msg)
-							} else {
-								m.ReplyMedia(media, &tg.MediaOptions{
-									Caption: msg,
-								})
-							}
-						} else {
-							var msg = fmt.Sprintf(msg, afk.Name, duration)
-							if afk.Message != "" {
-								msg += "\nReason: " + afk.Message
-							}
+	}
 
-							m.Reply(msg)
-						}
-					}
-				}
-			} else {
-				if len(m.Message.Entities) > 0 {
-					for _, entity := range m.Message.Entities {
-						switch e := entity.(type) {
-						case *tg.MessageEntityMentionName:
-							afkMu.RLock()
-							afk, ok := afkList[e.UserID]
-							afkMu.RUnlock()
-							if ok {
-								duration := time.Since(time.Unix(afk.Time, 0)).String()
-								msg := randomAFKMessages[rand.Intn(len(randomAFKMessages))]
-								if afk.Media != "" {
-									var msg = fmt.Sprintf(msg, afk.Name, duration)
-									if afk.Message != "" {
-										msg += "\nReason: " + afk.Message
-									}
-									media, _ := tg.ResolveBotFileID(afk.Media)
-									if IsSticker(media) {
-										m.ReplyMedia(media)
-										m.Respond(msg)
-									} else {
-										m.ReplyMedia(media, &tg.MediaOptions{
-											Caption: msg,
-										})
-									}
-								} else {
-									var msg = fmt.Sprintf(msg, afk.Name, duration)
-									if afk.Message != "" {
-										msg += "\nReason: " + afk.Message
-									}
+	if afkCount() == 0 {
+		return nil
+	}
 
-									m.Reply(msg)
-								}
-							}
-						case *tg.MessageEntityMention:
-							offset := e.Offset
-							length := e.Length
+	if afk, ok := afkClear(m.Sender.ID); ok {
+		m.Reply(fmt.Sprintf("Welcome back <b>%s</b>! You were AFK for %s.", html.EscapeString(afk.Name), afkDuration(afk.Time)))
+		return nil
+	}
 
-							username := m.Text()[offset : offset+length]
-							afkMu.RLock()
-							afkSnap := make(map[int64]AFK, len(afkList))
-							for k, v := range afkList {
-								afkSnap[k] = v
-							}
-							afkMu.RUnlock()
-							for _, afk := range afkSnap {
-								if afk.Name == username {
-									duration := time.Since(time.Unix(afk.Time, 0)).String()
-									msg := randomAFKMessages[rand.Intn(len(randomAFKMessages))]
-									if afk.Media != "" {
-										var msg = fmt.Sprintf(msg, afk.Name, trimDecimal(duration))
-										if afk.Message != "" {
-											msg += "\nReason: " + afk.Message
-										}
-										media, _ := tg.ResolveBotFileID(afk.Media)
-										if IsSticker(media) {
-											m.ReplyMedia(media)
-											m.Respond(msg)
-										} else {
-											m.ReplyMedia(media, &tg.MediaOptions{
-												Caption: msg,
-											})
-										}
-									} else {
-										var msg = fmt.Sprintf(msg, afk.Name, trimDecimal(duration))
-										if afk.Message != "" {
-											msg += "\nReason: " + afk.Message
-										}
-
-										m.Reply(msg)
-									}
-								}
-							}
-
-							user, err := m.Client.ResolvePeer(username)
-							if err == nil {
-								peerId := m.Client.GetPeerID(user)
-								afkMu.RLock()
-								afk, ok := afkList[peerId]
-								afkMu.RUnlock()
-								if ok {
-									duration := time.Since(time.Unix(afk.Time, 0)).String()
-									msg := randomAFKMessages[rand.Intn(len(randomAFKMessages))]
-									if afk.Media != "" {
-										var msg = fmt.Sprintf(msg, afk.Name, trimDecimal(duration))
-										if afk.Message != "" {
-											msg += "\nReason: " + afk.Message
-										}
-										media, _ := tg.ResolveBotFileID(afk.Media)
-										if IsSticker(media) {
-											m.ReplyMedia(media)
-											m.Respond(msg)
-										} else {
-											m.ReplyMedia(media, &tg.MediaOptions{
-												Caption: msg,
-											})
-										}
-									} else {
-										var msg = fmt.Sprintf(msg, afk.Name, trimDecimal(duration))
-										if afk.Message != "" {
-											msg += "\nReason: " + afk.Message
-										}
-
-										m.Reply(msg)
-									}
-								}
-							}
-						}
-					}
+	targets := make(map[int64]bool)
+	if m.IsReply() {
+		if r, err := m.GetReplyMessage(); err == nil && r != nil {
+			targets[r.SenderID()] = true
+		}
+	}
+	text := m.Text()
+	for _, entity := range m.Message.Entities {
+		switch e := entity.(type) {
+		case *tg.MessageEntityMentionName:
+			targets[e.UserID] = true
+		case *tg.MessageEntityMention:
+			if name := mentionUsername(text, e.Offset, e.Length); name != "" {
+				afkMu.RLock()
+				id, ok := afkByUsername[name]
+				afkMu.RUnlock()
+				if ok {
+					targets[id] = true
 				}
 			}
 		}
 	}
-
+	for id := range targets {
+		if id == 0 || id == m.Sender.ID {
+			continue
+		}
+		if afk, ok := afkGet(id); ok {
+			afkNotify(m, afk)
+		}
+	}
 	return nil
 }
 
@@ -422,11 +511,7 @@ func SedHandler(m *tg.NewMessage) error {
 		return nil
 	}
 
-	replyID := replyMsg.ID
-	if gp := replyMsg.ReplyToMsgID(); gp != 0 {
-		replyID = gp
-	}
-	m.Client.SendMessage(m.ChatID(), newText, &tg.SendOptions{ReplyID: replyID})
+	m.Respond(newText, &tg.SendOptions{ReplyID: replyMsg.ID})
 	return nil
 }
 
@@ -498,31 +583,93 @@ func lastSeenKey(chatID, userID int64) []byte {
 	return []byte(fmt.Sprintf("%d:%d", chatID, userID))
 }
 
-func saveLastSeen(entry *lastSeenEntry) error {
+var (
+	lastSeenMu      sync.Mutex
+	lastSeenDirty   = make(map[string]*lastSeenEntry)
+	lastSeenLatest  = make(map[int64]*lastSeenEntry)
+	lastSeenFlusher sync.Once
+)
+
+const lastSeenFlushInterval = 20 * time.Second
+
+func lastSeenFlushLoop() {
+	t := time.NewTicker(lastSeenFlushInterval)
+	defer t.Stop()
+	for range t.C {
+		flushLastSeen()
+	}
+}
+
+func FlushLastSeen() { flushLastSeen() }
+
+func flushLastSeen() {
+	lastSeenMu.Lock()
+	if len(lastSeenDirty) == 0 {
+		lastSeenMu.Unlock()
+		return
+	}
+	batch := lastSeenDirty
+	lastSeenDirty = make(map[string]*lastSeenEntry, len(batch))
+	lastSeenMu.Unlock()
+
 	database, err := db.GetDB()
 	if err != nil || database == nil {
-		return fmt.Errorf("db error")
+		return
 	}
-	return database.Update(func(tx *bbolt.Tx) error {
+	err = database.Update(func(tx *mongostore.Tx) error {
 		b, err := tx.CreateBucketIfNotExists([]byte(lastSeenBucket))
 		if err != nil {
 			return err
 		}
-		data, err := json.Marshal(entry)
-		if err != nil {
-			return err
+		for key, entry := range batch {
+			data, err := json.Marshal(entry)
+			if err != nil {
+				continue
+			}
+			if err := b.Put([]byte(key), data); err != nil {
+				return err
+			}
 		}
-		return b.Put(lastSeenKey(entry.ChatID, entry.UserID), data)
+		return nil
 	})
+	if err != nil {
+		lastSeenMu.Lock()
+		for k, v := range batch {
+			if _, newer := lastSeenDirty[k]; !newer {
+				lastSeenDirty[k] = v
+			}
+		}
+		lastSeenMu.Unlock()
+	}
+}
+
+func saveLastSeen(entry *lastSeenEntry) error {
+	lastSeenFlusher.Do(func() { go lastSeenFlushLoop() })
+	lastSeenMu.Lock()
+	lastSeenDirty[string(lastSeenKey(entry.ChatID, entry.UserID))] = entry
+	if cur := lastSeenLatest[entry.UserID]; cur == nil || entry.Time >= cur.Time {
+		lastSeenLatest[entry.UserID] = entry
+	}
+	if len(lastSeenLatest) > 200000 {
+		lastSeenLatest = make(map[int64]*lastSeenEntry)
+	}
+	lastSeenMu.Unlock()
+	return nil
 }
 
 func loadLastSeen(chatID, userID int64) (*lastSeenEntry, error) {
+	lastSeenMu.Lock()
+	if e, ok := lastSeenDirty[string(lastSeenKey(chatID, userID))]; ok {
+		lastSeenMu.Unlock()
+		return e, nil
+	}
+	lastSeenMu.Unlock()
 	database, err := db.GetDB()
 	if err != nil || database == nil {
 		return nil, fmt.Errorf("db error")
 	}
 	var entry *lastSeenEntry
-	err = database.View(func(tx *bbolt.Tx) error {
+	err = database.View(func(tx *mongostore.Tx) error {
 		b := tx.Bucket([]byte(lastSeenBucket))
 		if b == nil {
 			return nil
@@ -542,13 +689,19 @@ func loadLastSeen(chatID, userID int64) (*lastSeenEntry, error) {
 }
 
 func loadAnyLastSeen(userID int64) (*lastSeenEntry, error) {
+	lastSeenMu.Lock()
+	recent := lastSeenLatest[userID]
+	lastSeenMu.Unlock()
+	if recent != nil {
+		return recent, nil
+	}
 	database, err := db.GetDB()
 	if err != nil || database == nil {
 		return nil, fmt.Errorf("db error")
 	}
 	var best *lastSeenEntry
 	suffix := ":" + strconv.FormatInt(userID, 10)
-	err = database.View(func(tx *bbolt.Tx) error {
+	err = database.View(func(tx *mongostore.Tx) error {
 		b := tx.Bucket([]byte(lastSeenBucket))
 		if b == nil {
 			return nil
@@ -572,10 +725,7 @@ func loadAnyLastSeen(userID int64) (*lastSeenEntry, error) {
 }
 
 func LastSeenTracker(m *tg.NewMessage) error {
-	if m.SenderID() == 0 {
-		return nil
-	}
-	if m.ChatID() == 0 {
+	if m.SenderID() == 0 || m.ChatID() == 0 {
 		return nil
 	}
 	entry := &lastSeenEntry{
@@ -587,8 +737,7 @@ func LastSeenTracker(m *tg.NewMessage) error {
 		entry.Name = m.Sender.FirstName
 		entry.Username = m.Sender.Username
 	}
-	_ = saveLastSeen(entry)
-	return nil
+	return saveLastSeen(entry)
 }
 
 func AfkUsersHandler(m *tg.NewMessage) error {
@@ -597,45 +746,38 @@ func AfkUsersHandler(m *tg.NewMessage) error {
 		m.Reply("<b>This command works in chats only.</b>")
 		return nil
 	}
-	if len(afkList) == 0 {
-		m.Reply("<b>No one is AFK right now.</b>")
-		return nil
+	afkLoad()
+	afkMu.RLock()
+	snapshot := make(map[int64]AFK, len(afkList))
+	for k, v := range afkList {
+		snapshot[k] = v
 	}
+	afkMu.RUnlock()
 
 	type row struct {
-		id       int64
-		name     string
-		username string
-		since    time.Time
-		reason   string
+		id     int64
+		name   string
+		since  time.Time
+		reason string
 	}
 	var rows []row
-	for uid, a := range afkList {
-		name := a.Name
-		username := a.Name
+	for uid, a := range snapshot {
 		entry, _ := loadLastSeen(chatID, uid)
-		if entry != nil {
-			if entry.Name != "" {
-				name = entry.Name
-			}
-			if entry.Username != "" {
-				username = entry.Username
-			}
+		if entry == nil {
+			continue
+		}
+		name := a.Name
+		if name == "" {
+			name = entry.Name
 		}
 		if name == "" {
 			name = strconv.FormatInt(uid, 10)
 		}
-		rows = append(rows, row{
-			id:       uid,
-			name:     name,
-			username: username,
-			since:    time.Unix(a.Time, 0),
-			reason:   a.Message,
-		})
+		rows = append(rows, row{id: uid, name: name, since: time.Unix(a.Time, 0), reason: a.Message})
 	}
 
 	if len(rows) == 0 {
-		m.Reply("<b>No one is AFK right now.</b>")
+		m.Reply("<b>No one in this chat is AFK right now.</b>")
 		return nil
 	}
 
@@ -648,7 +790,7 @@ func AfkUsersHandler(m *tg.NewMessage) error {
 	sb.WriteString("━━━━━━━━━━━━━━━━\n")
 	for _, r := range rows {
 		mention := fmt.Sprintf("<a href='tg://user?id=%d'>%s</a>", r.id, html.EscapeString(r.name))
-		sb.WriteString(fmt.Sprintf(" • %s — last seen %s", mention, humanRelative(r.since)))
+		sb.WriteString(fmt.Sprintf(" • %s — AFK for %s", mention, afkDuration(r.since.Unix())))
 		if strings.TrimSpace(r.reason) != "" {
 			sb.WriteString(fmt.Sprintf(" (<i>%s</i>)", html.EscapeString(r.reason)))
 		}
@@ -741,7 +883,8 @@ func LastSeenHandler(m *tg.NewMessage) error {
 	mention := fmt.Sprintf("<a href='tg://user?id=%d'>%s</a>", targetID, html.EscapeString(name))
 
 	extra := ""
-	if afk, ok := afkList[targetID]; ok {
+	afkLoad()
+	if afk, ok := afkGet(targetID); ok {
 		extra = fmt.Sprintf("\n<b>Currently AFK</b> since %s.", humanRelative(time.Unix(afk.Time, 0)))
 		if strings.TrimSpace(afk.Message) != "" {
 			extra += fmt.Sprintf("\n<b>Reason:</b> %s", html.EscapeString(afk.Message))
@@ -757,9 +900,9 @@ func registerAFKHandlers() {
 	c.On(tg.OnNewMessage, AFKHandler)
 	c.On(tg.OnNewMessage, SedHandler)
 	c.On(tg.OnNewMessage, LastSeenTracker)
-	c.On("cmd:afkusers", AfkUsersHandler)
-	c.On("cmd:lastseen", LastSeenHandler)
-	c.On("cmd:seen", LastSeenHandler)
+	OnCommand(c, "cmd:afkusers", AfkUsersHandler)
+	OnCommand(c, "cmd:lastseen", LastSeenHandler)
+	OnCommand(c, "cmd:seen", LastSeenHandler)
 	Mods.AddModule("AFKStatus", `<b>AFK Status Module</b>
 <b>Commands:</b>
  • /afkusers - List AFK users in this chat with last-seen times

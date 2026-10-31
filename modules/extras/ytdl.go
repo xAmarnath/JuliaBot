@@ -16,7 +16,7 @@ import (
 	"sync"
 	"time"
 
-	tg "github.com/amarnathcjd/gogram/telegram"
+	tg "github.com/xAmarnath/gogram/telegram"
 	modules "main/modules"
 )
 
@@ -529,7 +529,7 @@ func runYTDLDownload(c *tg.CallbackQuery, sess *ytdlSession, f ytdlFormat) {
 	}
 
 	client := modules.Client
-	if _, err := client.SendMedia(c.ChatID, localPath, mediaOpts); err != nil {
+	if _, err := modules.TransferSendMedia(client, c.ChatID, localPath, mediaOpts); err != nil {
 		c.Edit("Upload failed: " + html.EscapeString(err.Error()))
 		log.Printf("[ytdl] upload failed: %v", err)
 		return
@@ -743,8 +743,8 @@ func sanitizeFileName(name string) string {
 
 func registerYTDLHandlers() {
 	c := modules.Client
-	c.On("cmd:yt", YTDLHandler)
-	c.On("cmd:youtube", YTDLHandler)
+	modules.OnCommand(c, "cmd:yt", YTDLHandler)
+	modules.OnCommand(c, "cmd:youtube", YTDLHandler)
 	c.On("callback:yt:", YTDLCallback)
 }
 

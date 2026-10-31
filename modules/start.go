@@ -1,28 +1,27 @@
 package modules
 
 import (
-	"encoding/json"
 	"fmt"
-	"net/http"
-	"net/url"
+	"html"
+	"os"
 	"runtime"
 	"strconv"
 	"strings"
 	"time"
 
-	tg "github.com/amarnathcjd/gogram/telegram"
+	tg "github.com/xAmarnath/gogram/telegram"
 	"github.com/shirou/gopsutil/host"
 	"github.com/shirou/gopsutil/load"
 )
 
 var startTime = time.Now()
 
-// DEAD: empty stub, never registered, never called
-func SnapSaveHandler(m *tg.NewMessage) error {
-	return nil
-}
+var StartPayloads = map[string]func(*tg.NewMessage) error{}
 
 func StartHandle(m *tg.NewMessage) error {
+	if fn, ok := StartPayloads[strings.TrimSpace(m.Args())]; ok {
+		return fn(m)
+	}
 	greeting := "✨ <b>Hello there!</b> ✨\n\n"
 	greeting += "I'm <b>Julia</b>, your friendly bot companion! 🤖💙\n\n"
 
@@ -32,13 +31,15 @@ func StartHandle(m *tg.NewMessage) error {
 }
 
 func GatherSystemInfo(m *tg.NewMessage) error {
-	m.ChatType()
-
-	msg, _ := m.Reply("<code>...System Information...</code>")
+	msg, err := m.Reply("<code>...System Information...</code>")
+	if err != nil || msg == nil {
+		return err
+	}
 
 	system, err := gatherSystemInfo()
 	if err != nil {
-		return err
+		msg.Edit("Failed to gather system info: <code>" + html.EscapeString(err.Error()) + "</code>")
+		return nil
 	}
 
 	var memStats runtime.MemStats
@@ -77,7 +78,7 @@ func GatherSystemInfo(m *tg.NewMessage) error {
 	info += fmt.Sprintf("   └ <b>PID:</b> <code>%d</code>\n\n", system.ProcessID)
 	info += "<i>Have a great day! 🌟</i>"
 	msg.Edit(info)
-	return err
+	return nil
 }
 
 var dcLocationMap = map[int]string{
@@ -114,7 +115,7 @@ func formatDCInfo(dcId int) string {
 
 func replyChannelInfo(m *tg.NewMessage, title string, channelPeerID string, username string, photo tg.ChatPhoto) {
 	msg := "<b>Channel Info</b>\n\n"
-	msg += fmt.Sprintf("<b>Title:</b> %s\n", title)
+	msg += fmt.Sprintf("<b>Title:</b> %s\n", html.EscapeString(title))
 	if username != "" {
 		msg += fmt.Sprintf("<b>Username:</b> @%s\n", strings.TrimPrefix(username, "@"))
 	}
@@ -126,7 +127,7 @@ func replyChannelInfo(m *tg.NewMessage, title string, channelPeerID string, user
 
 func replyGroupInfo(m *tg.NewMessage, title string, chatID int64, photo tg.ChatPhoto) {
 	msg := "<b>Group Info</b>\n\n"
-	msg += fmt.Sprintf("<b>Title:</b> %s\n", title)
+	msg += fmt.Sprintf("<b>Title:</b> %s\n", html.EscapeString(title))
 	msg += fmt.Sprintf("<b>ID:</b> <code>-%d</code>\n", chatID)
 	msg += "<b>DC:</b> {{dcInfo}}\n"
 	msg = strings.ReplaceAll(msg, "{{dcInfo}}", formatDCInfo(chatPhotoDcID(photo)))
@@ -137,7 +138,11 @@ func UserHandle(m *tg.NewMessage) error {
 	var userID int64 = 0
 	var userHash int64 = 0
 	if m.IsReply() {
-		r, _ := m.GetReplyMessage()
+		r, err := m.GetReplyMessage()
+		if err != nil || r == nil {
+			m.Reply("Error: couldn't fetch the replied message")
+			return nil
+		}
 		if r.SenderChat != nil && r.SenderChat.ID != 0 {
 			replyChannelInfo(m, r.SenderChat.Title, fmt.Sprintf("-100%d", r.SenderChat.ID), "", r.SenderChat.Photo)
 			return nil
@@ -205,18 +210,27 @@ func UserHandle(m *tg.NewMessage) error {
 		}
 		userHash = m.Sender.AccessHash
 	}
+	status := NewStatus(m, "Fetching user info…")
 	user, err := m.Client.UsersGetFullUser(&tg.InputUserObj{
 		UserID:     userID,
 		AccessHash: userHash,
 	})
 
 	if err != nil {
-		m.Reply("Error: " + err.Error())
+		status.Edit("Error: " + err.Error())
 		return nil
 	}
 
+	if user == nil || user.FullUser == nil || len(user.Users) == 0 {
+		status.Edit("Error: user not found")
+		return nil
+	}
 	uf := user.FullUser
-	un := user.Users[0].(*tg.UserObj)
+	un, ok := user.Users[0].(*tg.UserObj)
+	if !ok {
+		status.Edit("Error: user not found")
+		return nil
+	}
 
 	name := strings.TrimSpace(strings.TrimSpace(un.FirstName + " " + un.LastName))
 	if name == "" {
@@ -224,7 +238,7 @@ func UserHandle(m *tg.NewMessage) error {
 	}
 
 	userString := "<b>User Info</b>\n\n"
-	userString += fmt.Sprintf("<b>Name:</b> %s\n", name)
+	userString += fmt.Sprintf("<b>Name:</b> %s\n", html.EscapeString(name))
 	if un.Username != "" {
 		userString += fmt.Sprintf("<b>Username:</b> @%s\n", un.Username)
 	}
@@ -272,7 +286,7 @@ func UserHandle(m *tg.NewMessage) error {
 			botCaps = append(botCaps, "attach menu")
 		}
 		if un.BotInlinePlaceholder != "" {
-			botCaps = append(botCaps, "inline placeholder: "+un.BotInlinePlaceholder)
+			botCaps = append(botCaps, "inline placeholder: "+html.EscapeString(un.BotInlinePlaceholder))
 		}
 		if len(botCaps) > 0 {
 			userString += fmt.Sprintf("<b>Bot:</b> %s\n", strings.Join(botCaps, "; "))
@@ -303,7 +317,7 @@ func UserHandle(m *tg.NewMessage) error {
 	userString += "<b>Created:</b> <code>" + formattedDate + "</code>\n"
 
 	if uf.About != "" {
-		userString += "\n<b>Bio:</b>\n<i>" + uf.About + "</i>\n"
+		userString += "\n<b>Bio:</b>\n<i>" + html.EscapeString(uf.About) + "</i>\n"
 	}
 
 	userString += "\n<a href=\"tg://user?id=" + strconv.FormatInt(un.ID, 10) + "\">View full profile</a>"
@@ -329,8 +343,7 @@ func UserHandle(m *tg.NewMessage) error {
 
 	var buisnessSent bool = false
 
-	if uf.BusinessIntro != nil && uf.BusinessIntro.Sticker != nil {
-		stick := uf.BusinessIntro.Sticker.(*tg.DocumentObj)
+	if stick, ok := businessSticker(uf); ok {
 		dcId = int(stick.DcID)
 		sty := &tg.InputMediaDocument{
 			ID: &tg.InputDocumentObj{
@@ -339,7 +352,8 @@ func UserHandle(m *tg.NewMessage) error {
 				FileReference: stick.FileReference,
 			},
 		}
-		if _, err := m.ReplyMedia(sty, &tg.MediaOptions{
+		status.Done()
+		if _, err := TransferReplyMedia(m, sty, &tg.MediaOptions{
 			ReplyMarkup: keyb.Build(),
 		}); err == nil {
 			buisnessSent = true
@@ -357,11 +371,11 @@ func UserHandle(m *tg.NewMessage) error {
 		sendOpt.ReplyMarkup = keyb.Build()
 	}
 
-	if uf.ProfilePhoto != nil {
-		p := uf.ProfilePhoto.(*tg.PhotoObj)
-		if uf.PersonalPhoto != nil {
-			p = uf.PersonalPhoto.(*tg.PhotoObj)
-		}
+	p, _ := uf.ProfilePhoto.(*tg.PhotoObj)
+	if pp, ok := uf.PersonalPhoto.(*tg.PhotoObj); ok {
+		p = pp
+	}
+	if p != nil {
 		dcId = int(p.DcID)
 		var inp tg.InputMedia
 		inp = &tg.InputMediaPhoto{
@@ -373,32 +387,37 @@ func UserHandle(m *tg.NewMessage) error {
 			Spoiler: true,
 		}
 		if len(p.VideoSizes) > 0 {
-			dled, err := m.Client.DownloadMedia(p, &tg.DownloadOptions{
+			dled, err := TransferDownloadMedia(m.Client, p, &tg.DownloadOptions{
 				IsVideo: true,
 			})
 			if err == nil {
-				ul, err := m.Client.UploadFile(dled)
+				defer os.Remove(dled)
+				ul, err := TransferSendableMedia(m.Client, dled, &tg.MediaMetadata{NoSoundVideo: true, Spoiler: true, MimeType: "video/mp4"})
 				if err == nil {
-					inp = &tg.InputMediaUploadedDocument{
-						File:         ul,
-						NosoundVideo: true,
-						Spoiler:      true,
-						MimeType:     "video/mp4",
-					}
+					inp = ul
 				}
 			}
 		}
 
-		mediaOpt.Caption = strings.ReplaceAll(userString, "{{dcInfo}}", formatDCInfo(dcId))
-		_, err := m.ReplyMedia(inp, mediaOpt)
-		if err != nil {
-			m.Reply(userString, sendOpt)
+		userString = strings.ReplaceAll(userString, "{{dcInfo}}", formatDCInfo(dcId))
+		mediaOpt.Caption = userString
+		status.Done()
+		if _, err := TransferReplyMedia(m, inp, mediaOpt); err != nil {
+			status.Edit(userString, sendOpt)
 		}
 	} else {
 		userString = strings.ReplaceAll(userString, "{{dcInfo}}", formatDCInfo(dcId))
-		m.Reply(userString, sendOpt)
+		status.Edit(userString, sendOpt)
 	}
 	return nil
+}
+
+func businessSticker(uf *tg.UserFull) (*tg.DocumentObj, bool) {
+	if uf.BusinessIntro == nil {
+		return nil, false
+	}
+	d, ok := uf.BusinessIntro.Sticker.(*tg.DocumentObj)
+	return d, ok
 }
 
 func getCountryFlag(dcId int) string {
@@ -419,18 +438,20 @@ var st = time.Now()
 
 func PingHandle(m *tg.NewMessage) error {
 	startTime := time.Now()
-	sentMessage, _ := m.Reply("Pinging...")
-	_, err := sentMessage.Edit(fmt.Sprintf("<code>Pong!</code> <code>%s</code>\n<code>Uptime ⚡ </code><b>%s</b>", time.Since(startTime).String(), time.Since(st).String()))
+	sentMessage, err := m.Reply("Pinging...")
+	if err != nil || sentMessage == nil {
+		return err
+	}
+	_, err = sentMessage.Edit(fmt.Sprintf("<code>Pong!</code> <code>%s</code>\n<code>Uptime ⚡ </code><b>%s</b>", time.Since(startTime).String(), time.Since(st).String()))
 	return err
 }
 
+var istZone = time.FixedZone("IST", 5*3600+1800)
+
 func NewYearHandle(m *tg.NewMessage) error {
-	ist, _ := time.LoadLocation("Asia/Kolkata")
-
-	newYear := time.Date(2027, time.January, 1, 0, 0, 0, 0, ist)
-	now := time.Now().In(ist)
-
-	remaining := newYear.Sub(now)
+	now := time.Now().In(istZone)
+	target := now.Year() + 1
+	remaining := time.Date(target, time.January, 1, 0, 0, 0, 0, istZone).Sub(now)
 
 	days := int(remaining.Hours()) / 24
 	hours := int(remaining.Hours()) % 24
@@ -438,107 +459,28 @@ func NewYearHandle(m *tg.NewMessage) error {
 	seconds := int(remaining.Seconds()) % 60
 	milliseconds := remaining.Milliseconds() % 1000
 
-	timeStr := fmt.Sprintf("%02d:%02d:%02d.%03d", hours, minutes, seconds, milliseconds)
-	msg := fmt.Sprintf("<b>New Year 2026 Countdown</b>\n<code>%d days, %s</code>", days, timeStr)
-
-	// gifPath, err := generateCountdownGifFFmpeg(days, hours, minutes, seconds)
-	// if err == nil {
-	// 	defer os.Remove(gifPath)
-	// 	fi, err := m.Client.UploadFile(gifPath)
-	// 	if err != nil {
-	// 		fmt.Printf("Error uploading GIF: %v\n", err)
-	// 		m.Reply(msg)
-	// 		return nil
-	// 	}
-
-	// 	gifMedia := &tg.InputMediaUploadedDocument{
-	// 		File:         fi,
-	// 		Spoiler:      true,
-	// 		NosoundVideo: true,
-	// 		Attributes: []tg.DocumentAttribute{
-	// 			&tg.DocumentAttributeAnimated{},
-	// 		},
-	// 		MimeType: "image/gif",
-	// 	}
-	// 	_, err = m.ReplyMedia(gifMedia, &tg.MediaOptions{
-	// 		Caption: msg,
-	// 	})
-	// } else {
-	// 	fmt.Printf("Error generating GIF: %v\n", err)
-	m.Reply(msg)
-	// }
-	return nil
-}
-
-type UDResponse struct {
-	List []struct {
-		Definition string `json:"definition"`
-		Example    string `json:"example"`
-		Word       string `json:"word"`
-		Author     string `json:"author"`
-	} `json:"list"`
-}
-
-func UDHandler(m *tg.NewMessage) error {
-	term := m.Args()
-	if term == "" {
-		m.Reply("Usage: /ud <term>")
-		return nil
-	}
-
-	resp, err := http.Get("http://api.urbandictionary.com/v0/define?term=" + url.QueryEscape(term))
-	if err != nil {
-		m.Reply("Failed to fetch Urban Dictionary")
-		return nil
-	}
-	defer resp.Body.Close()
-
-	var res UDResponse
-	if err := json.NewDecoder(resp.Body).Decode(&res); err != nil {
-		return nil
-	}
-
-	if len(res.List) == 0 {
-		m.Reply("No definition found")
-		return nil
-	}
-
-	def := res.List[0]
-	definition := strings.ReplaceAll(def.Definition, "[", "")
-	definition = strings.ReplaceAll(definition, "]", "")
-	example := strings.ReplaceAll(def.Example, "[", "")
-	example = strings.ReplaceAll(example, "]", "")
-
-	if len(definition) > 1000 {
-		definition = definition[:1000] + "..."
-	}
-
-	msg := fmt.Sprintf("<b>%s</b>\n\n%s\n\n<i>%s</i>", def.Word, definition, example)
-	m.Reply(msg)
+	m.Reply(fmt.Sprintf("<b>New Year %d Countdown</b> <i>(IST)</i>\n<code>%d days, %02d:%02d:%02d.%03d</code>", target, days, hours, minutes, seconds, milliseconds))
 	return nil
 }
 
 func init() {
-	Mods.AddModule("Start", `<b>Here are the commands available in Start module:</b>
+	Mods.AddModule("Start", `<b>Start</b>
 
-<code>/start</code> - check if the bot is alive
-<code>/ping</code> - check the bot's response time
-<code>/new</code> - time left until New Year's Eve 2026
-<code>/systeminfo</code> - get system information
-<code>/info [user_id]</code> - get user information
-<code>/ud [term]</code> - Urban Dictionary lookup
-<code>/translate [lang] [-r]: Translate reply. -r replaces original.</code>
-<code>/new: count down to Next New Years.`)
+ - <code>/start</code> - check if the bot is alive
+ - <code>/ping</code> - response time and uptime
+ - <code>/sys</code> (alias <code>/systeminfo</code>) - host, memory, CPU and runtime stats
+ - <code>/info [user | @username | ID | -100channelID]</code> - user, group or channel info; reply to a message to inspect its sender. Ex: <code>/info @durov</code>
+ - <code>/new</code> - countdown to the next New Year (IST)`)
 }
 
 func registerStartHandlers() {
 	c := Client
-	c.On("cmd:start", StartHandle)
-	c.On("cmd:ping", PingHandle)
-	c.On("cmd:new", NewYearHandle)
-	c.On("cmd:sys", GatherSystemInfo)
-	c.On("cmd:info", UserHandle)
-	c.On("cmd:ud", UDHandler)
+	OnCommand(c, "cmd:start", StartHandle)
+	OnCommand(c, "cmd:ping", PingHandle)
+	OnCommand(c, "cmd:new", NewYearHandle)
+	OnCommand(c, "cmd:sys", GatherSystemInfo)
+	OnCommand(c, "cmd:systeminfo", GatherSystemInfo)
+	OnCommand(c, "cmd:info", UserHandle)
 }
 
 func init() {

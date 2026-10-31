@@ -1,35 +1,39 @@
 package db
 
 import (
-	"fmt"
+	"main/internal/mongostore"
+	"os"
+	"strings"
 	"sync"
-
-	bolt "go.etcd.io/bbolt"
 )
 
-var (
-	sharedDB     *bolt.DB
-	sharedDBOnce sync.Once
-	sharedDBPath = "database.db"
-)
+var sharedDB *mongostore.DB
+var sharedDBMu sync.Mutex
 
-func GetDB() (*bolt.DB, error) {
-	var err error
-	sharedDBOnce.Do(func() {
-		sharedDB, err = bolt.Open(sharedDBPath, 0600, nil)
-	})
+func GetDB() (*mongostore.DB, error) {
+	sharedDBMu.Lock()
+	defer sharedDBMu.Unlock()
+	if sharedDB != nil {
+		return sharedDB, nil
+	}
+	name := strings.TrimSpace(os.Getenv("MONGODB_DATABASE"))
+	if name == "" {
+		name = "Main_Database"
+	}
+	d, err := mongostore.Open(os.Getenv("MONGODB_URI"), name, "records")
 	if err != nil {
 		return nil, err
 	}
-	if sharedDB == nil {
-		return nil, fmt.Errorf("database not initialized")
-	}
-	return sharedDB, nil
+	sharedDB = d
+	return d, nil
 }
-
 func CloseDB() error {
-	if sharedDB != nil {
-		return sharedDB.Close()
+	sharedDBMu.Lock()
+	defer sharedDBMu.Unlock()
+	if sharedDB == nil {
+		return nil
 	}
-	return nil
+	err := sharedDB.Close()
+	sharedDB = nil
+	return err
 }

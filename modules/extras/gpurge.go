@@ -6,267 +6,285 @@ import (
 	"strings"
 	"time"
 
-	tg "github.com/amarnathcjd/gogram/telegram"
+	tg "github.com/xAmarnath/gogram/telegram"
 	modules "main/modules"
 )
 
-const gpurgeMaxN = 200
+const (
+	gpurgeMaxN       = 200
+	gpurgeMaxScan    = 1000
+	gpurgeMaxRange   = 3000
+	gpurgeBatch      = 100
+	gpurgeBatchPause = 400 * time.Millisecond
+)
 
-func gpurgeChunkedDelete(client *tg.Client, chatID int64, ids []int32) (int, error) {
-	if len(ids) == 0 {
-		return 0, nil
-	}
+func isSupergroupID(chat int64) bool { return chat < -1000000000000 }
+
+func gpurgeChunkedDelete(client *tg.Client, chat int64, ids []int32) (int, error) {
 	deleted := 0
-	for i := 0; i < len(ids); i += 100 {
-		end := i + 100
-		if end > len(ids) {
-			end = len(ids)
-		}
-		if _, err := client.DeleteMessages(chatID, ids[i:end]); err != nil {
+	for i := 0; i < len(ids); i += gpurgeBatch {
+		end := min(i+gpurgeBatch, len(ids))
+		if _, err := client.DeleteMessages(chat, ids[i:end]); err != nil {
 			return deleted, err
 		}
 		deleted += end - i
 		if end < len(ids) {
-			time.Sleep(400 * time.Millisecond)
+			time.Sleep(gpurgeBatchPause)
 		}
 	}
 	return deleted, nil
 }
 
+// gpurgeIDRanges splits the IDs below fromID (newest first) into batches, scanning at most depth IDs.
+func gpurgeIDRanges(fromID int32, depth int) [][]int32 {
+	var out [][]int32
+	var cur []int32
+	for id := fromID - 1; id > 0 && int(fromID-id) <= depth; id-- {
+		cur = append(cur, id)
+		if len(cur) == gpurgeBatch {
+			out = append(out, cur)
+			cur = nil
+		}
+	}
+	if len(cur) > 0 {
+		out = append(out, cur)
+	}
+	return out
+}
+
+// gpurgeScan collects up to limit message IDs below fromID in chat whose sender is senderID.
+// Bots can't read history, so messages are fetched by ID.
+func gpurgeScan(c *tg.Client, chat int64, fromID int32, depth int, senderID int64, limit int) ([]int32, error) {
+	var ids []int32
+	for _, batch := range gpurgeIDRanges(fromID, depth) {
+		msgs, err := c.GetMessages(chat, &tg.SearchOption{IDs: batch})
+		if err != nil {
+			return ids, err
+		}
+		for i := range msgs {
+			msg := &msgs[i]
+			if msg.Message == nil || msg.IsEmpty() || msg.ChannelID() != chat || msg.SenderID() != senderID {
+				continue
+			}
+			ids = append(ids, msg.ID)
+			if len(ids) >= limit {
+				return ids, nil
+			}
+		}
+	}
+	return ids, nil
+}
+
+// gpurgeFilterChat keeps only IDs that belong to chat. In basic groups message IDs are shared across
+// all of the bot's chats, so a raw range would hit other chats.
+func gpurgeFilterChat(c *tg.Client, chat int64, ids []int32) ([]int32, error) {
+	if isSupergroupID(chat) {
+		return ids, nil
+	}
+	var out []int32
+	for i := 0; i < len(ids); i += gpurgeBatch {
+		end := min(i+gpurgeBatch, len(ids))
+		msgs, err := c.GetMessages(chat, &tg.SearchOption{IDs: ids[i:end]})
+		if err != nil {
+			return out, err
+		}
+		for j := range msgs {
+			if msgs[j].Message != nil && !msgs[j].IsEmpty() && msgs[j].ChannelID() == chat {
+				out = append(out, msgs[j].ID)
+			}
+		}
+	}
+	return out, nil
+}
+
+func parsePurgeCount(m *tg.NewMessage, usage string) (int, bool) {
+	first, _ := modules.SplitFirstArg(modules.CommandArgs(m.Text()))
+	if first == "" {
+		m.Reply("<b>Usage:</b> " + usage)
+		return 0, false
+	}
+	n, err := strconv.Atoi(first)
+	if err != nil || n <= 0 {
+		m.Reply("<b>Invalid count.</b> Give a positive whole number, e.g. " + usage)
+		return 0, false
+	}
+	if n > gpurgeMaxN {
+		m.Reply(fmt.Sprintf("<b>Count too high.</b> The maximum is %d.", gpurgeMaxN))
+		return 0, false
+	}
+	return n, true
+}
+
+func gpurgeScanDepth(n int) int {
+	return min(max(n*5, 100), gpurgeMaxScan)
+}
+
 func SilentPurgeHandle(m *tg.NewMessage) error {
-	if m.IsPrivate() {
+	if !modules.IsGroupChat(m) {
 		return nil
 	}
-	if !modules.IsUserAdmin(m.Client, m.SenderID(), m.ChatID(), "delete") {
-		modules.ReplyTemp(m, "<b>Permission denied.</b> You need Delete Messages permission.", 5)
+	chat := m.ChannelID()
+	if !modules.SenderHasRight(m, "delete") {
+		modules.ReplyTemp(m, "You need the <b>Delete Messages</b> admin right.", 5)
 		m.Delete()
 		return nil
 	}
-	if !modules.CanBot(m.Client, m.Channel, "delete") {
-		modules.ReplyTemp(m, "<b>I need Delete Messages permission.</b>", 5)
-		m.Delete()
+	if !modules.BotHasRight(m.Client, chat, "delete") {
+		modules.ReplyTemp(m, "I need the <b>Delete Messages</b> admin right.", 5)
 		return nil
 	}
 	if !m.IsReply() {
-		modules.ReplyTemp(m, "<b>Reply to a message to silently purge from.</b>", 5)
-		m.Delete()
-		return nil
-	}
-	reply, err := m.GetReplyMessage()
-	if err != nil {
+		modules.ReplyTemp(m, "Reply to the first message you want gone, then send <code>/spurge</code>.", 5)
 		m.Delete()
 		return nil
 	}
 
-	startID := int32(reply.ID)
-	endID := int32(m.ID)
-	if startID > endID {
+	startID := m.ReplyToMsgID()
+	endID := m.ID
+	if startID <= 0 || startID > endID {
 		m.Delete()
 		return nil
 	}
+	if int(endID-startID) >= gpurgeMaxRange {
+		startID = endID - gpurgeMaxRange + 1
+	}
 
-	total := int(endID - startID + 1)
-	ids := make([]int32, 0, total)
+	ids := make([]int32, 0, endID-startID+1)
 	for i := startID; i <= endID; i++ {
 		ids = append(ids, i)
 	}
-
-	_, _ = gpurgeChunkedDelete(m.Client, m.ChatID(), ids)
+	ids, err := gpurgeFilterChat(m.Client, chat, ids)
+	if err != nil {
+		modules.ReplyTemp(m, modules.AdminFriendlyError(err, "purge"), 5)
+		return nil
+	}
+	if _, err := gpurgeChunkedDelete(m.Client, chat, ids); err != nil {
+		modules.ReplyTemp(m, modules.AdminFriendlyError(err, "purge"), 5)
+	}
 	return nil
 }
 
 func UserPurgeHandle(m *tg.NewMessage) error {
-	if m.IsPrivate() {
-		m.Reply("<b>This command only works in groups.</b>")
+	if !modules.RequireGroup(m) {
 		return nil
 	}
-	if !modules.IsUserAdmin(m.Client, m.SenderID(), m.ChatID(), "delete") {
-		m.Reply("<b>Permission denied.</b> You need Delete Messages permission.")
+	chat := m.ChannelID()
+	if !modules.SenderHasRight(m, "delete") {
+		m.Reply("You need the <b>Delete Messages</b> admin right.")
 		return nil
 	}
-	if !modules.CanBot(m.Client, m.Channel, "delete") {
-		m.Reply("<b>I need Delete Messages permission.</b>")
+	if !modules.BotHasRight(m.Client, chat, "delete") {
+		m.Reply("I need the <b>Delete Messages</b> admin right.")
 		return nil
 	}
 	if !m.IsReply() {
-		m.Reply("<b>Reply to the user's message and pass N.</b>\n<code>/upurge &lt;N&gt;</code>")
+		m.Reply("Reply to one of the user's messages: <code>/upurge &lt;N&gt;</code>")
 		return nil
 	}
-
-	args := m.ArgsList()
-	if len(args) < 1 {
-		m.Reply("<b>Usage:</b> <code>/upurge &lt;N&gt;</code>")
-		return nil
-	}
-	n, err := strconv.Atoi(args[0])
-	if err != nil || n <= 0 {
-		m.Reply("<b>Invalid N.</b> Provide a positive integer.")
-		return nil
-	}
-	if n > gpurgeMaxN {
-		m.Reply(fmt.Sprintf("<b>N too high.</b> Maximum is %d.", gpurgeMaxN))
+	n, ok := parsePurgeCount(m, "<code>/upurge 20</code>")
+	if !ok {
 		return nil
 	}
 
 	reply, err := m.GetReplyMessage()
+	if err != nil || reply == nil {
+		m.Reply("I couldn't read the replied message. It may have been deleted.")
+		return nil
+	}
+	target, err := modules.TargetFromMessage(m, reply)
 	if err != nil {
-		m.Reply("<b>Couldn't read the replied message.</b>")
+		m.Reply(modules.AdminFriendlyError(err, "purge"))
 		return nil
 	}
-	targetID := reply.SenderID()
-	if targetID == 0 {
-		m.Reply("<b>Couldn't identify the sender of that message.</b>")
-		return nil
-	}
-
-	scanDepth := int32(n * 2)
-	if scanDepth < 20 {
-		scanDepth = 20
-	}
-	if scanDepth > 400 {
-		scanDepth = 400
-	}
-
-	history, err := m.Client.GetHistory(m.ChatID(), &tg.HistoryOption{
-		Limit:            scanDepth,
-		Offset:           int32(m.ID),
-		SleepThresholdMs: 50,
-	})
-	if err != nil {
-		m.Reply(modules.AdminFriendlyError(err, "scan history"))
-		return nil
-	}
-
-	var ids []int32
-	for i := range history {
-		msg := &history[i]
-		if msg.SenderID() == targetID {
-			ids = append(ids, int32(msg.ID))
-			if len(ids) >= n {
-				break
-			}
+	if a := modules.GetChatAdmin(m.Client, chat, target.ID); a != nil && !target.IsChannel && target.ID != m.SenderID() {
+		if a.Creator || !modules.UserHasRight(m.Client, chat, m.SenderID(), "promote") {
+			m.Reply("I won't purge another admin's messages.")
+			return nil
 		}
 	}
 
+	ids, err := gpurgeScan(m.Client, chat, m.ID, gpurgeScanDepth(n), target.ID, n)
+	if err != nil && len(ids) == 0 {
+		m.Reply(modules.AdminFriendlyError(err, "scan recent messages"))
+		return nil
+	}
 	if len(ids) == 0 {
-		m.Reply("<b>No messages from that user found in the recent history.</b>")
+		modules.ReplyTemp(m, "No recent messages from "+target.Mention()+" found.", 5)
 		return nil
 	}
 
-	deleted, derr := gpurgeChunkedDelete(m.Client, m.ChatID(), ids)
-	if derr != nil {
+	deleted, derr := gpurgeChunkedDelete(m.Client, chat, ids)
+	if derr != nil && deleted == 0 {
 		m.Reply(modules.AdminFriendlyError(derr, "delete messages"))
 		return nil
 	}
-
-	name := fmt.Sprintf("user <code>%d</code>", targetID)
-	if peer, perr := m.Client.ResolvePeer(targetID); perr == nil {
-		if dn := strings.TrimSpace(modules.GetPeerDisplayName(m.Client, peer)); dn != "" {
-			name = "<b>" + dn + "</b>"
-		}
-	}
-
-	status, _ := m.Reply(fmt.Sprintf("Deleted <b>%d</b> message(s) from %s.", deleted, name))
-	if status != nil {
-		go func(chatID int64, statusID int32) {
-			time.Sleep(5 * time.Second)
-			m.Client.DeleteMessages(chatID, []int32{statusID})
-		}(m.ChatID(), status.ID)
-	}
+	m.Delete()
+	modules.ReplyTemp(m, fmt.Sprintf("Deleted <b>%d</b> message(s) from %s.", deleted, target.Mention()), 5)
 	return nil
 }
 
 func MyPurgeHandle(m *tg.NewMessage) error {
-	if m.IsPrivate() {
-		m.Reply("<b>This command only works in groups.</b>")
+	if !modules.RequireGroup(m) {
+		return nil
+	}
+	chat := m.ChannelID()
+	senderID := m.SenderID()
+	if senderID == 0 || modules.IsAnonAdmin(m) {
+		m.Reply("Anonymous admins can't use <code>/mypurge</code>.")
+		return nil
+	}
+	n, ok := parsePurgeCount(m, "<code>/mypurge 10</code>")
+	if !ok {
+		return nil
+	}
+	if !modules.BotHasRight(m.Client, chat, "delete") {
+		m.Reply("I need the <b>Delete Messages</b> admin right to remove your messages.")
 		return nil
 	}
 
-	args := m.ArgsList()
-	if len(args) < 1 {
-		m.Reply("<b>Usage:</b> <code>/mypurge &lt;N&gt;</code>")
+	ids, err := gpurgeScan(m.Client, chat, m.ID, gpurgeScanDepth(n), senderID, n)
+	if err != nil && len(ids) == 0 {
+		m.Reply(modules.AdminFriendlyError(err, "scan recent messages"))
 		return nil
 	}
-	n, err := strconv.Atoi(args[0])
-	if err != nil || n <= 0 {
-		m.Reply("<b>Invalid N.</b> Provide a positive integer.")
-		return nil
-	}
-	if n > gpurgeMaxN {
-		m.Reply(fmt.Sprintf("<b>N too high.</b> Maximum is %d.", gpurgeMaxN))
-		return nil
-	}
-
-	targetID := m.SenderID()
-	if targetID == 0 {
-		return nil
-	}
-
-	scanDepth := int32(n * 2)
-	if scanDepth < 20 {
-		scanDepth = 20
-	}
-	if scanDepth > 400 {
-		scanDepth = 400
-	}
-
-	history, err := m.Client.GetHistory(m.ChatID(), &tg.HistoryOption{
-		Limit:            scanDepth,
-		Offset:           int32(m.ID),
-		SleepThresholdMs: 50,
-	})
-	if err != nil {
-		m.Reply(modules.AdminFriendlyError(err, "scan history"))
-		return nil
-	}
-
-	var ids []int32
-	for i := range history {
-		msg := &history[i]
-		if msg.SenderID() == targetID {
-			ids = append(ids, int32(msg.ID))
-			if len(ids) >= n {
-				break
-			}
-		}
-	}
-
 	if len(ids) == 0 {
-		modules.ReplyTemp(m, "<b>No messages of yours found in the recent history.</b>", 5)
+		modules.ReplyTemp(m, "No recent messages of yours found.", 5)
 		m.Delete()
 		return nil
 	}
-
-	ids = append(ids, int32(m.ID))
-	_, _ = gpurgeChunkedDelete(m.Client, m.ChatID(), ids)
+	ids = append(ids, m.ID)
+	if _, err := gpurgeChunkedDelete(m.Client, chat, ids); err != nil {
+		m.Reply(modules.AdminFriendlyError(err, "delete messages"))
+	}
 	return nil
 }
 
 func registerGPurgeHandlers() {
 	c := modules.Client
-	c.On("cmd:spurge", SilentPurgeHandle)
-	c.On("cmd:upurge", UserPurgeHandle)
-	c.On("cmd:mypurge", MyPurgeHandle)
+	modules.OnCommand(c, "cmd:spurge", SilentPurgeHandle)
+	modules.OnCommand(c, "cmd:upurge", UserPurgeHandle)
+	modules.OnCommand(c, "cmd:mypurge", MyPurgeHandle)
 }
 
 func init() {
 	modules.QueueHandlerRegistration(registerGPurgeHandlers)
 
-	modules.Mods.AddModule("GPurge", `<b>Group Purge (Recovery)</b>
+	modules.Mods.AddModule("GPurge", strings.TrimSpace(`<b>Targeted Purge</b>
 
-Targeted purge tools that go beyond the basic /purge range.
+Purge tools that go beyond the basic <code>/purge</code> range.
 
 <b>Commands:</b>
- - <code>/spurge</code> - Silent purge. Reply to a message; deletes everything from that message through the command. Command and reply itself are wiped, no status spam.
- - <code>/upurge &lt;N&gt;</code> - Admin only. Reply to a user; deletes their last N messages in the chat (scans up to 2N deep, capped at 400).
- - <code>/mypurge &lt;N&gt;</code> - Any user. Deletes your own last N messages (scans up to 2N deep, capped at 400).
+ - <code>/spurge</code> - Silent purge. Reply to a message; deletes everything from that message up to and including the command, with no status message. At most 3000 messages per run.
+ - <code>/upurge &lt;N&gt;</code> - Reply to a user's message; deletes that user's last N messages (looks back up to 1000 messages).
+ - <code>/mypurge &lt;N&gt;</code> - Deletes your own last N messages plus the command (looks back up to 1000 messages).
 
-<b>Limits:</b>
- - Maximum N: 200.
- - Bot needs Delete Messages permission for admin commands.
- - For /mypurge, the bot still needs Delete Messages permission to remove messages it didn't author.
+<b>Examples:</b>
+ <code>/upurge 20</code> (as a reply) - remove the last 20 messages of that user
+ <code>/mypurge 5</code> - remove your last 5 messages
 
-<b>Permissions:</b>
- - /spurge and /upurge require the invoker to have Delete Messages admin right.
- - /mypurge is open to any group member.`)
+<b>Limits &amp; permissions:</b>
+ - N is 1-200.
+ - <code>/spurge</code> and <code>/upurge</code> need the Delete Messages right; <code>/upurge</code> won't touch other admins' messages unless you can add admins.
+ - <code>/mypurge</code> is open to everyone.
+ - I need the Delete Messages right for all of them.`))
 }

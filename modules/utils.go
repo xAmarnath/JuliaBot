@@ -12,7 +12,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/amarnathcjd/gogram/telegram"
+	"github.com/xAmarnath/gogram/telegram"
 	"github.com/shirou/gopsutil/v4/cpu"
 	"github.com/shirou/gopsutil/v4/disk"
 	"github.com/shirou/gopsutil/v4/mem"
@@ -155,6 +155,11 @@ func HumanBytes(bytes uint64) string {
 }
 
 func IsUserAdmin(bot *telegram.Client, userID int64, chatID int64, right string) bool {
+	if chatID < 0 {
+		if admins, _, err := GetChatAdmins(bot, chatID); err == nil {
+			return AdminRightAllowed(admins[userID], right)
+		}
+	}
 	member, err := bot.GetChatMember(chatID, userID)
 	if err != nil {
 		return false
@@ -484,4 +489,29 @@ func regexIsCatchAll(p string) bool {
 		}
 	}
 	return false
+}
+
+type Status struct {
+	m   *telegram.NewMessage
+	msg *telegram.NewMessage
+}
+
+func NewStatus(m *telegram.NewMessage, text string) *Status {
+	msg, _ := m.Reply(text)
+	return &Status{m: m, msg: msg}
+}
+
+func (s *Status) Edit(text string, opts ...*telegram.SendOptions) {
+	if s.msg != nil {
+		if _, err := s.msg.Edit(text, opts...); err == nil {
+			return
+		}
+	}
+	s.m.Reply(text, opts...)
+}
+
+func (s *Status) Done() {
+	if s.msg != nil {
+		s.msg.Delete()
+	}
 }

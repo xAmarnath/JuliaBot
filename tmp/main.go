@@ -1,7 +1,7 @@
 package main
 
 import (
-	_ "github.com/amarnathcjd/gogram/telegram"
+	_ "github.com/xAmarnath/gogram/telegram"
 )
 
 func mainBak() {}

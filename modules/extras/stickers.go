@@ -1,7 +1,7 @@
 package extras
 
 import (
-	"encoding/binary"
+	"context"
 	"fmt"
 	"html"
 	"image"
@@ -9,7 +9,6 @@ import (
 	"image/draw"
 	"image/jpeg"
 	"image/png"
-	"math"
 	modules "main/modules"
 	"main/modules/db"
 	"os"
@@ -19,7 +18,7 @@ import (
 	"strings"
 	"time"
 
-	tg "github.com/amarnathcjd/gogram/telegram"
+	tg "github.com/xAmarnath/gogram/telegram"
 	_ "golang.org/x/image/webp"
 )
 
@@ -46,6 +45,14 @@ func stickerFriendlyError(m *tg.NewMessage, err error) string {
 		return "Wrong file type for this pack kind. Video sticker packs accept only .webm/VP9, animated only .tgs, static only .webp/.png."
 	case strings.Contains(upper, "STICKER_EMOJI_INVALID"), strings.Contains(upper, "STICKER_EMOJI_EMPTY"):
 		return "Emoji is invalid or empty. Provide a real emoji after the command, like <code>/kang 😀</code>."
+	case strings.Contains(upper, "STICKER_VIDEO_BIG"):
+		return "The video sticker is over Telegram's 256 KB limit. Try a shorter or simpler clip."
+	case strings.Contains(upper, "STICKER_VIDEO_LONG"):
+		return "Video stickers can be at most 3 seconds long."
+	case strings.Contains(upper, "STICKER_VIDEO_NODIMENSIONS"):
+		return "The video sticker must have one side of exactly 512px."
+	case strings.Contains(upper, "STICKER_TGS_NOTGS"), strings.Contains(upper, "STICKER_FILE_INVALID"):
+		return "Telegram rejected the sticker file. Animated stickers must be valid .tgs files under 64 KB."
 	case strings.Contains(upper, "STICKER_PNG_DIMENSIONS"), strings.Contains(upper, "STICKER_PNG_NOPNG"):
 		return "Static sticker must be 512×512 PNG or WEBP with transparency."
 	case strings.Contains(upper, "STICKER_INVALID"), strings.Contains(upper, "STICKER_DOCUMENT_INVALID"):
@@ -84,6 +91,7 @@ func GifToSticker(m *tg.NewMessage) error {
 	if emoji == "" {
 		emoji = "😍"
 	}
+	status := modules.NewStatus(m, "Converting to a video sticker…")
 
 	ts := time.Now().UnixNano()
 	srcExt := ".mp4"
@@ -94,35 +102,33 @@ func GifToSticker(m *tg.NewMessage) error {
 	}
 	inPath := filepath.Join(os.TempDir(), fmt.Sprintf("gif2sticker_%d_in%s", ts, srcExt))
 	outPath := filepath.Join(os.TempDir(), fmt.Sprintf("gif2sticker_%d.webm", ts))
-	fi, err := r.Download(&tg.DownloadOptions{FileName: inPath})
+	fi, err := modules.TransferDownload(r, &tg.DownloadOptions{FileName: inPath})
 	if err != nil {
-		m.Reply("<b>Error:</b> Unable to download the source: " + html.EscapeString(err.Error()))
+		status.Edit("<b>Error:</b> Unable to download the source: " + html.EscapeString(err.Error()))
 		return nil
 	}
+	defer os.Remove(fi)
 
 	if st, err := os.Stat(fi); err != nil || st.Size() == 0 {
-		os.Remove(fi)
 		expected := int64(0)
 		if r.File != nil {
 			expected = r.File.Size
 		}
-		m.Reply(fmt.Sprintf("<b>Error:</b> Downloaded file is empty or unreadable (expected %d bytes).", expected))
+		status.Edit(fmt.Sprintf("<b>Error:</b> Downloaded file is empty or unreadable (expected %d bytes).", expected))
 		return nil
 	} else if r.File != nil && r.File.Size > 0 && st.Size() < r.File.Size {
-		os.Remove(fi)
-		m.Reply(fmt.Sprintf("<b>Error:</b> Download truncated (%d/%d bytes). Retry.", st.Size(), r.File.Size))
+		status.Edit(fmt.Sprintf("<b>Error:</b> Download truncated (%d/%d bytes). Retry.", st.Size(), r.File.Size))
 		return nil
 	}
 
 	defer os.Remove(outPath)
 
 	if err := encodeVideoSticker(fi, outPath); err != nil {
-		m.Reply(fmt.Sprintf("<b>Error:</b> ffmpeg failed: %s\n<i>Source kept at %s for inspection.</i>", html.EscapeString(err.Error()), html.EscapeString(fi)))
+		status.Edit("<b>Error:</b> couldn't convert this file: " + html.EscapeString(err.Error()))
 		return nil
 	}
-	os.Remove(fi)
 
-	if _, err := m.ReplyMedia(outPath, &tg.MediaOptions{
+	if _, err := modules.TransferReplyMedia(m, outPath, &tg.MediaOptions{
 		MimeType: "video/webm",
 		Attributes: []tg.DocumentAttribute{
 			&tg.DocumentAttributeSticker{
@@ -132,126 +138,75 @@ func GifToSticker(m *tg.NewMessage) error {
 			&tg.DocumentAttributeFilename{FileName: "sticker.webm"},
 		},
 	}); err != nil {
-		m.Reply("<b>Error:</b> upload failed: " + html.EscapeString(err.Error()))
+		status.Edit("<b>Error:</b> upload failed: " + html.EscapeString(err.Error()))
+		return nil
 	}
+	status.Done()
 	return nil
+}
+
+const (
+	videoStickerMaxBytes = 256 * 1024
+	videoStickerClipSecs = 2.95
+)
+
+func probeDuration(src string) float64 {
+	out, err := exec.Command("ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", src).Output()
+	if err != nil {
+		return 0
+	}
+	d, _ := strconv.ParseFloat(strings.TrimSpace(string(out)), 64)
+	return d
 }
 
 func encodeVideoSticker(src, dst string) error {
-	dur := 0.0
-	probe := exec.Command("ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", src)
-	if out, err := probe.Output(); err == nil {
-		dur, _ = strconv.ParseFloat(strings.TrimSpace(string(out)), 64)
+	clip := probeDuration(src)
+	if clip <= 0 || clip > videoStickerClipSecs {
+		clip = videoStickerClipSecs
 	}
-
-	vf := "scale='if(gt(iw,ih),512,-2)':'if(gt(iw,ih),-2,512)':flags=lanczos,format=yuva420p,fps=30"
-	args := []string{"-y", "-loglevel", "error", "-i", src, "-vf", vf,
-		"-c:v", "libvpx-vp9",
-		"-pix_fmt", "yuva420p",
-		"-b:v", "0",
-		"-crf", "34",
-		"-deadline", "good",
-		"-cpu-used", "4",
-		"-row-mt", "1",
-		"-threads", "4",
-		"-auto-alt-ref", "0",
-		"-an", "-sn",
-		dst,
+	budgetKbps := int(float64(videoStickerMaxBytes*8) * 0.9 / clip / 1000)
+	attempts := []struct {
+		fps   int
+		kbps  int
+		crf   int
+		speed string
+	}{
+		{30, budgetKbps, 30, "6"},
+		{30, budgetKbps * 3 / 4, 36, "6"},
+		{24, budgetKbps / 2, 42, "6"},
+		{20, budgetKbps * 3 / 8, 48, "7"},
+		{15, budgetKbps / 4, 55, "8"},
+		{10, budgetKbps / 5, 63, "8"},
 	}
-	cmd := exec.Command("ffmpeg", args...)
-	if out, err := cmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("%v: %s", err, strings.TrimSpace(string(out)))
-	}
-
-	if dur > 3.0 {
-		if err := spoofWebmDuration(dst, 2999.0); err != nil {
-			os.Remove(dst)
-			return fmt.Errorf("spoof duration: %w", err)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+	var lastSize int64
+	for _, a := range attempts {
+		vf := fmt.Sprintf("scale='if(gt(iw,ih),512,-2)':'if(gt(iw,ih),-2,512)':flags=lanczos,fps=%d,format=yuva420p", a.fps)
+		args := []string{"-nostdin", "-y", "-loglevel", "error", "-t", strconv.FormatFloat(clip, 'f', 2, 64), "-i", src,
+			"-vf", vf, "-c:v", "libvpx-vp9", "-pix_fmt", "yuva420p",
+			"-crf", strconv.Itoa(a.crf), "-b:v", fmt.Sprintf("%dk", a.kbps), "-maxrate", fmt.Sprintf("%dk", a.kbps), "-bufsize", fmt.Sprintf("%dk", a.kbps*2),
+			"-deadline", "realtime", "-cpu-used", a.speed, "-row-mt", "1", "-auto-alt-ref", "0",
+			"-an", "-sn", "-dn", "-map_metadata", "-1", dst}
+		if out, err := exec.CommandContext(ctx, "ffmpeg", args...).CombinedOutput(); err != nil {
+			return fmt.Errorf("%v: %.300s", err, strings.TrimSpace(string(out)))
 		}
+		st, err := os.Stat(dst)
+		if err != nil {
+			return err
+		}
+		if st.Size() > 0 && st.Size() <= videoStickerMaxBytes {
+			return nil
+		}
+		lastSize = st.Size()
 	}
-	return nil
+	os.Remove(dst)
+	return fmt.Errorf("couldn't fit the video under Telegram's 256 KB sticker limit (smallest attempt was %d KB)", lastSize/1024)
 }
 
-func spoofWebmDuration(path string, targetMs float64) error {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return err
-	}
-	// Element IDs as they appear in the file (VINT-encoded, with marker bits):
-	// Segment=0x18538067 (4 bytes), Info=0x1549A966 (4 bytes), Duration=0x4489 (2 bytes).
-	segStart, segLen, ok := ebmlFindChild(data, 0, len(data), []byte{0x18, 0x53, 0x80, 0x67})
-	if !ok {
-		return fmt.Errorf("Segment element not found")
-	}
-	infoStart, infoLen, ok := ebmlFindChild(data, segStart, segStart+segLen, []byte{0x15, 0x49, 0xA9, 0x66})
-	if !ok {
-		return fmt.Errorf("Info element not found")
-	}
-	durStart, durLen, ok := ebmlFindChild(data, infoStart, infoStart+infoLen, []byte{0x44, 0x89})
-	if !ok {
-		return fmt.Errorf("Duration element not found")
-	}
-	switch durLen {
-	case 4:
-		bits := math.Float32bits(float32(targetMs))
-		binary.BigEndian.PutUint32(data[durStart:durStart+4], bits)
-	case 8:
-		bits := math.Float64bits(targetMs)
-		binary.BigEndian.PutUint64(data[durStart:durStart+8], bits)
-	default:
-		return fmt.Errorf("unexpected Duration payload length %d", durLen)
-	}
-	return os.WriteFile(path, data, 0o644)
-}
-
-func ebmlFindChild(data []byte, start, end int, wantID []byte) (payloadStart, payloadLen int, ok bool) {
-	s := start
-	for s < end {
-		if s+len(wantID) > end {
-			return 0, 0, false
-		}
-		idLen := ebmlVIntLen(data[s])
-		if idLen == 0 || s+idLen > end {
-			return 0, 0, false
-		}
-		id := data[s : s+idLen]
-		s += idLen
-		sizeLen := ebmlVIntLen(data[s])
-		if sizeLen == 0 || s+sizeLen > end {
-			return 0, 0, false
-		}
-		size := ebmlVIntValue(data[s : s+sizeLen])
-		s += sizeLen
-		if len(id) == len(wantID) && bytesEqual(id, wantID) {
-			return s, int(size), true
-		}
-		s += int(size)
-	}
-	return 0, 0, false
-}
-
-func ebmlVIntLen(first byte) int {
-	if first == 0 {
-		return 0
-	}
-	for i := 0; i < 8; i++ {
-		if first&(0x80>>i) != 0 {
-			return i + 1
-		}
-	}
-	return 0
-}
-
-func ebmlVIntValue(b []byte) uint64 {
-	if len(b) == 0 {
-		return 0
-	}
-	mask := byte(0x80 >> (len(b) - 1))
-	v := uint64(b[0] &^ mask)
-	for i := 1; i < len(b); i++ {
-		v = (v << 8) | uint64(b[i])
-	}
-	return v
+func videoStickerNeedsEncode(path string) bool {
+	st, err := os.Stat(path)
+	return err != nil || st.Size() > videoStickerMaxBytes || probeDuration(path) > 3.0
 }
 
 func bytesEqual(a, b []byte) bool {
@@ -268,6 +223,7 @@ func bytesEqual(a, b []byte) bool {
 
 type kangSource struct {
 	Doc            *tg.DocumentObj
+	Media          tg.MessageMedia
 	Kind           string
 	IsAlreadyValid bool
 	Emoji          string
@@ -279,13 +235,16 @@ func kangDetectSource(reply *tg.NewMessage) (*kangSource, error) {
 	}
 	md, ok := reply.Media().(*tg.MessageMediaDocument)
 	if !ok {
-		return nil, fmt.Errorf("reply is not a document")
+		if photo, yes := reply.Media().(*tg.MessageMediaPhoto); yes && photo.Photo != nil {
+			return &kangSource{Kind: "normal", Media: photo}, nil
+		}
+		return nil, fmt.Errorf("reply to a sticker, photo or image document")
 	}
 	doc, ok := md.Document.(*tg.DocumentObj)
 	if !ok {
 		return nil, fmt.Errorf("document is not a DocumentObj")
 	}
-	src := &kangSource{Doc: doc}
+	src := &kangSource{Doc: doc, Media: md}
 	mime := strings.ToLower(doc.MimeType)
 	for _, attr := range doc.Attributes {
 		switch a := attr.(type) {
@@ -315,7 +274,11 @@ func kangDetectSource(reply *tg.NewMessage) (*kangSource, error) {
 		}
 	}
 	if src.Kind == "" {
-		src.Kind = "normal"
+		if src.IsAlreadyValid {
+			src.Kind = "normal"
+			return src, nil
+		}
+		return nil, fmt.Errorf("reply to a sticker, photo or image document")
 	}
 	return src, nil
 }
@@ -323,7 +286,7 @@ func kangDetectSource(reply *tg.NewMessage) (*kangSource, error) {
 func kangPrepareInputDoc(m *tg.NewMessage, src *kangSource) (tg.InputDocument, func(), error) {
 	cleanup := func() {}
 
-	if src.Kind == "normal" && src.IsAlreadyValid {
+	if src.Kind == "normal" && src.IsAlreadyValid && kangDocumentSized(src.Doc) && src.Doc.Size <= 512*1024 {
 		return &tg.InputDocumentObj{
 			ID:            src.Doc.ID,
 			AccessHash:    src.Doc.AccessHash,
@@ -331,30 +294,32 @@ func kangPrepareInputDoc(m *tg.NewMessage, src *kangSource) (tg.InputDocument, f
 		}, cleanup, nil
 	}
 
-	dl, err := m.Client.DownloadMedia(&tg.MessageMediaDocument{Document: src.Doc})
+	dl, err := modules.TransferDownloadMedia(m.Client, src.Media)
 	if err != nil {
 		return nil, cleanup, fmt.Errorf("download: %w", err)
 	}
 
 	srcW, srcH := 0, 0
-	for _, attr := range src.Doc.Attributes {
-		switch a := attr.(type) {
-		case *tg.DocumentAttributeImageSize:
-			srcW, srcH = int(a.W), int(a.H)
-		case *tg.DocumentAttributeVideo:
-			if srcW == 0 {
+	if src.Doc != nil {
+		for _, attr := range src.Doc.Attributes {
+			switch a := attr.(type) {
+			case *tg.DocumentAttributeImageSize:
 				srcW, srcH = int(a.W), int(a.H)
+			case *tg.DocumentAttributeVideo:
+				if srcW == 0 {
+					srcW, srcH = int(a.W), int(a.H)
+				}
 			}
 		}
 	}
-	alreadySized := (srcW == 512 && srcH <= 512) || (srcH == 512 && srcW <= 512)
+	alreadySized := kangValidSize(srcW, srcH)
 
 	outPath := dl
 	ts := time.Now().UnixNano()
 	switch src.Kind {
 	case "tgs":
 	case "webm":
-		if !(src.IsAlreadyValid && alreadySized) {
+		if !(src.IsAlreadyValid && alreadySized) || videoStickerNeedsEncode(dl) {
 			outPath = filepath.Join(os.TempDir(), fmt.Sprintf("kang_%d.webm", ts))
 			if err := encodeVideoSticker(dl, outPath); err != nil {
 				os.Remove(dl)
@@ -364,18 +329,10 @@ func kangPrepareInputDoc(m *tg.NewMessage, src *kangSource) (tg.InputDocument, f
 	default:
 		if !(src.IsAlreadyValid && alreadySized) {
 			outPath = filepath.Join(os.TempDir(), fmt.Sprintf("kang_%d.webp", ts))
-			cmd := exec.Command("ffmpeg",
-				"-y", "-loglevel", "error",
-				"-i", dl,
-				"-vf", "scale='if(gt(iw,ih),512,-2)':'if(gt(iw,ih),-2,512)':flags=lanczos",
-				"-c:v", "libwebp", "-pix_fmt", "yuva420p",
-				"-lossless", "0", "-compression_level", "4", "-q:v", "80",
-				"-preset", "picture", "-an", "-sn", "-threads", "4",
-				outPath,
-			)
-			if out, err := cmd.CombinedOutput(); err != nil {
+			if err := kangEncodeImage(dl, outPath); err != nil {
 				os.Remove(dl)
-				return nil, cleanup, fmt.Errorf("ffmpeg webp: %v: %s", err, strings.TrimSpace(string(out)))
+				os.Remove(outPath)
+				return nil, cleanup, err
 			}
 		}
 	}
@@ -387,7 +344,7 @@ func kangPrepareInputDoc(m *tg.NewMessage, src *kangSource) (tg.InputDocument, f
 		}
 	}
 
-	media, err := m.Client.GetSendableMedia(outPath, &tg.MediaMetadata{Inline: true})
+	media, err := modules.TransferSendableMedia(m.Client, outPath, &tg.MediaMetadata{Inline: true})
 	if err != nil {
 		cleanup()
 		return nil, func() {}, fmt.Errorf("prepare media: %w", err)
@@ -449,7 +406,7 @@ func KangSticker(m *tg.NewMessage) error {
 	if needNewPack {
 		packs, _ := db.GetUserPacks(userID)
 		packNumber := len(packs[src.Kind]) + 1
-		shortName := fmt.Sprintf("x%s_%s_%d_by_%s", username, src.Kind, packNumber, me.Username)
+		shortName := kangPackName(userID, src.Kind, packNumber, 2, me.Username)
 		title := fmt.Sprintf("%s's %s Stickers #%d", username, asciiTitle(src.Kind), packNumber)
 
 		newPack := &db.PackInfo{
@@ -459,18 +416,21 @@ func KangSticker(m *tg.NewMessage) error {
 			StickerCount: 1,
 			PackNumber:   packNumber,
 		}
-		_, createErr := m.Client.StickersCreateStickerSet(&tg.StickersCreateStickerSetParams{
-			UserID:    &tg.InputUserObj{UserID: userID, AccessHash: m.Sender.AccessHash},
-			Title:     title,
-			ShortName: shortName,
-			Stickers: []*tg.InputStickerSetItem{
-				{Document: doc, Emoji: emoji},
-			},
-		})
+		_, shortName, createErr := kangCreatePack(func(name string) (tg.MessagesStickerSet, error) {
+			return m.Client.StickersCreateStickerSet(&tg.StickersCreateStickerSetParams{
+				UserID:    &tg.InputUserObj{UserID: userID, AccessHash: m.Sender.AccessHash},
+				Title:     title,
+				ShortName: name,
+				Stickers: []*tg.InputStickerSetItem{
+					{Document: doc, Emoji: emoji},
+				},
+			})
+		}, userID, src.Kind, packNumber, me.Username)
 		if createErr != nil {
 			m.Reply(stickerFriendlyError(m, createErr))
 			return nil
 		}
+		newPack.ShortName = shortName
 		db.SavePack(userID, newPack)
 		m.Reply(fmt.Sprintf(
 			"<b>Created new %s sticker pack.</b>\n"+
@@ -732,13 +692,13 @@ func DeletePackHandler(m *tg.NewMessage) error {
 
 func registerStickersHandlers() {
 	c := modules.Client
-	c.On("cmd:gif", GifToSticker)
-	c.On("cmd:kang", KangSticker)
-	c.On("cmd:rmkang", RemoveKangedSticker)
-	c.On("cmd:pack", PackInfoHandle)
-	c.On("cmd:mypacks", MyPacksHandler)
-	c.On("cmd:renamepack", RenamePackHandler)
-	c.On("cmd:deletepack", DeletePackHandler)
+	modules.OnCommand(c, "cmd:gif", GifToSticker)
+	modules.OnCommand(c, "cmd:kang", KangSticker)
+	modules.OnCommand(c, "cmd:rmkang", RemoveKangedSticker)
+	modules.OnCommand(c, "cmd:pack", PackInfoHandle)
+	modules.OnCommand(c, "cmd:mypacks", MyPacksHandler)
+	modules.OnCommand(c, "cmd:renamepack", RenamePackHandler)
+	modules.OnCommand(c, "cmd:deletepack", DeletePackHandler)
 	c.On("command:doge", modules.DogeSticker)
 	c.On("inline:doge", modules.DogeStickerInline)
 }
@@ -849,9 +809,9 @@ func MeActionHandler(m *tg.NewMessage) error {
 
 func registerStickerPackInfoHandlers() {
 	c := modules.Client
-	c.On("cmd:stickerinfo", StickerInfoHandler)
-	c.On("cmd:me", MeActionHandler)
-	c.On("cmd:myself", MeActionHandler)
+	modules.OnCommand(c, "cmd:stickerinfo", StickerInfoHandler)
+	modules.OnCommand(c, "cmd:me", MeActionHandler)
+	modules.OnCommand(c, "cmd:myself", MeActionHandler)
 }
 
 func initFromSrc_sticker_pack_info_1_1() {
@@ -927,7 +887,7 @@ func StickerToImageHandler(m *tg.NewMessage) error {
 	pngPath := filepath.Join(os.TempDir(), fmt.Sprintf("sticker_%d.png", ts))
 	jpgPath := filepath.Join(os.TempDir(), fmt.Sprintf("sticker_%d.jpg", ts))
 
-	fi, err := reply.Download(&tg.DownloadOptions{FileName: srcPath})
+	fi, err := modules.TransferDownload(reply, &tg.DownloadOptions{FileName: srcPath})
 	if err != nil {
 		msg := "<b>Error:</b> download failed: " + html.EscapeString(err.Error())
 		if status != nil {
@@ -1017,7 +977,7 @@ func StickerToImageHandler(m *tg.NewMessage) error {
 
 	caption := fmt.Sprintf("<b>Sticker -&gt; Image</b>\n<b>Source:</b> <code>%s</code>", html.EscapeString(fmtName))
 
-	if _, err := m.ReplyMedia(pngPath, &tg.MediaOptions{
+	if _, err := modules.TransferReplyMedia(m, pngPath, &tg.MediaOptions{
 		Caption:       caption + "\n<b>Format:</b> PNG",
 		FileName:      "sticker.png",
 		MimeType:      "image/png",
@@ -1032,7 +992,7 @@ func StickerToImageHandler(m *tg.NewMessage) error {
 		return nil
 	}
 
-	if _, err := m.ReplyMedia(jpgPath, &tg.MediaOptions{
+	if _, err := modules.TransferReplyMedia(m, jpgPath, &tg.MediaOptions{
 		Caption:       caption + "\n<b>Format:</b> JPG",
 		FileName:      "sticker.jpg",
 		MimeType:      "image/jpeg",
@@ -1055,7 +1015,7 @@ func StickerToImageHandler(m *tg.NewMessage) error {
 
 func registerStickerToImageHandlers() {
 	c := modules.Client
-	c.On("cmd:towebp", StickerToImageHandler)
+	modules.OnCommand(c, "cmd:towebp", StickerToImageHandler)
 }
 
 func initFromSrc_sticker_to_image_2_1() {
@@ -1160,7 +1120,7 @@ func WebpToJpgHandler(m *tg.NewMessage) error {
 	srcPath := filepath.Join(os.TempDir(), fmt.Sprintf("tojpg_%d%s", ts, ext))
 	jpgPath := filepath.Join(os.TempDir(), fmt.Sprintf("tojpg_%d.jpg", ts))
 
-	fi, err := reply.Download(&tg.DownloadOptions{FileName: srcPath})
+	fi, err := modules.TransferDownload(reply, &tg.DownloadOptions{FileName: srcPath})
 	if err != nil {
 		msg := "<b>Error:</b> download failed: " + html.EscapeString(err.Error())
 		if status != nil {
@@ -1226,7 +1186,7 @@ func WebpToJpgHandler(m *tg.NewMessage) error {
 
 	caption := fmt.Sprintf("<b>WebP -&gt; JPG</b>\n<b>Source:</b> <code>%s</code>\n<b>Size:</b> <code>%dx%d</code>", html.EscapeString(fmtName), bounds.Dx(), bounds.Dy())
 
-	if _, err := m.ReplyMedia(jpgPath, &tg.MediaOptions{
+	if _, err := modules.TransferReplyMedia(m, jpgPath, &tg.MediaOptions{
 		Caption:       caption,
 		FileName:      "converted.jpg",
 		MimeType:      "image/jpeg",
@@ -1249,7 +1209,7 @@ func WebpToJpgHandler(m *tg.NewMessage) error {
 
 func registerWebpToJpgHandlers() {
 	c := modules.Client
-	c.On("cmd:tojpg", WebpToJpgHandler)
+	modules.OnCommand(c, "cmd:tojpg", WebpToJpgHandler)
 }
 
 func initFromSrc_webp_to_jpg_3_1() {

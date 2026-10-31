@@ -4,7 +4,7 @@ import (
 	"encoding/json"
 	"encoding/xml"
 	"fmt"
-	tg "github.com/amarnathcjd/gogram/telegram"
+	tg "github.com/xAmarnath/gogram/telegram"
 	"github.com/fogleman/gg"
 	"html"
 	"io"
@@ -44,13 +44,13 @@ type cryptoPrice struct {
 }
 
 type cryptoTopCoin struct {
-	ID                 string  `json:"id"`
-	Symbol             string  `json:"symbol"`
-	Name               string  `json:"name"`
-	CurrentPrice       float64 `json:"current_price"`
-	MarketCap          float64 `json:"market_cap"`
-	MarketCapRank      int     `json:"market_cap_rank"`
-	PriceChangePct24h  float64 `json:"price_change_percentage_24h"`
+	ID                string  `json:"id"`
+	Symbol            string  `json:"symbol"`
+	Name              string  `json:"name"`
+	CurrentPrice      float64 `json:"current_price"`
+	MarketCap         float64 `json:"market_cap"`
+	MarketCapRank     int     `json:"market_cap_rank"`
+	PriceChangePct24h float64 `json:"price_change_percentage_24h"`
 }
 
 type cryptoPriceCacheEntry struct {
@@ -370,13 +370,14 @@ func TopCryptoHandler(m *tg.NewMessage) error {
 
 func registerCryptoHandlers() {
 	c := modules.Client
-	c.On("cmd:price", PriceHandler)
-	c.On("cmd:top", TopCryptoHandler)
+	modules.OnCommand(c, "cmd:price", PriceHandler)
+	modules.OnCommand(c, "cmd:top", TopCryptoHandler)
 }
 
 func initFromSrc_crypto_0_1() {
 	modules.QueueHandlerRegistration(registerCryptoHandlers)
 }
+
 type cryptoChartMarket struct {
 	Prices [][]float64 `json:"prices"`
 }
@@ -629,7 +630,7 @@ func CryptoChartHandler(m *tg.NewMessage) error {
 		status.Delete()
 	}
 
-	_, merr := m.ReplyMedia(out, &tg.MediaOptions{
+	_, merr := modules.TransferReplyMedia(m, out, &tg.MediaOptions{
 		Caption:  caption,
 		FileName: "cryptochart.png",
 		MimeType: "image/png",
@@ -643,10 +644,11 @@ func CryptoChartHandler(m *tg.NewMessage) error {
 
 func registerCryptoChartHandlers() {
 	c := modules.Client
-	c.On("cmd:cryptochart", CryptoChartHandler)
+	modules.OnCommand(c, "cmd:cryptochart", CryptoChartHandler)
 }
 
 func initFromSrc_crypto_chart_1_1() { modules.QueueHandlerRegistration(registerCryptoChartHandlers) }
+
 var cryptoNewsHTTPClient = &http.Client{Timeout: 30 * time.Second}
 
 type cryptoNewsItem struct {
@@ -741,7 +743,7 @@ func CryptoNewsHandler(m *tg.NewMessage) error {
 
 func registerCryptoNewsHandlers() {
 	c := modules.Client
-	c.On("cmd:cryptonews", CryptoNewsHandler)
+	modules.OnCommand(c, "cmd:cryptonews", CryptoNewsHandler)
 }
 
 func initFromSrc_crypto_news_2_1() {

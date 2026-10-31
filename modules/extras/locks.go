@@ -13,8 +13,8 @@ import (
 	modules "main/modules"
 	"main/modules/db"
 
-	tg "github.com/amarnathcjd/gogram/telegram"
-	bolt "go.etcd.io/bbolt"
+	tg "github.com/xAmarnath/gogram/telegram"
+	"main/internal/mongostore"
 )
 
 const locksBucket = "locks_v3"
@@ -154,7 +154,7 @@ func loadLocks(chatID int64) map[string]lockValue {
 	if err != nil {
 		return out
 	}
-	_ = d.View(func(tx *bolt.Tx) error {
+	_ = d.View(func(tx *mongostore.Tx) error {
 		b := tx.Bucket([]byte(locksBucket))
 		if b == nil {
 			return nil
@@ -188,7 +188,7 @@ func saveLocks(chatID int64, m map[string]lockValue) error {
 			clean[k] = v
 		}
 	}
-	err = d.Update(func(tx *bolt.Tx) error {
+	err = d.Update(func(tx *mongostore.Tx) error {
 		b, err := tx.CreateBucketIfNotExists([]byte(locksBucket))
 		if err != nil {
 			return err
@@ -533,7 +533,7 @@ func LockHandler(m *tg.NewMessage) error {
 		m.Reply("Locks only work in groups.")
 		return nil
 	}
-	if !modules.IsUserAdmin(m.Client, m.SenderID(), m.ChatID(), "change_info") {
+	if !modules.IsUserAdmin(m.Client, m.SenderID(), m.ChannelID(), "change_info") {
 		m.Reply("You need Change Info permission to manage locks.")
 		return nil
 	}
@@ -626,7 +626,7 @@ func UnlockHandler(m *tg.NewMessage) error {
 		m.Reply("Locks only work in groups.")
 		return nil
 	}
-	if !modules.IsUserAdmin(m.Client, m.SenderID(), m.ChatID(), "change_info") {
+	if !modules.IsUserAdmin(m.Client, m.SenderID(), m.ChannelID(), "change_info") {
 		m.Reply("You need Change Info permission to manage locks.")
 		return nil
 	}
@@ -774,7 +774,7 @@ func LocksWatcher(m *tg.NewMessage) error {
 		}
 	}
 
-	if modules.IsUserAdmin(m.Client, m.SenderID(), m.ChatID(), "") {
+	if modules.IsUserAdmin(m.Client, m.SenderID(), m.ChannelID(), "") {
 		return nil
 	}
 
@@ -808,7 +808,7 @@ func LocksEditWatcher(m *tg.NewMessage) error {
 	if !locks["edit"].On && !locks["all"].On {
 		return nil
 	}
-	if modules.IsUserAdmin(m.Client, m.SenderID(), m.ChatID(), "") {
+	if modules.IsUserAdmin(m.Client, m.SenderID(), m.ChannelID(), "") {
 		return nil
 	}
 	m.Delete()
@@ -817,11 +817,11 @@ func LocksEditWatcher(m *tg.NewMessage) error {
 
 func registerLocksHandlers() {
 	c := modules.Client
-	c.On("cmd:lock", LockHandler)
-	c.On("cmd:unlock", UnlockHandler)
-	c.On("cmd:locks", LocksStatusHandler)
-	c.On("cmd:lockstatus", LocksStatusHandler)
-	c.On("cmd:locktypes", LockTypesHandler)
+	modules.OnCommand(c, "cmd:lock", LockHandler)
+	modules.OnCommand(c, "cmd:unlock", UnlockHandler)
+	modules.OnCommand(c, "cmd:locks", LocksStatusHandler)
+	modules.OnCommand(c, "cmd:lockstatus", LocksStatusHandler)
+	modules.OnCommand(c, "cmd:locktypes", LockTypesHandler)
 	c.On(tg.OnNewMessage, LocksWatcher)
 	c.On(tg.OnEditMessage, LocksEditWatcher)
 }

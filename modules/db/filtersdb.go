@@ -4,7 +4,7 @@ import (
 	"encoding/json"
 	"strconv"
 
-	bolt "go.etcd.io/bbolt"
+	"main/internal/mongostore"
 )
 
 type Filter struct {
@@ -16,8 +16,8 @@ type Filter struct {
 	Buttons   string `json:"buttons,omitempty"`
 }
 
-func ensureFiltersBuckets(db *bolt.DB) error {
-	return db.Update(func(tx *bolt.Tx) error {
+func ensureFiltersBuckets(db *mongostore.DB) error {
+	return db.Update(func(tx *mongostore.Tx) error {
 		_, err := tx.CreateBucketIfNotExists([]byte("filters"))
 		return err
 	})
@@ -28,12 +28,15 @@ func SaveFilter(chatID int64, filter *Filter) error {
 	if err != nil {
 		return err
 	}
-	if err := ensureFiltersBuckets(db); err != nil {
+	if err := ensureBucketsOnce("filters", db, ensureFiltersBuckets); err != nil {
 		return err
 	}
 
-	return db.Update(func(tx *bolt.Tx) error {
-		filtersBucket := tx.Bucket([]byte("filters"))
+	return db.Update(func(tx *mongostore.Tx) error {
+		filtersBucket, err := tx.CreateBucketIfNotExists([]byte("filters"))
+		if err != nil {
+			return err
+		}
 		chatBucket, err := filtersBucket.CreateBucketIfNotExists([]byte(strconv.FormatInt(chatID, 10)))
 		if err != nil {
 			return err
@@ -53,12 +56,12 @@ func GetFilter(chatID int64, keyword string) (*Filter, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := ensureFiltersBuckets(db); err != nil {
+	if err := ensureBucketsOnce("filters", db, ensureFiltersBuckets); err != nil {
 		return nil, err
 	}
 
 	var filter *Filter
-	err = db.View(func(tx *bolt.Tx) error {
+	err = db.View(func(tx *mongostore.Tx) error {
 		filtersBucket := tx.Bucket([]byte("filters"))
 		if filtersBucket == nil {
 			return nil
@@ -85,12 +88,12 @@ func GetAllFilters(chatID int64) ([]*Filter, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := ensureFiltersBuckets(db); err != nil {
+	if err := ensureBucketsOnce("filters", db, ensureFiltersBuckets); err != nil {
 		return nil, err
 	}
 
 	var filters []*Filter
-	err = db.View(func(tx *bolt.Tx) error {
+	err = db.View(func(tx *mongostore.Tx) error {
 		filtersBucket := tx.Bucket([]byte("filters"))
 		if filtersBucket == nil {
 			return nil
@@ -119,11 +122,11 @@ func DeleteFilter(chatID int64, keyword string) error {
 	if err != nil {
 		return err
 	}
-	if err := ensureFiltersBuckets(db); err != nil {
+	if err := ensureBucketsOnce("filters", db, ensureFiltersBuckets); err != nil {
 		return err
 	}
 
-	return db.Update(func(tx *bolt.Tx) error {
+	return db.Update(func(tx *mongostore.Tx) error {
 		filtersBucket := tx.Bucket([]byte("filters"))
 		if filtersBucket == nil {
 			return nil
@@ -142,16 +145,20 @@ func DeleteAllFilters(chatID int64) error {
 	if err != nil {
 		return err
 	}
-	if err := ensureFiltersBuckets(db); err != nil {
+	if err := ensureBucketsOnce("filters", db, ensureFiltersBuckets); err != nil {
 		return err
 	}
 
-	return db.Update(func(tx *bolt.Tx) error {
+	return db.Update(func(tx *mongostore.Tx) error {
 		filtersBucket := tx.Bucket([]byte("filters"))
 		if filtersBucket == nil {
 			return nil
 		}
-		return filtersBucket.DeleteBucket([]byte(strconv.FormatInt(chatID, 10)))
+		key := []byte(strconv.FormatInt(chatID, 10))
+		if filtersBucket.Bucket(key) == nil {
+			return nil
+		}
+		return filtersBucket.DeleteBucket(key)
 	})
 }
 
@@ -160,12 +167,12 @@ func GetFiltersCount(chatID int64) (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	if err := ensureFiltersBuckets(db); err != nil {
+	if err := ensureBucketsOnce("filters", db, ensureFiltersBuckets); err != nil {
 		return 0, err
 	}
 
 	count := 0
-	err = db.View(func(tx *bolt.Tx) error {
+	err = db.View(func(tx *mongostore.Tx) error {
 		filtersBucket := tx.Bucket([]byte("filters"))
 		if filtersBucket == nil {
 			return nil

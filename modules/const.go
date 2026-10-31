@@ -4,8 +4,6 @@ import (
 	"math/rand"
 )
 
-
-
 var fonts = []string{
 	"Inter_28pt-Bold.ttf",
 	"Swiss 721 Black Extended BT.ttf",

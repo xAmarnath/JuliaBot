@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"strconv"
 
-	bolt "go.etcd.io/bbolt"
+	"main/internal/mongostore"
 )
 
 type PackInfo struct {
@@ -16,8 +16,8 @@ type PackInfo struct {
 	PackNumber   int    `json:"pack_number"`
 }
 
-func ensureStickerBuckets(db *bolt.DB) error {
-	return db.Update(func(tx *bolt.Tx) error {
+func ensureStickerBuckets(db *mongostore.DB) error {
+	return db.Update(func(tx *mongostore.Tx) error {
 		_, err := tx.CreateBucketIfNotExists([]byte("sticker_users"))
 		if err != nil {
 			return err
@@ -33,7 +33,7 @@ func GetUserPacks(userID int64) (map[string][]*PackInfo, error) {
 		return nil, err
 	}
 
-	if err := ensureStickerBuckets(db); err != nil {
+	if err := ensureBucketsOnce("sticker", db, ensureStickerBuckets); err != nil {
 		return nil, err
 	}
 
@@ -42,7 +42,7 @@ func GetUserPacks(userID int64) (map[string][]*PackInfo, error) {
 	packs["webm"] = []*PackInfo{}
 	packs["tgs"] = []*PackInfo{}
 
-	err = db.View(func(tx *bolt.Tx) error {
+	err = db.View(func(tx *mongostore.Tx) error {
 		usersBucket := tx.Bucket([]byte("sticker_users"))
 		if usersBucket == nil {
 			return nil
@@ -79,12 +79,12 @@ func GetActivePack(userID int64, packType string) (*PackInfo, error) {
 		return nil, err
 	}
 
-	if err := ensureStickerBuckets(db); err != nil {
+	if err := ensureBucketsOnce("sticker", db, ensureStickerBuckets); err != nil {
 		return nil, err
 	}
 
 	var pack *PackInfo
-	err = db.View(func(tx *bolt.Tx) error {
+	err = db.View(func(tx *mongostore.Tx) error {
 		usersBucket := tx.Bucket([]byte("sticker_users"))
 		if usersBucket == nil {
 			return nil
@@ -125,11 +125,11 @@ func SavePack(userID int64, pack *PackInfo) error {
 		return err
 	}
 
-	if err := ensureStickerBuckets(db); err != nil {
+	if err := ensureBucketsOnce("sticker", db, ensureStickerBuckets); err != nil {
 		return err
 	}
 
-	return db.Update(func(tx *bolt.Tx) error {
+	return db.Update(func(tx *mongostore.Tx) error {
 		usersBucket := tx.Bucket([]byte("sticker_users"))
 		userBucket, err := usersBucket.CreateBucketIfNotExists([]byte(strconv.FormatInt(userID, 10)))
 		if err != nil {
@@ -168,11 +168,11 @@ func DeletePack(userID int64, shortName string) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	if err := ensureStickerBuckets(db); err != nil {
+	if err := ensureBucketsOnce("sticker", db, ensureStickerBuckets); err != nil {
 		return false, err
 	}
 	removed := false
-	err = db.Update(func(tx *bolt.Tx) error {
+	err = db.Update(func(tx *mongostore.Tx) error {
 		usersBucket := tx.Bucket([]byte("sticker_users"))
 		if usersBucket == nil {
 			return nil
@@ -212,12 +212,12 @@ func GetPackByShortName(userID int64, shortName string) (*PackInfo, error) {
 		return nil, err
 	}
 
-	if err := ensureStickerBuckets(db); err != nil {
+	if err := ensureBucketsOnce("sticker", db, ensureStickerBuckets); err != nil {
 		return nil, err
 	}
 
 	var pack *PackInfo
-	err = db.View(func(tx *bolt.Tx) error {
+	err = db.View(func(tx *mongostore.Tx) error {
 		usersBucket := tx.Bucket([]byte("sticker_users"))
 		if usersBucket == nil {
 			return fmt.Errorf("no packs found")
@@ -261,12 +261,12 @@ func PurgeStickersIfBotChanged(botUsername string) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	if err := ensureStickerBuckets(db); err != nil {
+	if err := ensureBucketsOnce("sticker", db, ensureStickerBuckets); err != nil {
 		return false, err
 	}
 
 	stale := false
-	err = db.View(func(tx *bolt.Tx) error {
+	err = db.View(func(tx *mongostore.Tx) error {
 		usersBucket := tx.Bucket([]byte("sticker_users"))
 		if usersBucket == nil {
 			return nil
@@ -307,7 +307,7 @@ func PurgeStickersIfBotChanged(botUsername string) (bool, error) {
 	if !stale {
 		return false, nil
 	}
-	err = db.Update(func(tx *bolt.Tx) error {
+	err = db.Update(func(tx *mongostore.Tx) error {
 		_ = tx.DeleteBucket([]byte("sticker_users"))
 		_ = tx.DeleteBucket([]byte("sticker_packs"))
 		_, e := tx.CreateBucketIfNotExists([]byte("sticker_users"))

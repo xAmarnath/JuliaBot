@@ -2,542 +2,360 @@ package extras
 
 import (
 	"bytes"
-	"encoding/json"
 	"fmt"
-	tg "github.com/amarnathcjd/gogram/telegram"
 	"html"
 	"image"
-	_ "image/png"
-	"io"
-	modules "main/modules"
-	"mime/multipart"
-	"net/http"
+	"image/color"
+	_ "image/gif"
+	_ "image/jpeg"
+	"image/png"
+	"math"
 	"net/url"
 	"os"
-	"path/filepath"
+	"strconv"
 	"strings"
-	"time"
+
+	modules "main/modules"
+
+	tg "github.com/xAmarnath/gogram/telegram"
+	"github.com/fogleman/gg"
+	"github.com/golang/freetype/truetype"
+	"github.com/makiuchi-d/gozxing"
+	gzqr "github.com/makiuchi-d/gozxing/qrcode"
+	qrcode "github.com/skip2/go-qrcode"
+	"golang.org/x/image/draw"
+	_ "golang.org/x/image/webp"
 )
 
-func QRHandler(m *tg.NewMessage) error {
+const qrMaxText = 1200
+
+func qrTextArg(m *tg.NewMessage) string {
 	text := strings.TrimSpace(m.Args())
 	if text == "" && m.IsReply() {
-		r, err := m.GetReplyMessage()
-		if err == nil {
+		if r, err := m.GetReplyMessage(); err == nil && r != nil {
 			text = strings.TrimSpace(r.Text())
 		}
 	}
+	return text
+}
+
+func qrSendPNG(m *tg.NewMessage, status *modules.Status, img image.Image, caption, name string) {
+	var buf bytes.Buffer
+	if err := png.Encode(&buf, img); err != nil {
+		status.Edit("Couldn't encode the image: " + html.EscapeString(err.Error()))
+		return
+	}
+	status.Done()
+	if _, err := modules.TransferReplyMedia(m, buf.Bytes(), &tg.MediaOptions{Caption: caption, FileName: name, MimeType: "image/png"}); err != nil {
+		status.Edit("Couldn't send the image: " + html.EscapeString(err.Error()))
+	}
+}
+
+func qrCaption(text string) string {
+	shown := text
+	if r := []rune(shown); len(r) > 200 {
+		shown = string(r[:200]) + "…"
+	}
+	return "<b>QR code</b>\n<code>" + html.EscapeString(shown) + "</code>"
+}
+
+func QRHandler(m *tg.NewMessage) error {
+	text := qrTextArg(m)
 	if text == "" {
-		m.Reply("usage: /qr &lt;text&gt;")
+		m.Reply("Usage: <code>/qr &lt;text&gt;</code> or reply to a message")
 		return nil
 	}
-
-	endpoint := "https://api.qrserver.com/v1/create-qr-code/?size=512x512&data=" + url.QueryEscape(text)
-
-	req, err := http.NewRequest(http.MethodGet, endpoint, nil)
+	if len(text) > qrMaxText {
+		m.Reply(fmt.Sprintf("Text is too long for a QR code (max %d characters).", qrMaxText))
+		return nil
+	}
+	status := modules.NewStatus(m, "Generating QR code…")
+	q, err := qrcode.New(text, qrcode.Medium)
 	if err != nil {
-		m.Reply("error: " + html.EscapeString(err.Error()))
+		status.Edit("Couldn't make a QR code: " + html.EscapeString(err.Error()))
 		return nil
 	}
-	req.Header.Set("User-Agent", "JuliaBot/1.0")
-
-	client := &http.Client{Timeout: 30 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		m.Reply("error fetching qr: " + html.EscapeString(err.Error()))
-		return nil
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		m.Reply(fmt.Sprintf("qr api returned status %d", resp.StatusCode))
-		return nil
-	}
-
-	tmpPath := filepath.Join(os.TempDir(), fmt.Sprintf("qr_%d.png", time.Now().UnixNano()))
-	out, err := os.Create(tmpPath)
-	if err != nil {
-		m.Reply("error creating temp file: " + html.EscapeString(err.Error()))
-		return nil
-	}
-
-	if _, err := io.Copy(out, io.LimitReader(resp.Body, 5*1024*1024)); err != nil {
-		out.Close()
-		os.Remove(tmpPath)
-		m.Reply("error writing qr: " + html.EscapeString(err.Error()))
-		return nil
-	}
-	out.Close()
-	defer os.Remove(tmpPath)
-
-	caption := "<b>QR Code</b>\n<code>" + html.EscapeString(text) + "</code>"
-	_, err = m.ReplyMedia(tmpPath, &tg.MediaOptions{Caption: caption})
-	if err != nil {
-		m.Reply("error sending qr: " + html.EscapeString(err.Error()))
-		return nil
-	}
+	qrSendPNG(m, status, q.Image(1024), qrCaption(text), "qr.png")
 	return nil
 }
 
-func initFromSrc_qr_0_1() { modules.QueueHandlerRegistration(registerQRHandlers) }
-
-func registerQRHandlers() {
-	c := modules.Client
-	c.On("cmd:qr", QRHandler)
-}
-func qrColorNormalizeHex(s string) (string, error) {
-	s = strings.TrimSpace(s)
-	s = strings.TrimPrefix(s, "#")
-	s = strings.ToLower(s)
+func qrParseHex(s string) (color.RGBA, error) {
+	s = strings.TrimPrefix(strings.TrimSpace(s), "#")
 	if len(s) == 3 {
 		s = string([]byte{s[0], s[0], s[1], s[1], s[2], s[2]})
 	}
 	if len(s) != 6 {
-		return "", fmt.Errorf("invalid hex length")
+		return color.RGBA{}, fmt.Errorf("invalid hex color")
 	}
-	for i := 0; i < 6; i++ {
-		c := s[i]
-		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) {
-			return "", fmt.Errorf("invalid hex char")
-		}
+	v, err := strconv.ParseUint(s, 16, 32)
+	if err != nil {
+		return color.RGBA{}, fmt.Errorf("invalid hex color")
 	}
-	return s, nil
+	return color.RGBA{uint8(v >> 16), uint8(v >> 8), uint8(v), 255}, nil
 }
 
-func qrColorFetchPNG(text, fg, bg string) ([]byte, error) {
-	endpoint := fmt.Sprintf(
-		"https://api.qrserver.com/v1/create-qr-code/?size=512x512&data=%s&color=%s&bgcolor=%s",
-		url.QueryEscape(text), fg, bg,
-	)
-	client := &http.Client{Timeout: 30 * time.Second}
-	req, err := http.NewRequest(http.MethodGet, endpoint, nil)
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("User-Agent", "JuliaBot/1.0")
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("qr api returned status %d", resp.StatusCode)
-	}
-	ct := resp.Header.Get("Content-Type")
-	if !strings.HasPrefix(ct, "image/") {
-		return nil, fmt.Errorf("unexpected content-type: %s", ct)
-	}
-	data, err := io.ReadAll(io.LimitReader(resp.Body, 5*1024*1024))
-	if err != nil {
-		return nil, err
-	}
-	if len(data) == 0 {
-		return nil, fmt.Errorf("empty qr response")
-	}
-	return data, nil
+func qrLuminance(c color.RGBA) float64 {
+	return 0.2126*float64(c.R) + 0.7152*float64(c.G) + 0.0722*float64(c.B)
 }
 
 func QRColorHandler(m *tg.NewMessage) error {
-	raw := strings.TrimSpace(m.Args())
-	if raw == "" {
-		m.Reply("usage: <code>/qrcolor &lt;text&gt; &lt;fg_hex&gt; &lt;bg_hex&gt;</code>\nexample: <code>/qrcolor hello ff0000 ffffff</code>")
-		return nil
-	}
-
-	fields := strings.Fields(raw)
+	fields := strings.Fields(m.Args())
 	if len(fields) < 3 {
-		m.Reply("need at least 3 args: <code>&lt;text&gt; &lt;fg_hex&gt; &lt;bg_hex&gt;</code>")
+		m.Reply("Usage: <code>/qrcolor &lt;text&gt; &lt;fg_hex&gt; &lt;bg_hex&gt;</code>\nExample: <code>/qrcolor hello ff0000 ffffff</code>")
 		return nil
 	}
-
-	bgRaw := fields[len(fields)-1]
-	fgRaw := fields[len(fields)-2]
-	text := strings.TrimSpace(strings.Join(fields[:len(fields)-2], " "))
-	if text == "" {
-		m.Reply("text cannot be empty")
+	fg, err1 := qrParseHex(fields[len(fields)-2])
+	bg, err2 := qrParseHex(fields[len(fields)-1])
+	if err1 != nil || err2 != nil {
+		m.Reply("Colors must be hex like <code>ff0000</code> or <code>#f00</code>.")
 		return nil
 	}
-	if len(text) > 900 {
-		m.Reply("text too long, max 900 characters")
+	text := strings.Join(fields[:len(fields)-2], " ")
+	if len(text) > qrMaxText {
+		m.Reply(fmt.Sprintf("Text is too long for a QR code (max %d characters).", qrMaxText))
 		return nil
 	}
-
-	fg, err := qrColorNormalizeHex(fgRaw)
+	status := modules.NewStatus(m, "Generating QR code…")
+	q, err := qrcode.New(text, qrcode.Medium)
 	if err != nil {
-		m.Reply("invalid fg hex: " + html.EscapeString(fgRaw))
+		status.Edit("Couldn't make a QR code: " + html.EscapeString(err.Error()))
 		return nil
 	}
-	bg, err := qrColorNormalizeHex(bgRaw)
-	if err != nil {
-		m.Reply("invalid bg hex: " + html.EscapeString(bgRaw))
-		return nil
+	q.ForegroundColor, q.BackgroundColor = fg, bg
+	caption := qrCaption(text)
+	if math.Abs(qrLuminance(fg)-qrLuminance(bg)) < 90 {
+		caption += "\n<i>Low contrast between these colors — some scanners may not read it.</i>"
 	}
+	qrSendPNG(m, status, q.Image(1024), caption, "qr.png")
+	return nil
+}
 
-	status, _ := m.Reply("<code>generating colored qr...</code>")
+var qrArtPalettes = [][3]color.RGBA{
+	{{0x7f, 0x5a, 0xf0, 255}, {0x2c, 0xb5, 0xe8, 255}, {0x10, 0x12, 0x2a, 255}},
+	{{0xff, 0x5f, 0x6d, 255}, {0xff, 0xc3, 0x71, 255}, {0x1d, 0x10, 0x1f, 255}},
+	{{0x11, 0x99, 0x8e, 255}, {0x38, 0xef, 0x7d, 255}, {0x08, 0x1c, 0x1a, 255}},
+	{{0xf7, 0x79, 0x7d, 255}, {0xc6, 0x4b, 0xd8, 255}, {0x1a, 0x0b, 0x24, 255}},
+}
 
-	png, err := qrColorFetchPNG(text, fg, bg)
-	if err != nil {
-		msg := "error generating qr: " + html.EscapeString(err.Error())
-		if status != nil {
-			status.Edit(msg)
-		} else {
-			m.Reply(msg)
+func qrLerp(a, b color.RGBA, t float64) color.RGBA {
+	l := func(x, y uint8) uint8 { return uint8(float64(x) + (float64(y)-float64(x))*t) }
+	return color.RGBA{l(a.R, b.R), l(a.G, b.G), l(a.B, b.B), 255}
+}
+
+func qrArtFace(bold bool) *truetype.Font {
+	for _, p := range []string{"assets/Inter_28pt-Bold.ttf", "assets/NotoSans-Bold.ttf", "assets/GoNotoCurrent-Bold.ttf"} {
+		if !bold {
+			p = strings.Replace(strings.Replace(p, "-Bold", "-Regular", 1), "Inter_28pt-Regular", "NotoSans-Regular", 1)
 		}
-		return nil
-	}
-
-	tmp := filepath.Join(os.TempDir(), fmt.Sprintf("qrcolor_%d.png", time.Now().UnixNano()))
-	if werr := os.WriteFile(tmp, png, 0644); werr != nil {
-		msg := "error saving qr: " + html.EscapeString(werr.Error())
-		if status != nil {
-			status.Edit(msg)
-		} else {
-			m.Reply(msg)
+		if f := imgFont(p); f != nil {
+			return f
 		}
-		return nil
-	}
-	defer os.Remove(tmp)
-
-	preview := text
-	if len(preview) > 80 {
-		preview = preview[:77] + "..."
-	}
-	caption := fmt.Sprintf("<b>QR Colored</b>\n<b>Text:</b> <code>%s</code>\n<b>FG:</b> <code>#%s</code>  <b>BG:</b> <code>#%s</code>",
-		html.EscapeString(preview), fg, bg)
-
-	_, merr := m.ReplyMedia(tmp, &tg.MediaOptions{
-		Caption:  caption,
-		FileName: "qrcolor.png",
-		MimeType: "image/png",
-	})
-	if merr != nil {
-		msg := "upload failed: " + html.EscapeString(merr.Error())
-		if status != nil {
-			status.Edit(msg)
-		} else {
-			m.Reply(msg)
-		}
-		return nil
-	}
-	if status != nil {
-		status.Delete()
 	}
 	return nil
 }
 
-func initFromSrc_qr_image_1_1() { modules.QueueHandlerRegistration(registerQRColorHandlers) }
-
-func registerQRColorHandlers() {
-	c := modules.Client
-	c.On("cmd:qrcolor", QRColorHandler)
-}
-func fetchQRPrettyPNG(text string) ([]byte, error) {
-	endpoint := "https://api.qrserver.com/v1/create-qr-code/?size=200x200&data=" + url.QueryEscape(text)
-	client := &http.Client{Timeout: 30 * time.Second}
-	req, err := http.NewRequest(http.MethodGet, endpoint, nil)
-	if err != nil {
-		return nil, err
+func qrDarkEnough(c color.RGBA) color.RGBA {
+	for qrLuminance(c) > 105 {
+		c = color.RGBA{uint8(float64(c.R) * 0.88), uint8(float64(c.G) * 0.88), uint8(float64(c.B) * 0.88), 255}
 	}
-	req.Header.Set("User-Agent", "JuliaBot/1.0")
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("qr api returned status %d", resp.StatusCode)
-	}
-	data, err := io.ReadAll(io.LimitReader(resp.Body, 5*1024*1024))
-	if err != nil {
-		return nil, err
-	}
-	if len(data) == 0 {
-		return nil, fmt.Errorf("empty qr response")
-	}
-	return data, nil
+	return c
 }
 
-func qrPNGToASCII(data []byte) (string, error) {
-	img, _, err := image.Decode(bytes.NewReader(data))
+func qrIsFinder(x, y, n int) bool {
+	in := func(cx, cy int) bool { return x >= cx && x < cx+7 && y >= cy && y < cy+7 }
+	return in(0, 0) || in(n-7, 0) || in(0, n-7)
+}
+
+func renderQRArt(text string, palette [3]color.RGBA) (image.Image, error) {
+	q, err := qrcode.New(text, qrcode.High)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
-	bounds := img.Bounds()
-	w := bounds.Dx()
-	h := bounds.Dy()
-	if w == 0 || h == 0 {
-		return "", fmt.Errorf("invalid image dimensions")
+	q.DisableBorder = true
+	bits := q.Bitmap()
+	n := len(bits)
+	const W, H, pad = 1080, 1350, 110
+	cell := float64(W-2*pad-80) / float64(n)
+	qrSize := cell * float64(n)
+	ox, oy := (float64(W)-qrSize)/2, 230.0
+
+	dc := gg.NewContext(W, H)
+	bg := gg.NewLinearGradient(0, 0, W, H)
+	bg.AddColorStop(0, palette[2])
+	bg.AddColorStop(1, qrLerp(palette[2], palette[0], 0.35))
+	dc.SetFillStyle(bg)
+	dc.DrawRectangle(0, 0, W, H)
+	dc.Fill()
+
+	for i, c := range []struct{ x, y, r float64 }{{120, 140, 260}, {W - 90, H - 220, 320}} {
+		g := gg.NewRadialGradient(c.x, c.y, 0, c.x, c.y, c.r)
+		col := palette[i]
+		g.AddColorStop(0, color.NRGBA{col.R, col.G, col.B, 110})
+		g.AddColorStop(1, color.NRGBA{col.R, col.G, col.B, 0})
+		dc.SetFillStyle(g)
+		dc.DrawCircle(c.x, c.y, c.r)
+		dc.Fill()
 	}
 
-	cell := w / 50
-	if cell < 1 {
-		cell = 1
-	}
+	dc.SetRGBA255(255, 255, 255, 250)
+	dc.DrawRoundedRectangle(ox-40, oy-40, qrSize+80, qrSize+80, 48)
+	dc.Fill()
 
-	cols := w / cell
-	rows := h / cell
+	grad := gg.NewLinearGradient(ox, oy, ox+qrSize, oy+qrSize)
+	grad.AddColorStop(0, qrDarkEnough(palette[0]))
+	grad.AddColorStop(1, qrDarkEnough(palette[1]))
 
-	if cols > 80 {
-		cell = w / 60
-		if cell < 1 {
-			cell = 1
-		}
-		cols = w / cell
-		rows = h / cell
-	}
-
-	var sb strings.Builder
-	for ry := 0; ry < rows; ry += 2 {
-		for rx := 0; rx < cols; rx++ {
-			px := bounds.Min.X + rx*cell + cell/2
-			py1 := bounds.Min.Y + ry*cell + cell/2
-			py2 := bounds.Min.Y + (ry+1)*cell + cell/2
-
-			top := isDark(img, px, py1)
-			bot := false
-			if ry+1 < rows {
-				bot = isDark(img, px, py2)
+	for y := 0; y < n; y++ {
+		for x := 0; x < n; x++ {
+			if !bits[y][x] || qrIsFinder(x, y, n) {
+				continue
 			}
-
-			switch {
-			case top && bot:
-				sb.WriteString("█")
-			case top && !bot:
-				sb.WriteString("▀")
-			case !top && bot:
-				sb.WriteString("▄")
-			default:
-				sb.WriteString(" ")
-			}
+			cx, cy := ox+(float64(x)+0.5)*cell, oy+(float64(y)+0.5)*cell
+			dc.DrawCircle(cx, cy, cell*0.46)
 		}
-		sb.WriteString("\n")
 	}
-	return sb.String(), nil
-}
+	dc.SetFillStyle(grad)
+	dc.Fill()
 
-func isDark(img image.Image, x, y int) bool {
-	b := img.Bounds()
-	if x < b.Min.X {
-		x = b.Min.X
+	for _, f := range [][2]int{{0, 0}, {n - 7, 0}, {0, n - 7}} {
+		fx, fy := ox+float64(f[0])*cell, oy+float64(f[1])*cell
+		dc.DrawRoundedRectangle(fx, fy, 7*cell, 7*cell, 2.2*cell)
+		dc.SetFillStyle(grad)
+		dc.Fill()
+		dc.SetRGBA255(255, 255, 255, 255)
+		dc.DrawRoundedRectangle(fx+cell, fy+cell, 5*cell, 5*cell, 1.6*cell)
+		dc.Fill()
+		dc.DrawRoundedRectangle(fx+2*cell, fy+2*cell, 3*cell, 3*cell, 1.1*cell)
+		dc.SetFillStyle(grad)
+		dc.Fill()
 	}
-	if y < b.Min.Y {
-		y = b.Min.Y
+
+	if f := qrArtFace(true); f != nil {
+		dc.SetFontFace(truetype.NewFace(f, &truetype.Options{Size: 54}))
+		dc.SetRGBA255(255, 255, 255, 255)
+		dc.DrawStringAnchored("Scan me", W/2, 130, 0.5, 0.5)
 	}
-	if x >= b.Max.X {
-		x = b.Max.X - 1
+	label := text
+	if u, err := url.Parse(text); err == nil && u.Host != "" {
+		label = u.Host + strings.TrimSuffix(u.Path, "/")
 	}
-	if y >= b.Max.Y {
-		y = b.Max.Y - 1
+	if f := qrArtFace(false); f != nil {
+		dc.SetFontFace(truetype.NewFace(f, &truetype.Options{Size: 36}))
+		dc.SetRGBA255(255, 255, 255, 215)
+		lines := dc.WordWrap(label, W-2*pad)
+		if len(lines) > 2 {
+			lines = lines[:2]
+			lines[1] = strings.TrimRight(lines[1], " ") + "…"
+		}
+		for i, line := range lines {
+			dc.DrawStringAnchored(line, W/2, oy+qrSize+110+float64(i)*50, 0.5, 0.5)
+		}
 	}
-	r, g, bl, _ := img.At(x, y).RGBA()
-	lum := (uint32(r) + uint32(g) + uint32(bl)) / 3
-	return lum < 0x8000
+	return dc.Image(), nil
 }
 
 func QRArtHandler(m *tg.NewMessage) error {
-	text := strings.TrimSpace(m.Args())
-	if text == "" && m.IsReply() {
-		r, err := m.GetReplyMessage()
-		if err == nil {
-			text = strings.TrimSpace(r.Text())
-		}
-	}
+	text := qrTextArg(m)
 	if text == "" {
-		m.Reply("usage: <code>/qrart &lt;text&gt;</code>\nor reply to a message with <code>/qrart</code>")
+		m.Reply("Usage: <code>/qrart &lt;text&gt;</code> or reply to a message")
 		return nil
 	}
-	if len(text) > 100 {
-		m.Reply("text too long, max 100 characters")
+	if len(text) > 600 {
+		m.Reply("Text is too long for a styled QR code (max 600 characters). Use /qr for longer text.")
 		return nil
 	}
-
-	status, _ := m.Reply("<code>generating qr art...</code>")
-
-	png, err := fetchQRPrettyPNG(text)
+	status := modules.NewStatus(m, "Designing your QR code…")
+	palette := qrArtPalettes[int(uint32(len(text)*31+int(text[0])))%len(qrArtPalettes)]
+	img, err := renderQRArt(text, palette)
 	if err != nil {
-		msg := "error generating qr: " + html.EscapeString(err.Error())
-		if status != nil {
-			status.Edit(msg)
-		} else {
-			m.Reply(msg)
-		}
+		status.Edit("Couldn't make a QR code: " + html.EscapeString(err.Error()))
 		return nil
 	}
-
-	art, err := qrPNGToASCII(png)
-	if err != nil {
-		msg := "error converting qr: " + html.EscapeString(err.Error())
-		if status != nil {
-			status.Edit(msg)
-		} else {
-			m.Reply(msg)
-		}
-		return nil
-	}
-
-	out := "<pre>" + html.EscapeString(art) + "</pre>"
-	if len(out) > 4000 {
-		out = out[:3990] + "</pre>"
-	}
-
-	if status != nil {
-		status.Edit(out)
-	} else {
-		m.Reply(out)
-	}
+	qrSendPNG(m, status, img, qrCaption(text), "qr-art.png")
 	return nil
 }
 
-func initFromSrc_qr_pretty_2_1() { modules.QueueHandlerRegistration(registerQRArtHandlers) }
-
-func registerQRArtHandlers() {
-	c := modules.Client
-	c.On("cmd:qrart", QRArtHandler)
-}
-type qrServerSymbol struct {
-	Seq   int     `json:"seq"`
-	Data  string  `json:"data"`
-	Error *string `json:"error"`
-}
-
-type qrServerResult struct {
-	Type   string           `json:"type"`
-	Symbol []qrServerSymbol `json:"symbol"`
-}
-
-func decodeQRFromFile(path string) (string, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return "", err
+func decodeQRImage(img image.Image) (string, error) {
+	reader := gzqr.NewQRCodeReader()
+	hints := map[gozxing.DecodeHintType]any{gozxing.DecodeHintType_TRY_HARDER: true}
+	try := func(src image.Image) (string, error) {
+		bmp, err := gozxing.NewBinaryBitmapFromImage(src)
+		if err != nil {
+			return "", err
+		}
+		res, err := reader.Decode(bmp, hints)
+		if err != nil {
+			return "", err
+		}
+		return res.GetText(), nil
 	}
-	defer f.Close()
-
-	var body bytes.Buffer
-	writer := multipart.NewWriter(&body)
-	part, err := writer.CreateFormFile("file", filepath.Base(path))
-	if err != nil {
-		return "", err
+	if text, err := try(img); err == nil {
+		return text, nil
 	}
-	if _, err := io.Copy(part, f); err != nil {
-		return "", err
-	}
-	writer.Close()
-
-	req, err := http.NewRequest(http.MethodPost, "https://api.qrserver.com/v1/read-qr-code/", &body)
-	if err != nil {
-		return "", err
-	}
-	req.Header.Set("Content-Type", writer.FormDataContentType())
-	req.Header.Set("User-Agent", "JuliaBot/1.0")
-
-	client := &http.Client{Timeout: 30 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("qr api returned status %d", resp.StatusCode)
-	}
-
-	raw, err := io.ReadAll(io.LimitReader(resp.Body, 2*1024*1024))
-	if err != nil {
-		return "", err
-	}
-
-	var results []qrServerResult
-	if err := json.Unmarshal(raw, &results); err != nil {
-		return "", fmt.Errorf("invalid response: %s", strings.TrimSpace(string(raw)))
-	}
-
-	var decoded []string
-	var lastErr string
-	for _, r := range results {
-		for _, s := range r.Symbol {
-			if s.Error != nil && *s.Error != "" {
-				lastErr = *s.Error
-				continue
-			}
-			if strings.TrimSpace(s.Data) != "" {
-				decoded = append(decoded, s.Data)
-			}
+	b := img.Bounds()
+	for _, target := range []int{1200, 600, 2000} {
+		longest := max(b.Dx(), b.Dy())
+		if longest == 0 || longest == target {
+			continue
+		}
+		scale := float64(target) / float64(longest)
+		dst := image.NewRGBA(image.Rect(0, 0, int(float64(b.Dx())*scale), int(float64(b.Dy())*scale)))
+		draw.CatmullRom.Scale(dst, dst.Bounds(), img, b, draw.Src, nil)
+		if text, err := try(dst); err == nil {
+			return text, nil
 		}
 	}
-
-	if len(decoded) == 0 {
-		if lastErr != "" {
-			return "", fmt.Errorf("%s", lastErr)
-		}
-		return "", fmt.Errorf("no qr code detected")
-	}
-
-	return strings.Join(decoded, "\n"), nil
+	return "", fmt.Errorf("no QR code found")
 }
 
 func QRReadHandler(m *tg.NewMessage) error {
 	if !m.IsReply() {
-		m.Reply("usage: reply to a QR-code image with <code>/qrread</code>")
+		m.Reply("Usage: reply to an image containing a QR code with <code>/qrread</code>")
 		return nil
 	}
 	r, err := m.GetReplyMessage()
-	if err != nil {
-		m.Reply("error: " + html.EscapeString(err.Error()))
+	if err != nil || r == nil || !r.IsMedia() {
+		m.Reply("The replied message has no image.")
 		return nil
 	}
-	if !r.IsMedia() {
-		m.Reply("the replied message has no media")
-		return nil
-	}
-
-	status, _ := m.Reply("<code>downloading image...</code>")
-
-	path, err := m.Client.DownloadMedia(r.Media())
+	status := modules.NewStatus(m, "Reading QR code…")
+	path, err := modules.TransferDownload(r)
 	if err != nil {
-		msg := "error downloading: " + html.EscapeString(err.Error())
-		if status != nil {
-			status.Edit(msg)
-		} else {
-			m.Reply(msg)
-		}
+		status.Edit("Couldn't download the image: " + html.EscapeString(err.Error()))
 		return nil
 	}
 	defer os.Remove(path)
-
-	if status != nil {
-		status.Edit("<code>decoding qr...</code>")
-	}
-
-	text, err := decodeQRFromFile(path)
+	f, err := os.Open(path)
 	if err != nil {
-		msg := "error decoding qr: " + html.EscapeString(err.Error())
-		if status != nil {
-			status.Edit(msg)
-		} else {
-			m.Reply(msg)
-		}
+		status.Edit("Couldn't open the image.")
 		return nil
 	}
-
-	out := "<b>QR Decoded</b>\n<code>" + html.EscapeString(text) + "</code>"
-	if status != nil {
-		status.Edit(out)
-	} else {
-		m.Reply(out)
+	img, _, err := image.Decode(f)
+	f.Close()
+	if err != nil {
+		status.Edit("That file isn't an image I can read (use a photo, PNG, JPG, GIF or WEBP).")
+		return nil
 	}
+	text, err := decodeQRImage(img)
+	if err != nil {
+		status.Edit("I couldn't find a readable QR code in that image. Try a sharper, closer photo.")
+		return nil
+	}
+	out := "<b>QR decoded</b>\n<code>" + html.EscapeString(text) + "</code>"
+	opts := &tg.SendOptions{LinkPreview: false}
+	if u, err := url.Parse(text); err == nil && (u.Scheme == "http" || u.Scheme == "https") && u.Host != "" {
+		opts.ReplyMarkup = tg.NewKeyboard().AddRow(tg.Button.URL("Open link", text)).Build()
+	}
+	status.Edit(out, opts)
 	return nil
 }
 
-func initFromSrc_qrcode_decode_3_1() { modules.QueueHandlerRegistration(registerQRReadHandlers) }
-
-func registerQRReadHandlers() {
-	c := modules.Client
-	c.On("cmd:qrread", QRReadHandler)
-}
-
 func init() {
-	initFromSrc_qr_0_1()
-	initFromSrc_qr_image_1_1()
-	initFromSrc_qr_pretty_2_1()
-	initFromSrc_qrcode_decode_3_1()
+	modules.QueueHandlerRegistration(func() {
+		c := modules.Client
+		modules.OnCommand(c, "cmd:qr", QRHandler)
+		modules.OnCommand(c, "cmd:qrcolor", QRColorHandler)
+		modules.OnCommand(c, "cmd:qrart", QRArtHandler)
+		modules.OnCommand(c, "cmd:qrread", QRReadHandler)
+	})
 }

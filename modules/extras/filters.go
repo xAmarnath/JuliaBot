@@ -2,288 +2,425 @@ package extras
 
 import (
 	"fmt"
+	"html"
 	"main/modules/db"
-	"regexp"
 	"sort"
+	"strconv"
 	"strings"
+	"sync"
+	"time"
+	"unicode/utf8"
 
-	tg "github.com/amarnathcjd/gogram/telegram"
+	tg "github.com/xAmarnath/gogram/telegram"
 	modules "main/modules"
 )
 
+const maxFiltersPerChat = 300
+
+type compiledFilter struct {
+	f *db.Filter
+	t *trigger
+}
+
+type filterState struct {
+	at       time.Time
+	ttl      time.Duration
+	filters  []*db.Filter
+	compiled []compiledFilter
+}
+
+var (
+	filtersMu    sync.RWMutex
+	filtersCache = map[int64]*filterState{}
+)
+
+func invalidateFilters(chatID int64) {
+	filtersMu.Lock()
+	delete(filtersCache, chatID)
+	filtersMu.Unlock()
+}
+
+func loadFilterState(chatID int64) *filterState {
+	filtersMu.RLock()
+	st, ok := filtersCache[chatID]
+	filtersMu.RUnlock()
+	if ok && time.Since(st.at) < st.ttl {
+		return st
+	}
+	st = &filterState{at: time.Now(), ttl: triggerCacheTTL}
+	list, err := db.GetAllFilters(chatID)
+	if err != nil {
+		st.ttl = triggerErrTTL
+	}
+	st.filters = list
+	for _, f := range list {
+		if t, err := compileTrigger(f.Keyword); err == nil {
+			st.compiled = append(st.compiled, compiledFilter{f: f, t: t})
+		}
+	}
+	// Longer plain keywords first so "good morning" wins over "morning"; regexes last.
+	sort.SliceStable(st.compiled, func(i, j int) bool {
+		a, b := st.compiled[i].t, st.compiled[j].t
+		if a.isRegex() != b.isRegex() {
+			return !a.isRegex()
+		}
+		return len(a.word) > len(b.word)
+	})
+	filtersMu.Lock()
+	filtersCache[chatID] = st
+	filtersMu.Unlock()
+	return st
+}
+
+// formattedTail returns text[byteStart:] as HTML, keeping the sender's formatting entities.
+func formattedTail(text string, entities []tg.MessageEntity, byteStart int) string {
+	if byteStart < 0 || byteStart > len(text) {
+		return ""
+	}
+	tail := text[byteStart:]
+	shift := int32(utf16Len(text[:byteStart]))
+	tailLen := int32(utf16Len(tail))
+	var tags []tg.Tag
+	for _, tag := range tg.ParseEntitiesToTags(entities) {
+		switch tag.Type {
+		case "mention":
+			continue
+		case "a":
+			if tag.Attrs["href"] == "" || tag.Attrs["href"] == "mailto:" {
+				continue
+			}
+		}
+		start, end := tag.Offset-shift, tag.Offset+tag.Length-shift
+		if end <= 0 || start >= tailLen {
+			continue
+		}
+		start = max(start, 0)
+		end = min(end, tailLen)
+		tag.Offset, tag.Length = start, end-start
+		tags = append(tags, tag)
+	}
+	return strings.TrimSpace(tg.InsertTagsIntoText(tail, tags))
+}
+
+func utf16Len(s string) int {
+	n := 0
+	for _, r := range s {
+		if r >= 0x10000 {
+			n += 2
+		} else {
+			n++
+		}
+	}
+	return n
+}
+
+// argsStart is the byte offset in text right after the command token and following spaces.
+func argsStart(text string) int {
+	return len(text) - len(modules.CommandArgs(text))
+}
+
+type savedMedia struct {
+	kind, fileID string
+}
+
+func mediaOfMessage(msg *tg.NewMessage) savedMedia {
+	if msg == nil || !msg.IsMedia() || msg.File == nil || msg.File.FileID == "" {
+		return savedMedia{}
+	}
+	kind := ""
+	switch {
+	case msg.Sticker() != nil:
+		kind = "sticker"
+	case msg.Animation() != nil:
+		kind = "animation"
+	case msg.Video() != nil:
+		kind = "video"
+	case msg.Voice() != nil:
+		kind = "voice"
+	case msg.Audio() != nil:
+		kind = "audio"
+	case msg.Photo() != nil:
+		kind = "photo"
+	case msg.Document() != nil:
+		kind = "document"
+	default:
+		return savedMedia{}
+	}
+	return savedMedia{kind: kind, fileID: msg.File.FileID}
+}
+
 func FilterHandler(m *tg.NewMessage) error {
-	if m.IsPrivate() {
-		m.Reply("<b>Filters work in groups only.</b>")
+	if !modules.RequireGroup(m) {
+		return nil
+	}
+	if !modules.SenderHasRight(m, "change_info") {
+		m.Reply("You need the <b>Change Info</b> admin right to add filters.")
 		return nil
 	}
 
-	if !modules.IsUserAdmin(m.Client, m.SenderID(), m.ChatID(), "change_info") {
-		m.Reply("<b>Permission denied.</b> You need Change Info permission to add filters.")
+	text := m.Text()
+	args := modules.CommandArgs(text)
+	if args == "" {
+		m.Reply("<b>Usage:</b>\n<code>/filter keyword reply text</code>\n<code>/filter \"multi word\" reply text</code>\n<code>/filter regex:pattern reply text</code>\nOr reply to a message/media with <code>/filter keyword</code>.")
 		return nil
 	}
-
-	args := m.Args()
-	if args == "" && !m.IsReply() {
-		m.Reply("<b>Usage:</b> <code>/filter keyword response</code> or reply with <code>/filter keyword</code>")
+	keyRaw, rest := splitQuotedFirst(args)
+	t, err := compileTrigger(keyRaw)
+	if err != nil {
+		m.Reply("Invalid keyword: " + html.EscapeString(err.Error()) + ".")
 		return nil
 	}
+	key := normalizeTriggerKey(keyRaw)
 
-	parts := strings.SplitN(args, " ", 2)
-	keyword := strings.ToLower(strings.TrimSpace(parts[0]))
-
-	if keyword == "" {
-		m.Reply("<b>Error:</b> Keyword required.")
-		return nil
-	}
-
-	if len(keyword) < 2 {
-		m.Reply("<b>Error:</b> Keyword must be at least 2 characters.")
-		return nil
-	}
-
-	filter := &db.Filter{
-		Keyword: keyword,
-		AddedBy: m.SenderID(),
+	filter := &db.Filter{Keyword: key, AddedBy: m.SenderID()}
+	if rest != "" {
+		if idx := strings.LastIndex(text, rest); idx >= 0 {
+			filter.Content = formattedTail(text, m.Message.Entities, idx)
+		} else {
+			filter.Content = html.EscapeString(rest)
+		}
 	}
 
 	if m.IsReply() {
 		reply, err := m.GetReplyMessage()
-		if err != nil {
-			m.Reply("Error getting reply message")
+		if err != nil || reply == nil {
+			m.Reply("I couldn't read the replied message. Please try again.")
 			return nil
 		}
-
-		if reply.IsMedia() {
-			if reply.Photo() != nil {
-				filter.MediaType = "photo"
-				filter.FileID = reply.File.FileID
-			} else if reply.Document() != nil {
-				filter.MediaType = "document"
-				filter.FileID = reply.File.FileID
-			} else if reply.Video() != nil {
-				filter.MediaType = "video"
-				filter.FileID = reply.File.FileID
-			} else if reply.Audio() != nil {
-				filter.MediaType = "audio"
-				filter.FileID = reply.File.FileID
-			} else if reply.Sticker() != nil {
-				filter.MediaType = "sticker"
-				filter.FileID = reply.File.FileID
-			} else if reply.Animation() != nil {
-				filter.MediaType = "animation"
-				filter.FileID = reply.File.FileID
-			}
+		media := mediaOfMessage(reply)
+		filter.MediaType, filter.FileID = media.kind, media.fileID
+		if filter.Content == "" && reply.Message != nil {
+			filter.Content = formattedTail(reply.Text(), reply.Message.Entities, 0)
 		}
-
-		filter.Content = reply.Text()
-		if len(parts) > 1 && strings.TrimSpace(parts[1]) != "" {
-			filter.Content = parts[1]
-		}
-	} else {
-		if len(parts) < 2 {
-			m.Reply("<b>Error:</b> Provide response or reply to a message.")
-			return nil
-		}
-		filter.Content = parts[1]
 	}
 
 	if filter.Content == "" && filter.FileID == "" {
-		m.Reply("<b>Error:</b> Filter response required.")
+		m.Reply("Please give a reply text, or reply to a message or media to use as the response.")
 		return nil
 	}
 
-	if err := db.SaveFilter(m.ChatID(), filter); err != nil {
-		m.Reply("<b>Failed to save filter.</b> Please try again.")
+	chatID := m.ChatID()
+	st := loadFilterState(chatID)
+	exists := false
+	for _, f := range st.filters {
+		if f.Keyword == key {
+			exists = true
+			break
+		}
+	}
+	if !exists && len(st.filters) >= maxFiltersPerChat {
+		m.Reply(fmt.Sprintf("This chat already has the maximum of %d filters. Remove some with /stop first.", maxFiltersPerChat))
 		return nil
 	}
 
-	m.Reply(fmt.Sprintf("<b>Filter saved:</b> <code>%s</code>", keyword))
+	if err := db.SaveFilter(chatID, filter); err != nil {
+		m.Reply("I couldn't save the filter right now. Please try again.")
+		return nil
+	}
+	invalidateFilters(chatID)
+
+	kind := "Keyword"
+	if t.isRegex() {
+		kind = "Regex"
+	}
+	verb := "saved"
+	if exists {
+		verb = "updated"
+	}
+	m.Reply(fmt.Sprintf("Filter %s. %s: <code>%s</code>", verb, kind, html.EscapeString(key)))
 	return nil
 }
 
+func findFilterKey(st *filterState, raw string) string {
+	candidates := []string{normalizeTriggerKey(raw), strings.TrimSpace(raw), strings.ToLower(strings.TrimSpace(raw))}
+	for _, c := range candidates {
+		for _, f := range st.filters {
+			if f.Keyword == c {
+				return c
+			}
+		}
+	}
+	return ""
+}
+
 func StopFilterHandler(m *tg.NewMessage) error {
-	if m.IsPrivate() {
-		m.Reply("<b>Filters work in groups only.</b>")
+	if !modules.RequireGroup(m) {
 		return nil
 	}
-
-	if !modules.IsUserAdmin(m.Client, m.SenderID(), m.ChatID(), "change_info") {
-		m.Reply("<b>Permission denied.</b> You need Change Info permission to remove filters.")
+	if !modules.SenderHasRight(m, "change_info") {
+		m.Reply("You need the <b>Change Info</b> admin right to remove filters.")
 		return nil
 	}
-
-	keyword := strings.ToLower(strings.TrimSpace(m.Args()))
-	if keyword == "" {
-		m.Reply("<b>Usage:</b> <code>/stop keyword</code>")
+	args := modules.CommandArgs(m.Text())
+	if args == "" {
+		m.Reply("<b>Usage:</b> <code>/stop keyword</code> (use quotes for multi-word keywords, or <code>regex:pattern</code>)")
 		return nil
 	}
-
-	filter, _ := db.GetFilter(m.ChatID(), keyword)
-	if filter == nil {
-		m.Reply(fmt.Sprintf("<b>Not found:</b> No filter for <code>%s</code>", keyword))
+	raw := args
+	if strings.HasPrefix(args, `"`) || strings.HasPrefix(args, "“") {
+		raw, _ = splitQuotedFirst(args)
+	}
+	chatID := m.ChatID()
+	key := findFilterKey(loadFilterState(chatID), raw)
+	if key == "" {
+		m.Reply(fmt.Sprintf("There's no filter for <code>%s</code>. See /filters.", html.EscapeString(raw)))
 		return nil
 	}
-
-	if err := db.DeleteFilter(m.ChatID(), keyword); err != nil {
-		m.Reply("<b>Failed to delete filter.</b> Please try again.")
+	if err := db.DeleteFilter(chatID, key); err != nil {
+		m.Reply("I couldn't remove the filter right now. Please try again.")
 		return nil
 	}
-
-	m.Reply(fmt.Sprintf("<b>Filter removed:</b> <code>%s</code>", keyword))
+	invalidateFilters(chatID)
+	m.Reply(fmt.Sprintf("Filter removed: <code>%s</code>", html.EscapeString(key)))
 	return nil
 }
 
 func ListFiltersHandler(m *tg.NewMessage) error {
-	if m.IsPrivate() {
-		m.Reply("<b>Filters work in groups only.</b>")
+	if !modules.RequireGroup(m) {
 		return nil
 	}
-
-	filters, err := db.GetAllFilters(m.ChatID())
-	if err != nil || len(filters) == 0 {
-		m.Reply("<b>No filters yet.</b> Create one with <code>/filter keyword response</code>")
+	st := loadFilterState(m.ChatID())
+	if len(st.filters) == 0 {
+		m.Reply("No filters in this chat yet. Add one with <code>/filter keyword reply</code>.")
 		return nil
 	}
-
-	sort.Slice(filters, func(i, j int) bool {
-		return filters[i].Keyword < filters[j].Keyword
-	})
-
-	var resp strings.Builder
-	resp.WriteString("<b>Saved Filters</b>\n")
-	resp.WriteString("━━━━━━━━━━━━━━━━\n\n")
-
-	mediaCount := 0
-	for _, filter := range filters {
+	list := append([]*db.Filter(nil), st.filters...)
+	sort.Slice(list, func(i, j int) bool { return list[i].Keyword < list[j].Keyword })
+	lines := make([]string, 0, len(list))
+	media := 0
+	for _, f := range list {
 		marker := ""
-		if filter.FileID != "" {
-			marker = " [M]"
-			mediaCount++
+		if f.FileID != "" {
+			marker = " [" + html.EscapeString(f.MediaType) + "]"
+			media++
 		}
-		resp.WriteString(fmt.Sprintf(" • <code>%s</code>%s\n", filter.Keyword, marker))
+		lines = append(lines, " • <code>"+html.EscapeString(f.Keyword)+"</code>"+marker)
 	}
-
-	resp.WriteString(fmt.Sprintf("\n━━━━━━━━━━━━━━━━\n<b>Total:</b> %d filters", len(filters)))
-	if mediaCount > 0 {
-		resp.WriteString(fmt.Sprintf(" (%d with media)", mediaCount))
+	footer := fmt.Sprintf("\n<b>Total:</b> %d filters", len(list))
+	if media > 0 {
+		footer += fmt.Sprintf(" (%d with media)", media)
 	}
-
-	m.Reply(resp.String())
+	sendChunked(m, "<b>Filters in this chat:</b>\n\n", lines, footer)
 	return nil
 }
 
 func StopAllFiltersHandler(m *tg.NewMessage) error {
-	if m.IsPrivate() {
-		m.Reply("<b>Filters work in groups only.</b>")
+	if !modules.RequireGroup(m) {
 		return nil
 	}
-
-	if !modules.IsUserAdmin(m.Client, m.SenderID(), m.ChatID(), "change_info") {
-		m.Reply("<b>Permission denied.</b> You need Change Info permission to remove filters.")
+	if !modules.SenderHasRight(m, "change_info") {
+		m.Reply("You need the <b>Change Info</b> admin right to remove filters.")
 		return nil
 	}
-
-	count, _ := db.GetFiltersCount(m.ChatID())
+	count := len(loadFilterState(m.ChatID()).filters)
 	if count == 0 {
-		m.Reply("<b>No filters to delete.</b>")
+		m.Reply("There are no filters to delete.")
 		return nil
 	}
-
 	b := tg.Button
 	m.Reply(
-		fmt.Sprintf("<b>Delete all %d filters?</b>\n\nThis cannot be undone.", count),
+		fmt.Sprintf("<b>Delete all %d filters?</b> This can't be undone.", count),
 		&tg.SendOptions{
 			ReplyMarkup: tg.NewKeyboard().AddRow(
-				b.Data("Delete", fmt.Sprintf("stopall_%d", m.SenderID())),
+				b.Data("Delete all", fmt.Sprintf("stopall_%d", m.SenderID())),
 				b.Data("Cancel", fmt.Sprintf("cancelfilters_%d", m.SenderID())),
 			).Build(),
 		},
 	)
-
 	return nil
 }
 
 func StopAllFiltersCallback(c *tg.CallbackQuery) error {
 	data := c.DataString()
-
+	owner := ""
 	if after, ok := strings.CutPrefix(data, "cancelfilters_"); ok {
-		userID := after
-		if fmt.Sprint(c.SenderID) != userID {
-			c.Answer("Not for you", &tg.CallbackOptions{Alert: true})
-			return nil
-		}
-		c.Edit("<b>Cancelled.</b>")
+		owner = after
+	} else if after, ok := strings.CutPrefix(data, "stopall_"); ok {
+		owner = after
+	}
+	if strconv.FormatInt(c.GetSenderID(), 10) != owner {
+		c.Answer("This button isn't for you.", &tg.CallbackOptions{Alert: true})
 		return nil
 	}
-
-	if after, ok := strings.CutPrefix(data, "stopall_"); ok {
-		userID := after
-		if fmt.Sprint(c.SenderID) != userID {
-			c.Answer("Not for you", &tg.CallbackOptions{Alert: true})
-			return nil
-		}
-
-		chatID := c.ChatID
-		count, _ := db.GetFiltersCount(chatID)
-
-		if err := db.DeleteAllFilters(chatID); err != nil {
-			c.Edit("<b>Failed to delete filters.</b>")
-			return nil
-		}
-
-		c.Edit(fmt.Sprintf("<b>Deleted:</b> %d filters", count))
+	if strings.HasPrefix(data, "cancelfilters_") {
+		c.Edit("Cancelled.")
+		return nil
 	}
-
+	if !modules.CallbackHasRight(c, "change_info") {
+		c.Answer("You no longer have the Change Info admin right.", &tg.CallbackOptions{Alert: true})
+		return nil
+	}
+	chatID := c.ChatID
+	count := len(loadFilterState(chatID).filters)
+	if err := db.DeleteAllFilters(chatID); err != nil {
+		c.Edit("I couldn't delete the filters right now. Please try again.")
+		return nil
+	}
+	invalidateFilters(chatID)
+	c.Edit(fmt.Sprintf("Deleted <b>%d</b> filters.", count))
 	return nil
 }
 
 func FilterWatcher(m *tg.NewMessage) error {
-	if m.IsPrivate() || m.Text() == "" || m.IsCommand() {
+	if m == nil || m.Message == nil || m.Message.Out || m.Action != nil || !modules.IsGroupChat(m) {
 		return nil
 	}
-
-	filters, err := db.GetAllFilters(m.ChatID())
-	if err != nil || len(filters) == 0 {
+	text := m.Text()
+	if text == "" || isCommandMessage(m) {
 		return nil
 	}
-
-	msgLower := strings.ToLower(m.Text())
-
-	for _, filter := range filters {
-		pattern := `(?i)\b` + regexp.QuoteMeta(filter.Keyword) + `\b`
-		matched, _ := regexp.MatchString(pattern, msgLower)
-
-		if matched {
-			// Parse buttons from filter content
-			buttons, cleanContent := ParseButtonsFromText(filter.Content)
-
-			if filter.FileID != "" {
-				opts := &tg.MediaOptions{Caption: cleanContent}
-				if len(buttons) > 0 {
-					opts.ReplyMarkup = BuildButtonKeyboard(buttons)
-				}
-				file, _ := tg.ResolveBotFileID(filter.FileID)
-				m.ReplyMedia(file, opts)
-			} else if cleanContent != "" {
-				if len(buttons) > 0 {
-					m.Reply(cleanContent, &tg.SendOptions{ReplyMarkup: BuildButtonKeyboard(buttons)})
-				} else {
-					m.Reply(cleanContent)
-				}
-			}
-			break
+	st := loadFilterState(m.ChatID())
+	if len(st.compiled) == 0 {
+		return nil
+	}
+	lower := strings.ToLower(text)
+	for _, cf := range st.compiled {
+		if cf.t.match(text, lower) {
+			sendFilterReply(m, cf.f)
+			return nil
 		}
 	}
-
 	return nil
+}
+
+func sendFilterReply(m *tg.NewMessage, f *db.Filter) {
+	content, rows := parseButtons(f.Content)
+	kb := buildKeyboard(rows)
+
+	if f.FileID != "" {
+		media, err := tg.ResolveBotFileID(f.FileID)
+		if err == nil {
+			opts := &tg.MediaOptions{ReplyMarkup: kb}
+			captionFits := f.MediaType != "sticker" && utf8.RuneCountInString(content) <= 1024
+			if captionFits {
+				opts.Caption = content
+			}
+			if _, err := modules.TransferReplyMedia(m, media, opts); err == nil {
+				if !captionFits && content != "" {
+					m.Reply(content)
+				}
+				return
+			}
+		}
+	}
+	if content == "" {
+		return
+	}
+	opts := &tg.SendOptions{}
+	if kb != nil {
+		opts.ReplyMarkup = kb
+	}
+	if _, err := m.Reply(content, opts); err != nil {
+		m.Reply(html.EscapeString(content), opts)
+	}
 }
 
 func registerFiltersHandlers() {
 	c := modules.Client
-	c.On("cmd:filter", FilterHandler)
-	c.On("cmd:stop", StopFilterHandler)
-	c.On("cmd:filters", ListFiltersHandler)
-	c.On("cmd:stopall", StopAllFiltersHandler)
+	modules.OnCommand(c, "cmd:filter", FilterHandler)
+	modules.OnCommand(c, "cmd:stop", StopFilterHandler)
+	modules.OnCommand(c, "cmd:filters", ListFiltersHandler)
+	modules.OnCommand(c, "cmd:stopall", StopAllFiltersHandler)
 	c.On("callback:stopall_", StopAllFiltersCallback)
 	c.On("callback:cancelfilters_", StopAllFiltersCallback)
 	c.On(tg.OnNewMessage, FilterWatcher)
@@ -292,27 +429,31 @@ func registerFiltersHandlers() {
 func init() {
 	modules.QueueHandlerRegistration(registerFiltersHandlers)
 
-	modules.Mods.AddModule("Filters", `<b>Content Filters</b>
-
-Set automatic responses or deletion for keywords.
+	modules.Mods.AddModule("Filters", `<b>Filters</b>
+Auto-reply when a message contains a keyword or matches a pattern. One reply per message; longer keywords win over shorter ones.
 
 <b>Commands:</b>
-/filter [keyword] [response] - Add filter with response (or reply to message)
-/stop [keyword] - Remove filter
-/filters - View all active filters
-/stopall - Delete all filters
+ • <code>/filter &lt;keyword&gt; &lt;reply&gt;</code> - add or replace a filter. Formatting (bold, links...) is kept.
+ • <code>/filter "&lt;multi word keyword&gt;" &lt;reply&gt;</code> - keyword with spaces.
+ • <code>/filter regex:&lt;pattern&gt; &lt;reply&gt;</code> - trigger on a regular expression.
+ • <code>/filter &lt;keyword&gt;</code> (reply to a message) - reply with that message's text, photo, video, GIF, sticker, voice, audio or file. Text after the keyword becomes the caption.
+ • <code>/stop &lt;keyword&gt;</code> - remove a filter (<code>/stop regex:pattern</code> for regexes).
+ • <code>/filters</code> - list all filters.
+ • <code>/stopall</code> - remove every filter (asks for confirmation).
+Adding/removing needs the Change Info admin right.
 
-<b>Behavior:</b>
-Triggers when keyword appears as a complete word.
-Example: "hello" triggers on "hello there" but not "helloworld".
+<b>Matching</b>
+ • Keywords are case-insensitive whole words: <code>hello</code> triggers on "Hello there!" but not "helloworld". Works with any language.
+ • <code>regex:</code> uses Go (RE2) syntax, case-insensitive, max 256 characters, checked against the first 4096 characters. Use <code>\s</code> instead of spaces in the pattern. Patterns matching everything are rejected.
+ • Commands never trigger filters.
 
-<b>Add Buttons:</b>
-Use format: <code>[Button Text](https://example.com)</code>
-Example: <code>/filter spam [Report](url) | [Info](url)</code>
+<b>Buttons:</b> add <code>[Text](https://link)</code> to the reply; start the text with <code>same:</code> to keep it on the previous row, e.g. <code>[Site](https://example.com) [same:Docs](https://example.com/docs)</code>. <code>[Rules](rules)</code> shows the chat rules.
 
 <b>Examples:</b>
-• /filter spam - Auto-delete messages with "spam"
-• /filter rules Check the rules! - Reply to keyword
-
-<b>Permission:</b> Admins with Change Info permission only.`)
+<code>/filter hello Hi there, welcome!</code>
+<code>/filter "how are you" I'm a bot, but thanks!</code>
+<code>/filter regex:^(hi|hey|yo)\b Hey!</code>
+<code>/filter regex:discord\.gg/\w+ No invite links please.</code>
+<code>/filter rules Read the [Rules](rules)</code>
+<code>/stop hello</code>`)
 }

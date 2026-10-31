@@ -4,11 +4,12 @@ import (
 	"crypto/rand"
 	"encoding/binary"
 	"fmt"
+	"html"
 	"strings"
 
 	modules "main/modules"
 
-	tg "github.com/amarnathcjd/gogram/telegram"
+	tg "github.com/xAmarnath/gogram/telegram"
 )
 
 func ephemeralRandomID() int64 {
@@ -37,7 +38,7 @@ func sendEphemeralIn(m *tg.NewMessage, chat tg.InputPeer, receiver *tg.InputUser
 		RandomID:   ephemeralRandomID(),
 	})
 	if err != nil {
-		m.Reply("Ephemeral send failed: " + err.Error())
+		m.Reply("Ephemeral send failed: " + html.EscapeString(err.Error()))
 		return nil
 	}
 	if deleteTrigger {
@@ -54,14 +55,14 @@ func EphemeralHandler(m *tg.NewMessage) error {
 		m.Reply("Usage: <code>/ep &lt;text&gt;</code> — sends a message only you can see.")
 		return nil
 	}
-	chat, err := m.Client.ResolvePeer(m.ChatID())
+	chat, err := m.Client.ResolvePeer(m.ChannelID())
 	if err != nil {
-		m.Reply("Failed to resolve chat: " + err.Error())
+		m.Reply("Failed to resolve chat: " + html.EscapeString(err.Error()))
 		return nil
 	}
 	receiver, err := toInputUser(m.Client, m.SenderID())
 	if err != nil {
-		m.Reply("Failed to resolve sender: " + err.Error())
+		m.Reply("Failed to resolve sender: " + html.EscapeString(err.Error()))
 		return nil
 	}
 	return sendEphemeralIn(m, chat, receiver, text, true)
@@ -93,7 +94,7 @@ func WhisperHandler(m *tg.NewMessage) error {
 		}
 		chat, err := m.Client.ResolvePeer(chatTok)
 		if err != nil {
-			m.Reply("Couldn't resolve chat <code>" + chatTok + "</code>: " + err.Error())
+			m.Reply("Couldn't resolve chat <code>" + html.EscapeString(chatTok) + "</code>: " + html.EscapeString(err.Error()))
 			return nil
 		}
 		if _, isUser := chat.(*tg.InputPeerUser); isUser {
@@ -102,15 +103,15 @@ func WhisperHandler(m *tg.NewMessage) error {
 		}
 		receiver, err := toInputUser(m.Client, userTok)
 		if err != nil {
-			m.Reply("Couldn't resolve user <code>" + userTok + "</code>: " + err.Error())
+			m.Reply("Couldn't resolve user <code>" + html.EscapeString(userTok) + "</code>: " + html.EscapeString(err.Error()))
 			return nil
 		}
 		return sendEphemeralIn(m, chat, receiver, text, false)
 	}
 
-	chat, err := m.Client.ResolvePeer(m.ChatID())
+	chat, err := m.Client.ResolvePeer(m.ChannelID())
 	if err != nil {
-		m.Reply("Failed to resolve chat: " + err.Error())
+		m.Reply("Failed to resolve chat: " + html.EscapeString(err.Error()))
 		return nil
 	}
 
@@ -123,9 +124,13 @@ func WhisperHandler(m *tg.NewMessage) error {
 			m.Reply("Couldn't read the replied-to message.")
 			return nil
 		}
+		if reply.SenderID() == 0 || reply.Sender == nil {
+			m.Reply("The replied-to message isn't from a user.")
+			return nil
+		}
 		receiver, err = toInputUser(m.Client, reply.SenderID())
 		if err != nil {
-			m.Reply("Couldn't resolve reply target: " + err.Error())
+			m.Reply("Couldn't resolve reply target: " + html.EscapeString(err.Error()))
 			return nil
 		}
 		text = strings.TrimSpace(m.Args())
@@ -134,7 +139,8 @@ func WhisperHandler(m *tg.NewMessage) error {
 		text = strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(m.Args()), target))
 		receiver, err = toInputUser(m.Client, target)
 		if err != nil {
-			m.Reply("Couldn't resolve <code>" + target + "</code>: " + err.Error())
+			m.Reply("Couldn't resolve <code>" + html.EscapeString(target) + "</code>: " + html.EscapeString(err.Error()))
+
 			return nil
 		}
 	}
@@ -148,9 +154,9 @@ func WhisperHandler(m *tg.NewMessage) error {
 
 func registerEphemeralHandlers() {
 	c := modules.Client
-	c.On("cmd:ep", EphemeralHandler)
-	c.On("cmd:wsp", WhisperHandler)
-	c.On("cmd:whisper", WhisperHandler)
+	modules.OnCommand(c, "cmd:ep", EphemeralHandler)
+	modules.OnCommand(c, "cmd:wsp", WhisperHandler)
+	modules.OnCommand(c, "cmd:whisper", WhisperHandler)
 }
 
 func init() {

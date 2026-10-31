@@ -5,7 +5,7 @@ import (
 	"strconv"
 	"time"
 
-	bolt "go.etcd.io/bbolt"
+	"main/internal/mongostore"
 )
 
 type Note struct {
@@ -19,8 +19,8 @@ type Note struct {
 	Buttons   string    `json:"buttons,omitempty"`
 }
 
-func ensureNotesBuckets(db *bolt.DB) error {
-	return db.Update(func(tx *bolt.Tx) error {
+func ensureNotesBuckets(db *mongostore.DB) error {
+	return db.Update(func(tx *mongostore.Tx) error {
 
 		_, err := tx.CreateBucketIfNotExists([]byte("notes"))
 		return err
@@ -32,11 +32,11 @@ func SaveNote(chatID int64, note *Note) error {
 	if err != nil {
 		return err
 	}
-	if err := ensureNotesBuckets(db); err != nil {
+	if err := ensureBucketsOnce("notes", db, ensureNotesBuckets); err != nil {
 		return err
 	}
 
-	return db.Update(func(tx *bolt.Tx) error {
+	return db.Update(func(tx *mongostore.Tx) error {
 		notesBucket := tx.Bucket([]byte("notes"))
 		chatBucket, err := notesBucket.CreateBucketIfNotExists([]byte(strconv.FormatInt(chatID, 10)))
 		if err != nil {
@@ -57,12 +57,12 @@ func GetNote(chatID int64, name string) (*Note, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := ensureNotesBuckets(db); err != nil {
+	if err := ensureBucketsOnce("notes", db, ensureNotesBuckets); err != nil {
 		return nil, err
 	}
 
 	var note *Note
-	err = db.View(func(tx *bolt.Tx) error {
+	err = db.View(func(tx *mongostore.Tx) error {
 		notesBucket := tx.Bucket([]byte("notes"))
 		if notesBucket == nil {
 			return nil
@@ -100,12 +100,12 @@ func GetAllNotes(chatID int64) ([]*Note, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := ensureNotesBuckets(db); err != nil {
+	if err := ensureBucketsOnce("notes", db, ensureNotesBuckets); err != nil {
 		return nil, err
 	}
 
 	var notes []*Note
-	err = db.View(func(tx *bolt.Tx) error {
+	err = db.View(func(tx *mongostore.Tx) error {
 		notesBucket := tx.Bucket([]byte("notes"))
 		if notesBucket == nil {
 			return nil
@@ -134,11 +134,11 @@ func DeleteNote(chatID int64, name string) error {
 	if err != nil {
 		return err
 	}
-	if err := ensureNotesBuckets(db); err != nil {
+	if err := ensureBucketsOnce("notes", db, ensureNotesBuckets); err != nil {
 		return err
 	}
 
-	return db.Update(func(tx *bolt.Tx) error {
+	return db.Update(func(tx *mongostore.Tx) error {
 		notesBucket := tx.Bucket([]byte("notes"))
 		if notesBucket == nil {
 			return nil
@@ -157,11 +157,11 @@ func DeleteAllNotes(chatID int64) error {
 	if err != nil {
 		return err
 	}
-	if err := ensureNotesBuckets(db); err != nil {
+	if err := ensureBucketsOnce("notes", db, ensureNotesBuckets); err != nil {
 		return err
 	}
 
-	return db.Update(func(tx *bolt.Tx) error {
+	return db.Update(func(tx *mongostore.Tx) error {
 		notesBucket := tx.Bucket([]byte("notes"))
 		if notesBucket == nil {
 			return nil
@@ -175,12 +175,12 @@ func GetNotesCount(chatID int64) (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	if err := ensureNotesBuckets(db); err != nil {
+	if err := ensureBucketsOnce("notes", db, ensureNotesBuckets); err != nil {
 		return 0, err
 	}
 
 	count := 0
-	err = db.View(func(tx *bolt.Tx) error {
+	err = db.View(func(tx *mongostore.Tx) error {
 		notesBucket := tx.Bucket([]byte("notes"))
 		if notesBucket == nil {
 			return nil

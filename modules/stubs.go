@@ -4,7 +4,7 @@ import (
 	"strings"
 	"sync"
 
-	tg "github.com/amarnathcjd/gogram/telegram"
+	tg "github.com/xAmarnath/gogram/telegram"
 )
 
 func ExtractText(m *tg.NewMessage) string {

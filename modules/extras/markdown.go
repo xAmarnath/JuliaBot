@@ -11,7 +11,7 @@ import (
 
 	modules "main/modules"
 
-	tg "github.com/amarnathcjd/gogram/telegram"
+	tg "github.com/xAmarnath/gogram/telegram"
 )
 
 var (
@@ -261,7 +261,7 @@ func initFromSrc_markdown_convert_0_1() {
 }
 func registerMarkdownConvertHandlers() {
 	c := modules.Client
-	c.On("cmd:markdown", MarkdownConvertHandler)
+	modules.OnCommand(c, "cmd:markdown", MarkdownConvertHandler)
 }
 
 func extractJSONPayload(m *tg.NewMessage) string {
@@ -690,10 +690,10 @@ func YamlCvtHandler(m *tg.NewMessage) error {
 
 func registerJsonPrettyHandlers() {
 	c := modules.Client
-	c.On("cmd:jsonpretty", JsonPrettyHandler)
-	c.On("cmd:jsonmin", JsonMinHandler)
-	c.On("cmd:jsonvalid", JsonValidHandler)
-	c.On("cmd:yamlcvt", YamlCvtHandler)
+	modules.OnCommand(c, "cmd:jsonpretty", JsonPrettyHandler)
+	modules.OnCommand(c, "cmd:jsonmin", JsonMinHandler)
+	modules.OnCommand(c, "cmd:jsonvalid", JsonValidHandler)
+	modules.OnCommand(c, "cmd:yamlcvt", YamlCvtHandler)
 }
 
 func initFromSrc_json_pretty_2_1() {

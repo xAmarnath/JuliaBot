@@ -3,11 +3,12 @@ package extras
 import (
 	"encoding/json"
 	"fmt"
-	tg "github.com/amarnathcjd/gogram/telegram"
+	tg "github.com/xAmarnath/gogram/telegram"
 	"html"
 	"io"
 	modules "main/modules"
 	"net/http"
+	"net/url"
 	"os"
 	"path"
 	"path/filepath"
@@ -85,8 +86,8 @@ type ghCommitInner struct {
 }
 
 type ghCommit struct {
-	SHA    string        `json:"sha"`
-	Commit ghCommitInner `json:"commit"`
+	SHA     string        `json:"sha"`
+	Commit  ghCommitInner `json:"commit"`
 	HTMLURL string        `json:"html_url"`
 }
 
@@ -572,7 +573,7 @@ func GithubUserHandler(m *tg.NewMessage) error {
 	avatarPath, derr := ghDownloadImage(c.user.AvatarURL, c.user.Login)
 	if derr == nil && avatarPath != "" {
 		defer os.Remove(avatarPath)
-		_, merr := m.ReplyMedia(avatarPath, &tg.MediaOptions{
+		_, merr := modules.TransferReplyMedia(m, avatarPath, &tg.MediaOptions{
 			Caption:     caption,
 			FileName:    c.user.Login + ".jpg",
 			MimeType:    "image/jpeg",
@@ -638,7 +639,7 @@ func GithubRepoHandler(m *tg.NewMessage) error {
 	avatarPath, derr := ghDownloadImage(c.repo.Owner.AvatarURL, c.repo.Owner.Login)
 	if derr == nil && avatarPath != "" {
 		defer os.Remove(avatarPath)
-		_, merr := m.ReplyMedia(avatarPath, &tg.MediaOptions{
+		_, merr := modules.TransferReplyMedia(m, avatarPath, &tg.MediaOptions{
 			Caption:     caption,
 			FileName:    c.repo.Owner.Login + ".jpg",
 			MimeType:    "image/jpeg",
@@ -669,11 +670,12 @@ func GithubRepoHandler(m *tg.NewMessage) error {
 
 func registerGithubHandlers() {
 	c := modules.Client
-	c.On("cmd:gh", GithubUserHandler)
-	c.On("cmd:repo", GithubRepoHandler)
+	modules.OnCommand(c, "cmd:gh", GithubUserHandler)
+	modules.OnCommand(c, "cmd:repo", GithubRepoHandler)
 }
 
 func initFromSrc_github_0_1() { modules.QueueHandlerRegistration(registerGithubHandlers) }
+
 type ghContribDay struct {
 	Date              string `json:"date"`
 	ContributionCount int    `json:"contributionCount"`
@@ -744,7 +746,7 @@ func ghContribStreaks(days []ghContribDay) (current, longest int, lastActive str
 }
 
 func ghContribFetch(user string) (*ghContribResponse, int, error) {
-	endpoint := "https://github-contributions-api.deno.dev/" + user + ".json"
+	endpoint := "https://github-contributions-api.jogruber.de/v4/" + url.PathEscape(user) + "?y=last"
 	req, err := http.NewRequest(http.MethodGet, endpoint, nil)
 	if err != nil {
 		return nil, 0, err
@@ -763,11 +765,23 @@ func ghContribFetch(user string) (*ghContribResponse, int, error) {
 	if resp.StatusCode != http.StatusOK {
 		return nil, resp.StatusCode, fmt.Errorf("status %d", resp.StatusCode)
 	}
-	var out ghContribResponse
-	if err := json.Unmarshal(body, &out); err != nil {
+	var raw struct {
+		Total struct {
+			LastYear int `json:"lastYear"`
+		} `json:"total"`
+		Contributions []struct {
+			Date  string `json:"date"`
+			Count int    `json:"count"`
+		} `json:"contributions"`
+	}
+	if err := json.Unmarshal(body, &raw); err != nil {
 		return nil, resp.StatusCode, err
 	}
-	return &out, resp.StatusCode, nil
+	days := make([]ghContribDay, 0, len(raw.Contributions))
+	for _, d := range raw.Contributions {
+		days = append(days, ghContribDay{Date: d.Date, ContributionCount: d.Count})
+	}
+	return &ghContribResponse{Contributions: [][]ghContribDay{days}, TotalContributions: raw.Total.LastYear}, resp.StatusCode, nil
 }
 
 func GhContribHandler(m *tg.NewMessage) error {
@@ -853,10 +867,11 @@ func GhContribHandler(m *tg.NewMessage) error {
 
 func registerGhContribHandlers() {
 	c := modules.Client
-	c.On("cmd:ghcontrib", GhContribHandler)
+	modules.OnCommand(c, "cmd:ghcontrib", GhContribHandler)
 }
 
 func initFromSrc_github_contribs_1_1() { modules.QueueHandlerRegistration(registerGhContribHandlers) }
+
 var (
 	ghEmojiMu      sync.RWMutex
 	ghEmojiCache   map[string]string
@@ -936,9 +951,10 @@ func GitHubEmojiHandler(m *tg.NewMessage) error {
 		return nil
 	}
 
+	status := modules.NewStatus(m, "Fetching emoji…")
 	emojis, err := loadGithubEmojis()
 	if err != nil {
-		m.Reply("Failed to fetch GitHub emojis. Try again later.")
+		status.Edit("Failed to fetch GitHub emojis. Try again later.")
 		return nil
 	}
 
@@ -963,10 +979,10 @@ func GitHubEmojiHandler(m *tg.NewMessage) error {
 				b.WriteString(html.EscapeString(s))
 				b.WriteString("</code>")
 			}
-			m.Reply(fmt.Sprintf("<b>No emoji found for:</b> <code>%s</code>\n<b>Did you mean:</b> %s", html.EscapeString(name), b.String()))
+			status.Edit(fmt.Sprintf("<b>No emoji found for:</b> <code>%s</code>\n<b>Did you mean:</b> %s", html.EscapeString(name), b.String()))
 			return nil
 		}
-		m.Reply(fmt.Sprintf("<b>No GitHub emoji found for:</b> <code>%s</code>", html.EscapeString(name)))
+		status.Edit(fmt.Sprintf("<b>No GitHub emoji found for:</b> <code>%s</code>", html.EscapeString(name)))
 		return nil
 	}
 
@@ -974,7 +990,7 @@ func GitHubEmojiHandler(m *tg.NewMessage) error {
 
 	imgBytes, mime, derr := downloadGithubEmojiImage(url)
 	if derr != nil || len(imgBytes) == 0 {
-		m.Reply(caption, &tg.SendOptions{LinkPreview: true})
+		status.Edit(caption, &tg.SendOptions{LinkPreview: true})
 		return nil
 	}
 
@@ -984,12 +1000,13 @@ func GitHubEmojiHandler(m *tg.NewMessage) error {
 	}
 	fileName := name + ext
 
-	if _, err := m.ReplyMedia(imgBytes, &tg.MediaOptions{
+	status.Done()
+	if _, err := modules.TransferReplyMedia(m, imgBytes, &tg.MediaOptions{
 		Caption:  caption,
 		FileName: fileName,
 		MimeType: mime,
 	}); err != nil {
-		m.Reply(caption, &tg.SendOptions{LinkPreview: true})
+		status.Edit(caption, &tg.SendOptions{LinkPreview: true})
 	}
 	return nil
 }
@@ -997,8 +1014,9 @@ func GitHubEmojiHandler(m *tg.NewMessage) error {
 func initFromSrc_github_emoji_2_1() { modules.QueueHandlerRegistration(registerGitHubEmojiHandlers) }
 func registerGitHubEmojiHandlers() {
 	c := modules.Client
-	c.On("cmd:ghemoji", GitHubEmojiHandler)
+	modules.OnCommand(c, "cmd:ghemoji", GitHubEmojiHandler)
 }
+
 type ghIssueLabel struct {
 	Name string `json:"name"`
 }
@@ -1323,11 +1341,12 @@ func GithubIssueDetailHandler(m *tg.NewMessage) error {
 
 func registerGithubIssuesHandlers() {
 	c := modules.Client
-	c.On("cmd:ghissues", GithubIssuesListHandler)
-	c.On("cmd:ghissue", GithubIssueDetailHandler)
+	modules.OnCommand(c, "cmd:ghissues", GithubIssuesListHandler)
+	modules.OnCommand(c, "cmd:ghissue", GithubIssueDetailHandler)
 }
 
 func initFromSrc_github_issues_3_1() { modules.QueueHandlerRegistration(registerGithubIssuesHandlers) }
+
 var ghrelHTTPClient = &http.Client{Timeout: 30 * time.Second}
 
 type ghrelAuthor struct {
@@ -1559,7 +1578,7 @@ func GithubReleaseHandler(m *tg.NewMessage) error {
 
 func registerGithubReleaseHandlers() {
 	c := modules.Client
-	c.On("cmd:ghrelease", GithubReleaseHandler)
+	modules.OnCommand(c, "cmd:ghrelease", GithubReleaseHandler)
 }
 
 func initFromSrc_github_releases_4_1() {

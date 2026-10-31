@@ -4,143 +4,22 @@ import (
 	"encoding/json"
 	"fmt"
 	"html"
+	"log"
 	"main/modules/db"
 	"math/rand"
 	"os"
 	"path/filepath"
-	"regexp"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
-	tg "github.com/amarnathcjd/gogram/telegram"
 	"github.com/fogleman/gg"
-	bolt "go.etcd.io/bbolt"
+	tg "github.com/xAmarnath/gogram/telegram"
+	"main/internal/mongostore"
 	modules "main/modules"
 )
-
-func formatWelcomeText(text string, user *tg.UserObj, chat *tg.Channel) string {
-	if user == nil {
-		return text
-	}
-
-	chatTitle := ""
-	if chat != nil {
-		chatTitle = chat.Title
-	}
-
-	mention := fmt.Sprintf("<a href=\"tg://user?id=%d\">%s</a>", user.ID, user.FirstName)
-
-	replacements := map[string]string{
-		"{first}":     user.FirstName,
-		"{last}":      user.LastName,
-		"{fullname}":  strings.TrimSpace(user.FirstName + " " + user.LastName),
-		"{username}":  "@" + user.Username,
-		"{mention}":   mention,
-		"{id}":        strconv.FormatInt(user.ID, 10),
-		"{chatname}":  chatTitle,
-		"{chattitle}": chatTitle,
-	}
-
-	result := text
-	for placeholder, value := range replacements {
-		if value == "@" {
-			value = mention
-		}
-		result = strings.ReplaceAll(result, placeholder, value)
-	}
-
-	return result
-}
-
-func SetWelcomeHandler(m *tg.NewMessage) error {
-	if m.IsPrivate() {
-		m.Reply("Welcome message can only be set in groups")
-		return nil
-	}
-
-	if !modules.IsUserAdmin(m.Client, m.SenderID(), m.ChatID(), "change_info") {
-		m.Reply("You need Change Info permission to set welcome message")
-		return nil
-	}
-
-	welcomeMsg := &db.WelcomeMessage{Enabled: true}
-
-	if m.IsReply() {
-		reply, err := m.GetReplyMessage()
-		if err != nil {
-			m.Reply("Error getting reply message")
-			return nil
-		}
-
-		if reply.IsMedia() {
-			if reply.Photo() != nil && reply.File != nil {
-				welcomeMsg.MediaType = "photo"
-				welcomeMsg.FileID = reply.File.FileID
-			} else if reply.Document() != nil && reply.File != nil {
-				welcomeMsg.MediaType = "document"
-				welcomeMsg.FileID = reply.File.FileID
-			} else if reply.Video() != nil && reply.File != nil {
-				welcomeMsg.MediaType = "video"
-				welcomeMsg.FileID = reply.File.FileID
-			} else if reply.Animation() != nil && reply.File != nil {
-				welcomeMsg.MediaType = "animation"
-				welcomeMsg.FileID = reply.File.FileID
-			} else if reply.Sticker() != nil && reply.File != nil {
-				welcomeMsg.MediaType = "sticker"
-				welcomeMsg.FileID = reply.File.FileID
-			}
-		}
-
-		welcomeMsg.Content = reply.RawText()
-		if m.Args() != "" {
-			welcomeMsg.Content = m.Args()
-		}
-	} else {
-		welcomeMsg.Content = m.Args()
-	}
-
-	if welcomeMsg.Content == "" && welcomeMsg.FileID == "" {
-		m.Reply(`<b>Set Welcome Message</b>
-
-Usage: /setwelcome <message> or reply to a message
-
-<b>Available variables:</b>
- - {first} - User's first name
- - {last} - User's last name
- - {fullname} - User's full name
- - {username} - User's @username
- - {mention} - Clickable mention
- - {id} - User's ID
- - {chatname} - Chat title
-
-<b>Button Format:</b>
- - [Button Text](https://url)
- - [same:Button](https://url) - Same row
- - [Rules](rules) - Show rules button`)
-		return nil
-	}
-
-	cleanContent, buttons := parseButtons(welcomeMsg.Content)
-	welcomeMsg.Content = cleanContent
-	if len(buttons) > 0 {
-		welcomeMsg.Buttons = serializeButtons(buttons)
-	}
-
-	if err := db.SetWelcome(m.ChatID(), welcomeMsg); err != nil {
-		m.Reply("Failed to save welcome message")
-		return nil
-	}
-
-	mediaTag := ""
-	if welcomeMsg.FileID != "" {
-		mediaTag = " [with media]"
-	}
-
-	m.Reply(fmt.Sprintf("Welcome message saved%s", mediaTag))
-	return nil
-}
 
 func serializeButtons(buttons [][]tg.KeyboardInlineButton) string {
 	var lines []string
@@ -171,408 +50,6 @@ func serializeButtons(buttons [][]tg.KeyboardInlineButton) string {
 	return strings.Join(lines, "\n")
 }
 
-func SetGoodbyeHandler(m *tg.NewMessage) error {
-	if m.IsPrivate() {
-		m.Reply("Goodbye message can only be set in groups")
-		return nil
-	}
-
-	if !modules.IsUserAdmin(m.Client, m.SenderID(), m.ChatID(), "change_info") {
-		m.Reply("You need Change Info permission to set goodbye message")
-		return nil
-	}
-
-	goodbyeMsg := &db.WelcomeMessage{Enabled: true}
-
-	if m.IsReply() {
-		reply, err := m.GetReplyMessage()
-		if err != nil {
-			m.Reply("Error getting reply message")
-			return nil
-		}
-
-		if reply.IsMedia() {
-			if reply.Photo() != nil {
-				goodbyeMsg.MediaType = "photo"
-				goodbyeMsg.FileID = reply.File.FileID
-			} else if reply.Document() != nil {
-				goodbyeMsg.MediaType = "document"
-				goodbyeMsg.FileID = reply.File.FileID
-			} else if reply.Video() != nil {
-				goodbyeMsg.MediaType = "video"
-				goodbyeMsg.FileID = reply.File.FileID
-			} else if reply.Animation() != nil {
-				goodbyeMsg.MediaType = "animation"
-				goodbyeMsg.FileID = reply.File.FileID
-			}
-		}
-
-		goodbyeMsg.Content = reply.RawText()
-		if m.Args() != "" {
-			goodbyeMsg.Content = m.Args()
-		}
-	} else {
-		goodbyeMsg.Content = m.Args()
-	}
-
-	if goodbyeMsg.Content == "" && goodbyeMsg.FileID == "" {
-		m.Reply(`<b>Set Goodbye Message</b>
-
-Usage: /setgoodbye <message> or reply to a message
-
-<b>Available variables:</b>
- - {first} - User's first name
- - {last} - User's last name
- - {fullname} - User's full name
- - {username} - User's @username
- - {mention} - Clickable mention
- - {id} - User's ID
- - {chatname} - Chat title`)
-		return nil
-	}
-
-	if err := db.SetGoodbye(m.ChatID(), goodbyeMsg); err != nil {
-		m.Reply("Failed to save goodbye message")
-		return nil
-	}
-
-	m.Reply("Goodbye message saved")
-	return nil
-}
-
-func WelcomeToggleHandler(m *tg.NewMessage) error {
-	if m.IsPrivate() {
-		m.Reply("Welcome settings can only be changed in groups")
-		return nil
-	}
-
-	if !modules.IsUserAdmin(m.Client, m.SenderID(), m.ChatID(), "change_info") {
-		m.Reply("You need Change Info permission to modify welcome settings")
-		return nil
-	}
-
-	args := strings.ToLower(strings.TrimSpace(m.Args()))
-
-	welcomeMsg, _ := db.GetWelcome(m.ChatID())
-	if welcomeMsg == nil {
-		welcomeMsg = &db.WelcomeMessage{Enabled: false}
-	}
-
-	switch args {
-	case "on", "yes", "enable", "1":
-		welcomeMsg.Enabled = true
-		db.SetWelcome(m.ChatID(), welcomeMsg)
-		m.Reply("Welcome messages enabled")
-	case "off", "no", "disable", "0":
-		welcomeMsg.Enabled = false
-		db.SetWelcome(m.ChatID(), welcomeMsg)
-		m.Reply("Welcome messages disabled")
-	default:
-		status := "disabled"
-		if welcomeMsg.Enabled {
-			status = "enabled"
-		}
-		m.Reply(fmt.Sprintf("Welcome is currently <b>%s</b>\n\nUsage: /welcome on/off", status))
-	}
-	return nil
-}
-
-func GoodbyeToggleHandler(m *tg.NewMessage) error {
-	if m.IsPrivate() {
-		m.Reply("Goodbye settings can only be changed in groups")
-		return nil
-	}
-
-	if !modules.IsUserAdmin(m.Client, m.SenderID(), m.ChatID(), "change_info") {
-		m.Reply("You need Change Info permission to modify goodbye settings")
-		return nil
-	}
-
-	args := strings.ToLower(strings.TrimSpace(m.Args()))
-
-	goodbyeMsg, _ := db.GetGoodbye(m.ChatID())
-	if goodbyeMsg == nil {
-		goodbyeMsg = &db.WelcomeMessage{Enabled: false}
-	}
-
-	switch args {
-	case "on", "yes", "enable", "1":
-		goodbyeMsg.Enabled = true
-		db.SetGoodbye(m.ChatID(), goodbyeMsg)
-		m.Reply("Goodbye messages enabled")
-	case "off", "no", "disable", "0":
-		goodbyeMsg.Enabled = false
-		db.SetGoodbye(m.ChatID(), goodbyeMsg)
-		m.Reply("Goodbye messages disabled")
-	default:
-		status := "disabled"
-		if goodbyeMsg.Enabled {
-			status = "enabled"
-		}
-		m.Reply(fmt.Sprintf("Goodbye is currently <b>%s</b>\n\nUsage: /goodbye on/off", status))
-	}
-	return nil
-}
-
-func ClearWelcomeHandler(m *tg.NewMessage) error {
-	if m.IsPrivate() {
-		m.Reply("Welcome can only be cleared in groups")
-		return nil
-	}
-
-	if !modules.IsUserAdmin(m.Client, m.SenderID(), m.ChatID(), "change_info") {
-		m.Reply("You need Change Info permission to clear welcome")
-		return nil
-	}
-
-	db.SetWelcome(m.ChatID(), &db.WelcomeMessage{})
-	m.Reply("Welcome message cleared")
-	return nil
-}
-
-func ClearGoodbyeHandler(m *tg.NewMessage) error {
-	if m.IsPrivate() {
-		m.Reply("Goodbye can only be cleared in groups")
-		return nil
-	}
-
-	if !modules.IsUserAdmin(m.Client, m.SenderID(), m.ChatID(), "change_info") {
-		m.Reply("You need Change Info permission to clear goodbye")
-		return nil
-	}
-
-	db.SetGoodbye(m.ChatID(), &db.WelcomeMessage{})
-	m.Reply("Goodbye message cleared")
-	return nil
-}
-
-func WelcomeHandler(p *tg.ParticipantUpdate) error {
-	if !p.IsJoined() && !p.IsAdded() {
-		return nil
-	}
-	user := p.User
-	if user == nil || user.Bot {
-		return nil
-	}
-	chatID := p.ChatID()
-
-	if reason, matched := joinFilterMatch(chatID, user); matched {
-		joinFilterBan(p.Client, chatID, user, reason)
-		return nil
-	}
-
-	if getCaptchaConfig(chatID).Enabled {
-		startCaptcha(p)
-		return nil
-	}
-	sendWelcome(p.Client, chatID, user)
-	return nil
-}
-
-func sendWelcome(client *tg.Client, chatID int64, user *tg.UserObj) {
-	if user == nil {
-		return
-	}
-
-	welcomeMsg, err := db.GetWelcome(chatID)
-	if err != nil {
-		return
-	}
-
-	if welcomeMsg != nil && welcomeMsg.DeletePrevious {
-		if lastID, _ := db.GetLastWelcomeID(chatID); lastID > 0 {
-			client.DeleteMessages(chatID, []int32{int32(lastID)})
-		}
-	}
-
-	content := ""
-	fileID := ""
-	buttons := ""
-	autoDelete := 0
-	if welcomeMsg != nil {
-		content = welcomeMsg.Content
-		fileID = welcomeMsg.FileID
-		buttons = welcomeMsg.Buttons
-		autoDelete = welcomeMsg.AutoDeleteSec
-	}
-
-	if content == "" && fileID == "" {
-		content = "Hey {mention}, welcome to {chatname}!"
-	}
-
-	channel, _ := client.GetChannel(chatID)
-	text := formatWelcomeText(content, user, channel)
-
-	var keyboard *tg.ReplyInlineMarkup
-	if buttons != "" {
-		_, btns := parseButtons(buttons)
-		keyboard = buildKeyboard(btns)
-	}
-
-	var sentMsg tg.NewMessage
-	if fileID != "" {
-		media, err := tg.ResolveBotFileID(fileID)
-		if err == nil {
-			msg, err := client.SendMedia(chatID, media, &tg.MediaOptions{Caption: text, ReplyMarkup: keyboard})
-			if err == nil {
-				sentMsg = *msg
-			}
-		}
-	} else if text != "" {
-		opts := &tg.SendOptions{}
-		if keyboard != nil {
-			opts.ReplyMarkup = keyboard
-		}
-		msg, err := client.SendMessage(chatID, text, opts)
-		if err == nil {
-			sentMsg = *msg
-		}
-	}
-
-	if sentMsg.ID > 0 {
-		db.SetLastWelcomeID(chatID, int(sentMsg.ID))
-		if autoDelete > 0 {
-			go func() {
-				time.Sleep(time.Duration(autoDelete) * time.Second)
-				client.DeleteMessages(chatID, []int32{int32(sentMsg.ID)})
-			}()
-		}
-	}
-}
-
-func WelcomeSettingsHandler(m *tg.NewMessage) error {
-	if m.IsPrivate() {
-		m.Reply("Welcome settings can only be viewed in groups")
-		return nil
-	}
-
-	welcomeMsg, _ := db.GetWelcome(m.ChatID())
-	goodbyeMsg, _ := db.GetGoodbye(m.ChatID())
-
-	welcomeStatus := "not set"
-	if welcomeMsg != nil && (welcomeMsg.Content != "" || welcomeMsg.FileID != "") {
-		if welcomeMsg.Enabled {
-			welcomeStatus = "enabled"
-		} else {
-			welcomeStatus = "disabled"
-		}
-	}
-
-	goodbyeStatus := "not set"
-	if goodbyeMsg != nil && (goodbyeMsg.Content != "" || goodbyeMsg.FileID != "") {
-		if goodbyeMsg.Enabled {
-			goodbyeStatus = "enabled"
-		} else {
-			goodbyeStatus = "disabled"
-		}
-	}
-
-	m.Reply(fmt.Sprintf(`<b>Greetings Settings</b>
-
-<b>Welcome:</b> %s
-<b>Goodbye:</b> %s
-
-<b>Commands:</b>
- /setwelcome - Set welcome message
- /setgoodbye - Set goodbye message
- /welcome on/off - Toggle welcome
- /goodbye on/off - Toggle goodbye
- /clearwelcome - Clear welcome
- /cleargoodbye - Clear goodbye`, welcomeStatus, goodbyeStatus))
-	return nil
-}
-
-func CleanServiceHandler(m *tg.NewMessage) error {
-	if m.IsPrivate() {
-		m.Reply("This can only be used in groups")
-		return nil
-	}
-
-	if !modules.IsUserAdmin(m.Client, m.SenderID(), m.ChatID(), "change_info") {
-		m.Reply("You need Change Info permission")
-		return nil
-	}
-
-	args := strings.ToLower(strings.TrimSpace(m.Args()))
-
-	welcomeMsg, _ := db.GetWelcome(m.ChatID())
-	if welcomeMsg == nil {
-		welcomeMsg = &db.WelcomeMessage{}
-	}
-
-	switch args {
-	case "on", "yes", "enable":
-		welcomeMsg.DeletePrevious = true
-		db.SetWelcome(m.ChatID(), welcomeMsg)
-		m.Reply("Previous welcome messages will be deleted")
-	case "off", "no", "disable":
-		welcomeMsg.DeletePrevious = false
-		db.SetWelcome(m.ChatID(), welcomeMsg)
-		m.Reply("Previous welcome messages will not be deleted")
-	default:
-		status := "disabled"
-		if welcomeMsg.DeletePrevious {
-			status = "enabled"
-		}
-		m.Reply(fmt.Sprintf("Clean welcome: <b>%s</b>\n\nUsage: /cleanwelcome on/off", status))
-	}
-	return nil
-}
-
-func WelcomeAutoDeleteHandler(m *tg.NewMessage) error {
-	if m.IsPrivate() {
-		m.Reply("This can only be used in groups")
-		return nil
-	}
-
-	if !modules.IsUserAdmin(m.Client, m.SenderID(), m.ChatID(), "change_info") {
-		m.Reply("You need Change Info permission")
-		return nil
-	}
-
-	args := strings.TrimSpace(m.Args())
-
-	welcomeMsg, _ := db.GetWelcome(m.ChatID())
-	if welcomeMsg == nil {
-		welcomeMsg = &db.WelcomeMessage{}
-	}
-
-	if args == "off" || args == "0" {
-		welcomeMsg.AutoDeleteSec = 0
-		db.SetWelcome(m.ChatID(), welcomeMsg)
-		m.Reply("Welcome auto-delete disabled")
-		return nil
-	}
-
-	durationRegex := regexp.MustCompile(`^(\d+)([smh]?)$`)
-	matches := durationRegex.FindStringSubmatch(args)
-
-	if len(matches) == 0 {
-		m.Reply(fmt.Sprintf("Current: <b>%ds</b>\n\nUsage: /wautodelete <seconds> or <number>s/m/h\nExample: /wautodelete 30s or /wautodelete 5m", welcomeMsg.AutoDeleteSec))
-		return nil
-	}
-
-	value, _ := strconv.Atoi(matches[1])
-	unit := matches[2]
-
-	switch unit {
-	case "m":
-		value *= 60
-	case "h":
-		value *= 3600
-	}
-
-	if value < 5 || value > 86400 {
-		m.Reply("Auto-delete time must be between 5 seconds and 24 hours")
-		return nil
-	}
-
-	welcomeMsg.AutoDeleteSec = value
-	db.SetWelcome(m.ChatID(), welcomeMsg)
-	m.Reply(fmt.Sprintf("Welcome messages will be auto-deleted after <b>%d seconds</b>", value))
-	return nil
-}
-
 var defaultJoinFilterEmoji = []string{
 	"🏳️‍🌈", "🏳‍🌈", "🏳️‍⚧️", "🏳‍⚧",
 	"🌈",
@@ -592,7 +69,7 @@ func getJoinFilterConfig(chatID int64) *JoinFilterConfig {
 	if err != nil || database == nil {
 		return cfg
 	}
-	_ = database.View(func(tx *bolt.Tx) error {
+	_ = database.View(func(tx *mongostore.Tx) error {
 		b := tx.Bucket([]byte(joinFilterBucket))
 		if b == nil {
 			return nil
@@ -612,7 +89,7 @@ func saveJoinFilterConfig(chatID int64, cfg *JoinFilterConfig) error {
 	if err != nil || database == nil {
 		return fmt.Errorf("db unavailable")
 	}
-	return database.Update(func(tx *bolt.Tx) error {
+	return database.Update(func(tx *mongostore.Tx) error {
 		b, err := tx.CreateBucketIfNotExists([]byte(joinFilterBucket))
 		if err != nil {
 			return err
@@ -667,7 +144,10 @@ func joinFilterBan(client *tg.Client, chatID int64, user *tg.UserObj, reason str
 	if err != nil || peer == nil {
 		return
 	}
-	_, _ = client.EditBanned(chatID, peer, &tg.BannedOptions{Ban: true})
+	if _, err := client.EditBanned(chatID, peer, &tg.BannedOptions{Ban: true}); err != nil {
+		log.Printf("join filter removal: %v", err)
+		return
+	}
 	_, _ = client.SendMessage(chatID, fmt.Sprintf(
 		"Removed %s on join — %s.",
 		html.EscapeString(joinFilterDisplayName(user)),
@@ -680,7 +160,7 @@ func JoinFilterCommandHandler(m *tg.NewMessage) error {
 		m.Reply("Join filter is only available in groups.")
 		return nil
 	}
-	if !modules.IsUserAdmin(m.Client, m.SenderID(), m.ChatID(), "ban") {
+	if !modules.IsUserAdmin(m.Client, m.SenderID(), m.ChannelID(), "ban") {
 		m.Reply("You need Ban Users permission to manage the join filter.")
 		return nil
 	}
@@ -717,6 +197,9 @@ Matches auto-ban new joiners before they see captcha or welcome.`, status, len(c
 	case "on", "enable", "yes", "1":
 		cfg.Enabled = true
 	case "off", "disable", "no", "0":
+		lock := &captchaSetupLocks[uint64(m.ChatID())%64]
+		lock.Lock()
+		defer lock.Unlock()
 		cfg.Enabled = false
 	case "list":
 		var b strings.Builder
@@ -841,18 +324,22 @@ type CaptchaConfig struct {
 }
 
 type captchaState struct {
-	UserID    int64
-	ChatID    int64
-	Type      string
-	Answer    string
-	MessageID int32
-	Deadline  time.Time
-	Cancel    chan struct{}
-	UserName  string
-	User      *tg.UserObj
+	Restricted bool
+	Finished   atomic.Bool
+	Ready      chan struct{}
+	UserID     int64
+	ChatID     int64
+	Type       string
+	Answer     string
+	MessageID  int32
+	Deadline   time.Time
+	Cancel     chan struct{}
+	UserName   string
+	User       *tg.UserObj
 }
 
 var captchaStates sync.Map
+var captchaSetupLocks [64]sync.Mutex
 
 func captchaStateKey(chatID, userID int64) string {
 	return fmt.Sprintf("%d:%d", chatID, userID)
@@ -868,7 +355,7 @@ func getCaptchaConfig(chatID int64) *CaptchaConfig {
 	if err != nil || database == nil {
 		return cfg
 	}
-	_ = database.View(func(tx *bolt.Tx) error {
+	_ = database.View(func(tx *mongostore.Tx) error {
 		b := tx.Bucket([]byte(captchaBucket))
 		if b == nil {
 			return nil
@@ -894,7 +381,7 @@ func saveCaptchaConfig(chatID int64, cfg *CaptchaConfig) error {
 	if err != nil || database == nil {
 		return fmt.Errorf("db unavailable")
 	}
-	return database.Update(func(tx *bolt.Tx) error {
+	return database.Update(func(tx *mongostore.Tx) error {
 		b, err := tx.CreateBucketIfNotExists([]byte(captchaBucket))
 		if err != nil {
 			return err
@@ -1024,70 +511,107 @@ func captchaGenMath() (string, string) {
 	}
 }
 
-func captchaRestrictUser(c *tg.Client, chatID int64, userID int64, restrict bool) {
+// Only the state still registered for this join may finish it.
+// Keeping it registered during Telegram calls prevents a duplicate challenge.
+func claimCaptcha(st *captchaState) bool {
+	current, ok := captchaStates.Load(captchaStateKey(st.ChatID, st.UserID))
+	if !ok || current != st || !st.Finished.CompareAndSwap(false, true) {
+		return false
+	}
+	close(st.Cancel)
+	return true
+}
+func captchaRestrictUser(c *tg.Client, chatID int64, userID int64, restrict bool) error {
 	user, err := c.ResolvePeer(userID)
-	if err != nil || user == nil {
-		return
+	if err != nil {
+		return err
+	}
+	if user == nil {
+		return fmt.Errorf("user unavailable")
 	}
 	if restrict {
-		_, _ = c.EditBanned(chatID, user, &tg.BannedOptions{Mute: true})
+		_, err = c.EditBanned(chatID, user, &tg.BannedOptions{Mute: true, TillDate: int32(time.Now().Add(15 * time.Minute).Unix())})
 	} else {
-		_, _ = c.EditBanned(chatID, user, &tg.BannedOptions{Unmute: true})
+		_, err = c.EditBanned(chatID, user, &tg.BannedOptions{Unmute: true})
 	}
+	return err
 }
-
-func captchaKickUser(c *tg.Client, chatID int64, userID int64) {
+func captchaKickUser(c *tg.Client, chatID int64, userID int64) error {
 	user, err := c.ResolvePeer(userID)
-	if err != nil || user == nil {
-		return
+	if err != nil {
+		return err
 	}
-	_, _ = c.EditBanned(chatID, user, &tg.BannedOptions{Ban: true})
-	_, _ = c.EditBanned(chatID, user, &tg.BannedOptions{Unban: true})
+	if user == nil {
+		return fmt.Errorf("user unavailable")
+	}
+	if _, err = c.EditBanned(chatID, user, &tg.BannedOptions{Ban: true}); err != nil {
+		return err
+	}
+	_, err = c.EditBanned(chatID, user, &tg.BannedOptions{Unban: true})
+	return err
 }
-
 func captchaCleanup(chatID, userID int64, c *tg.Client, msgID int32) {
-	key := captchaStateKey(chatID, userID)
-	captchaStates.Delete(key)
 	if msgID > 0 {
 		_, _ = c.DeleteMessages(chatID, []int32{msgID})
 	}
 }
-
+func captchaFailed(c *tg.Client, st *captchaState) bool {
+	if !claimCaptcha(st) {
+		return false
+	}
+	defer captchaStates.CompareAndDelete(captchaStateKey(st.ChatID, st.UserID), st)
+	err := captchaKickUser(c, st.ChatID, st.UserID)
+	captchaCleanup(st.ChatID, st.UserID, c, st.MessageID)
+	if err != nil {
+		log.Printf("captcha removal: %v", err)
+		if st.Restricted {
+			_ = captchaRestrictUser(c, st.ChatID, st.UserID, false)
+		}
+		return false
+	}
+	_, _ = c.SendMessage(st.ChatID, fmt.Sprintf("%s failed the captcha and was removed.", html.EscapeString(st.UserName)))
+	return true
+}
 func captchaScheduleTimeout(c *tg.Client, st *captchaState) {
 	go func() {
+		timer := time.NewTimer(time.Until(st.Deadline))
+		defer timer.Stop()
 		select {
-		case <-time.After(time.Until(st.Deadline)):
-			if _, ok := captchaStates.Load(captchaStateKey(st.ChatID, st.UserID)); !ok {
-				return
-			}
-			captchaKickUser(c, st.ChatID, st.UserID)
-			captchaCleanup(st.ChatID, st.UserID, c, st.MessageID)
-			_, _ = c.SendMessage(st.ChatID, fmt.Sprintf("%s failed the captcha and was removed.", html.EscapeString(st.UserName)))
+		case <-timer.C:
+			captchaFailed(c, st)
 		case <-st.Cancel:
-			return
 		}
 	}()
 }
-
-func captchaPassed(client *tg.Client, st *captchaState) {
-	captchaRestrictUser(client, st.ChatID, st.UserID, false)
-	close(st.Cancel)
+func captchaPassed(client *tg.Client, st *captchaState) bool {
+	if !claimCaptcha(st) {
+		return false
+	}
+	defer captchaStates.CompareAndDelete(captchaStateKey(st.ChatID, st.UserID), st)
+	if st.Restricted {
+		if err := captchaRestrictUser(client, st.ChatID, st.UserID, false); err != nil {
+			log.Printf("captcha unmute: %v", err)
+			_, _ = client.SendMessage(st.ChatID, "Verification succeeded, but I could not unmute the member. An admin needs to unmute them.")
+		}
+	}
 	captchaCleanup(st.ChatID, st.UserID, client, st.MessageID)
 	if st.User != nil {
 		sendWelcome(client, st.ChatID, st.User)
 	}
+	return true
 }
 
 func startCaptcha(p *tg.ParticipantUpdate) {
 	chatID := p.ChatID()
+	lock := &captchaSetupLocks[uint64(chatID)%64]
+	lock.Lock()
+	defer lock.Unlock()
 	cfg := getCaptchaConfig(chatID)
-	userID := p.User.ID
-	key := captchaStateKey(chatID, userID)
-	if _, exists := captchaStates.Load(key); exists {
+	if !cfg.Enabled {
 		return
 	}
-
-	captchaRestrictUser(p.Client, chatID, userID, true)
+	userID := p.User.ID
+	key := captchaStateKey(chatID, userID)
 
 	userName := p.User.FirstName
 	if userName == "" {
@@ -1097,6 +621,7 @@ func startCaptcha(p *tg.ParticipantUpdate) {
 	deadline := time.Now().Add(time.Duration(cfg.Timeout) * time.Second)
 
 	st := &captchaState{
+		Ready:    make(chan struct{}),
 		UserID:   userID,
 		ChatID:   chatID,
 		Type:     cfg.Type,
@@ -1105,6 +630,29 @@ func startCaptcha(p *tg.ParticipantUpdate) {
 		UserName: userName,
 		User:     p.User,
 	}
+	if _, exists := captchaStates.LoadOrStore(key, st); exists {
+		return
+	}
+	defer close(st.Ready)
+	// Text challenges need members to be able to send their answer. The watcher
+	// consumes their other messages until they reply to the challenge.
+	restricted := cfg.Type != captchaTypeText
+	st.Restricted = restricted
+	if restricted {
+		if err := captchaRestrictUser(p.Client, chatID, userID, true); err != nil {
+			captchaStates.CompareAndDelete(key, st)
+			log.Printf("captcha restrict: %v", err)
+			return
+		}
+	}
+	defer func() {
+		if st.MessageID == 0 {
+			captchaStates.CompareAndDelete(key, st)
+			if restricted {
+				_ = captchaRestrictUser(p.Client, chatID, userID, false)
+			}
+		}
+	}()
 
 	switch cfg.Type {
 	case captchaTypeBtn:
@@ -1126,7 +674,6 @@ func startCaptcha(p *tg.ParticipantUpdate) {
 		st.Answer = answer
 		img, err := captchaRenderText(question, 360, 140, 36)
 		if err != nil {
-			captchaRestrictUser(p.Client, chatID, userID, false)
 			return
 		}
 		defer os.Remove(img)
@@ -1171,7 +718,7 @@ func startCaptcha(p *tg.ParticipantUpdate) {
 			kb.AddRow(row...)
 		}
 
-		msg, err := p.Client.SendMedia(chatID, img, &tg.MediaOptions{
+		msg, err := modules.TransferSendMedia(p.Client, chatID, img, &tg.MediaOptions{
 			Caption: fmt.Sprintf(
 				"Welcome %s! Solve the captcha within %d seconds. Pick the correct answer below.",
 				mention, cfg.Timeout,
@@ -1189,12 +736,11 @@ func startCaptcha(p *tg.ParticipantUpdate) {
 		st.Answer = text
 		img, err := captchaRenderText(text, 320, 120, 44)
 		if err != nil {
-			captchaRestrictUser(p.Client, chatID, userID, false)
 			return
 		}
 		defer os.Remove(img)
 
-		msg, err := p.Client.SendMedia(chatID, img, &tg.MediaOptions{
+		msg, err := modules.TransferSendMedia(p.Client, chatID, img, &tg.MediaOptions{
 			Caption: fmt.Sprintf(
 				"Welcome %s! Reply to this message with the 5 characters shown within %d seconds (case-insensitive).",
 				mention, cfg.Timeout,
@@ -1207,98 +753,102 @@ func startCaptcha(p *tg.ParticipantUpdate) {
 		}
 	}
 
-	captchaStates.Store(key, st)
+	if st.MessageID == 0 {
+		return
+	}
+	st.Deadline = time.Now().Add(time.Duration(cfg.Timeout) * time.Second)
 	captchaScheduleTimeout(p.Client, st)
 }
 
 func CaptchaCallbackHandler(c *tg.CallbackQuery) error {
-	data := c.DataString()
-	if !strings.HasPrefix(data, captchaPrefix) {
-		return nil
-	}
-	parts := strings.Split(strings.TrimPrefix(data, captchaPrefix), ":")
+	parts := strings.Split(strings.TrimPrefix(c.DataString(), captchaPrefix), ":")
 	if len(parts) < 3 {
 		return nil
 	}
-	kind := parts[0]
-	chatID, _ := strconv.ParseInt(parts[1], 10, 64)
-	userID, _ := strconv.ParseInt(parts[2], 10, 64)
-
+	chatID, err := strconv.ParseInt(parts[1], 10, 64)
+	if err != nil {
+		return nil
+	}
+	userID, err := strconv.ParseInt(parts[2], 10, 64)
+	if err != nil {
+		return nil
+	}
 	if c.SenderID != userID {
 		c.Answer("This captcha is not for you.", &tg.CallbackOptions{Alert: true})
 		return nil
 	}
-
-	key := captchaStateKey(chatID, userID)
-	raw, ok := captchaStates.Load(key)
+	raw, ok := captchaStates.Load(captchaStateKey(chatID, userID))
 	if !ok {
-		c.Answer("Captcha expired.", &tg.CallbackOptions{Alert: true})
+		c.Answer("Captcha expired.")
 		return nil
 	}
 	st := raw.(*captchaState)
-
-	switch kind {
-	case "btn":
-		captchaPassed(c.Client, st)
-		c.Answer("Verified!", &tg.CallbackOptions{Alert: false})
-	case "math":
-		if len(parts) < 4 {
-			return nil
-		}
-		choice := parts[3]
-		if choice == st.Answer {
-			captchaPassed(c.Client, st)
-			c.Answer("Verified!", &tg.CallbackOptions{Alert: false})
+	<-st.Ready
+	// Bind callbacks to the actual message as well as the member and chat.
+	if st.MessageID == 0 || c.GetChatID() != st.ChatID || c.MessageID != st.MessageID || st.Finished.Load() || time.Now().After(st.Deadline) {
+		c.Answer("Captcha expired.")
+		return nil
+	}
+	correct := false
+	switch {
+	case parts[0] == "btn" && st.Type == captchaTypeBtn:
+		correct = true
+	case parts[0] == "math" && st.Type == captchaTypeMath && len(parts) == 4:
+		correct = parts[3] == st.Answer
+	default:
+		return nil
+	}
+	if correct {
+		if captchaPassed(c.Client, st) {
+			c.Answer("Verified!")
 		} else {
-			captchaKickUser(c.Client, chatID, userID)
-			close(st.Cancel)
-			captchaCleanup(chatID, userID, c.Client, st.MessageID)
+			c.Answer("Already handled.")
+		}
+	} else {
+		if captchaFailed(c.Client, st) {
 			c.Answer("Wrong answer. Removed.", &tg.CallbackOptions{Alert: true})
-			_, _ = c.Client.SendMessage(chatID, fmt.Sprintf("%s failed the captcha and was removed.", html.EscapeString(st.UserName)))
+		} else {
+			c.Answer("Challenge ended.")
 		}
 	}
 	return nil
 }
-
 func CaptchaMessageWatcher(m *tg.NewMessage) error {
-	if m.IsPrivate() {
+	if m.IsPrivate() || m.SenderID() == 0 {
 		return nil
 	}
-	senderID := m.SenderID()
-	if senderID == 0 {
-		return nil
-	}
-	key := captchaStateKey(m.ChatID(), senderID)
-	raw, ok := captchaStates.Load(key)
+	raw, ok := captchaStates.Load(captchaStateKey(m.ChatID(), m.SenderID()))
 	if !ok {
 		return nil
 	}
 	st := raw.(*captchaState)
-	if st.Type != captchaTypeText {
+	<-st.Ready
+	if st.MessageID == 0 || st.Finished.Load() {
 		return nil
+	}
+	if st.Type != captchaTypeText {
+		return tg.ErrEndGroup
+	}
+	// An unrelated message must not count as a wrong answer.
+	if m.ReplyToMsgID() != st.MessageID {
+		_, _ = m.Client.DeleteMessages(m.ChatID(), []int32{m.ID})
+		return tg.ErrEndGroup
+	}
+	if time.Now().After(st.Deadline) {
+		captchaFailed(m.Client, st)
+		return tg.ErrEndGroup
 	}
 	text := strings.ToUpper(strings.TrimSpace(m.Text()))
 	if text == "" {
-		return nil
+		return tg.ErrEndGroup
 	}
 	if text == strings.ToUpper(st.Answer) {
 		captchaPassed(m.Client, st)
-		_, _ = m.Client.DeleteMessages(m.ChatID(), []int32{int32(m.ID)})
-		reply, _ := m.Client.SendMessage(m.ChatID(), fmt.Sprintf("%s verified!", html.EscapeString(st.UserName)))
-		if reply != nil {
-			go func(id int32) {
-				time.Sleep(10 * time.Second)
-				_, _ = m.Client.DeleteMessages(m.ChatID(), []int32{id})
-			}(reply.ID)
-		}
 	} else {
-		captchaKickUser(m.Client, m.ChatID(), senderID)
-		close(st.Cancel)
-		captchaCleanup(m.ChatID(), senderID, m.Client, st.MessageID)
-		_, _ = m.Client.DeleteMessages(m.ChatID(), []int32{int32(m.ID)})
-		_, _ = m.Client.SendMessage(m.ChatID(), fmt.Sprintf("%s failed the captcha and was removed.", html.EscapeString(st.UserName)))
+		captchaFailed(m.Client, st)
 	}
-	return nil
+	_, _ = m.Client.DeleteMessages(m.ChatID(), []int32{m.ID})
+	return tg.ErrEndGroup
 }
 
 func CaptchaCommandHandler(m *tg.NewMessage) error {
@@ -1306,7 +856,7 @@ func CaptchaCommandHandler(m *tg.NewMessage) error {
 		m.Reply("Captcha is only available in groups")
 		return nil
 	}
-	if !modules.IsUserAdmin(m.Client, m.SenderID(), m.ChatID(), "change_info") {
+	if !modules.IsUserAdmin(m.Client, m.SenderID(), m.ChannelID(), "change_info") {
 		m.Reply("You need Change Info permission to manage captcha")
 		return nil
 	}
@@ -1341,11 +891,28 @@ Timeout: <b>%d seconds</b>
 		}
 		m.Reply(fmt.Sprintf("Captcha <b>enabled</b>\nType: <b>%s</b>\nTimeout: <b>%d s</b>", html.EscapeString(cfg.Type), cfg.Timeout))
 	case "off", "disable", "no", "0":
+		lock := &captchaSetupLocks[uint64(m.ChatID())%64]
+		lock.Lock()
+		defer lock.Unlock()
 		cfg.Enabled = false
 		if err := saveCaptchaConfig(m.ChatID(), cfg); err != nil {
 			m.Reply("Failed to disable captcha")
 			return nil
 		}
+		captchaStates.Range(func(key, value any) bool {
+			st := value.(*captchaState)
+			if st.ChatID == m.ChatID() {
+				<-st.Ready
+				if claimCaptcha(st) {
+					if st.Restricted {
+						_ = captchaRestrictUser(m.Client, st.ChatID, st.UserID, false)
+					}
+					captchaCleanup(st.ChatID, st.UserID, m.Client, st.MessageID)
+					captchaStates.CompareAndDelete(key, st)
+				}
+			}
+			return true
+		})
 		m.Reply("Captcha <b>disabled</b>")
 	case "status":
 		status := "off"
@@ -1400,22 +967,28 @@ Timeout: <b>%d seconds</b>`, status, html.EscapeString(cfg.Type), cfg.Timeout))
 
 func registerWelcomeHandlers() {
 	c := modules.Client
-	c.On("cmd:setwelcome", SetWelcomeHandler)
-	c.On("cmd:setgoodbye", SetGoodbyeHandler)
-	c.On("cmd:goodbye", GoodbyeToggleHandler)
-	c.On("cmd:clearwelcome", ClearWelcomeHandler)
-	c.On("cmd:cleargoodbye", ClearGoodbyeHandler)
-	c.On("cmd:cleanwelcome", CleanServiceHandler)
-	c.On("cmd:wautodelete", WelcomeAutoDeleteHandler)
-	c.On("cmd:welcomesettings", WelcomeSettingsHandler)
-	c.On("cmd:greetings", WelcomeSettingsHandler)
-	c.On("cmd:greet", WelcomeToggleHandler)
-	c.On("cmd:welcome", WelcomeToggleHandler)
-	c.On("cmd:captcha", CaptchaCommandHandler)
+	modules.OnCommand(c, "cmd:setwelcome", SetWelcomeHandler)
+	modules.OnCommand(c, "cmd:setgoodbye", SetGoodbyeHandler)
+	modules.OnCommand(c, "cmd:goodbye", GoodbyeToggleHandler)
+	modules.OnCommand(c, "cmd:clearwelcome", ClearWelcomeHandler)
+	modules.OnCommand(c, "cmd:cleargoodbye", ClearGoodbyeHandler)
+	modules.OnCommand(c, "cmd:cleanwelcome", CleanServiceHandler)
+	modules.OnCommand(c, "cmd:wautodelete", WelcomeAutoDeleteHandler)
+	modules.OnCommand(c, "cmd:gautodelete", GoodbyeAutoDeleteHandler)
+	modules.OnCommand(c, "cmd:cleangoodbye", CleanGoodbyeHandler)
+	modules.OnCommand(c, "cmd:testwelcome", func(m *tg.NewMessage) error { return previewGreeting(m, false) })
+	modules.OnCommand(c, "cmd:testgoodbye", func(m *tg.NewMessage) error { return previewGreeting(m, true) })
+	modules.OnCommand(c, "cmd:welcomesettings", WelcomeSettingsHandler)
+	modules.OnCommand(c, "cmd:greetings", WelcomeSettingsHandler)
+	modules.OnCommand(c, "cmd:greet", WelcomeToggleHandler)
+	modules.OnCommand(c, "cmd:welcome", WelcomeToggleHandler)
+	modules.OnCommand(c, "cmd:captcha", CaptchaCommandHandler)
 	c.On("callback:"+captchaPrefix, CaptchaCallbackHandler)
-	c.On("cmd:joinfilter", JoinFilterCommandHandler)
+	modules.OnCommand(c, "cmd:joinfilter", JoinFilterCommandHandler)
 	c.On(tg.OnParticipant, WelcomeHandler)
-	c.On(tg.OnNewMessage, CaptchaMessageWatcher)
+	// ConversationGroup runs synchronously before ordinary handlers. Other
+	// groups run alongside default handlers and cannot gate pending members.
+	c.On(tg.OnNewMessage, CaptchaMessageWatcher).SetGroup(tg.ConversationGroup)
 }
 
 func init() {
@@ -1436,6 +1009,9 @@ Welcomes new users, greets returners, and gates joins behind a captcha challenge
  - /setgoodbye &lt;text&gt; - Set goodbye message
  - /goodbye on/off - Toggle goodbye messages
  - /cleargoodbye - Clear goodbye message
+ - /cleangoodbye on/off - Delete previous goodbye
+ - /gautodelete &lt;time&gt; - Auto-delete goodbye
+ - /testwelcome and /testgoodbye - Preview without cleanup
 
 <b>Captcha Commands:</b>
  - /captcha on|off|status - Toggle or view captcha

@@ -8,7 +8,7 @@ import (
 	"net/url"
 	"strconv"
 
-	"github.com/amarnathcjd/gogram/telegram"
+	"github.com/xAmarnath/gogram/telegram"
 	"github.com/fogleman/gg"
 )
 
@@ -53,7 +53,7 @@ func DogeSticker(m *telegram.NewMessage) error {
 	}
 
 	dc.SavePNG("out.webp")
-	m.RespondMedia("out.webp")
+	TransferRespondMedia(m, "out.webp")
 	return nil
 }
 

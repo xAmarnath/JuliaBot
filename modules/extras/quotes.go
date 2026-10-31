@@ -2,11 +2,13 @@ package extras
 
 import (
 	"bytes"
+	"cmp"
+	"context"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"html"
-	"io"
+	"math/rand/v2"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -15,12 +17,13 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	modules "main/modules"
 	"main/modules/db"
 
-	tg "github.com/amarnathcjd/gogram/telegram"
-	bolt "go.etcd.io/bbolt"
+	tg "github.com/xAmarnath/gogram/telegram"
+	"main/internal/mongostore"
 )
 
 var quotesBucket = []byte("quotes")
@@ -41,7 +44,7 @@ func quoteAPIBase() string {
 	if v := strings.TrimSuffix(strings.TrimSpace(os.Getenv("QUOTE_API")), "/"); v != "" {
 		return v
 	}
-	return "http://localhost:8080"
+	return "https://quote.yuri.ly"
 }
 
 const (
@@ -63,11 +66,30 @@ func AvatarServerInit(c *tg.Client) {
 	http.HandleFunc("/avatar/", avatarServeHTTP)
 }
 
+// avatarSelfURL returns where the renderer can reach /avatar/, or "" when it can't
+// (the default remote renderer cannot see this dyno's localhost server).
 func avatarSelfURL() string {
 	if v := strings.TrimSuffix(strings.TrimSpace(os.Getenv("BOT_PUBLIC_URL")), "/"); v != "" {
 		return v
 	}
-	return "http://localhost:6060"
+	if quoteAPIIsLocal(quoteAPIBase()) {
+		return "http://localhost:6060"
+	}
+	return ""
+}
+
+func quoteAPIIsLocal(base string) bool {
+	return strings.Contains(base, "://localhost") || strings.Contains(base, "://127.0.0.1")
+}
+
+func quoteAvatarURL(username string, uid int64) string {
+	if username != "" {
+		return fmt.Sprintf("https://t.me/i/userpic/320/%s.jpg", username)
+	}
+	if self := avatarSelfURL(); self != "" {
+		return fmt.Sprintf("%s/avatar/%d.jpg", self, uid)
+	}
+	return ""
 }
 
 func avatarServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -127,7 +149,7 @@ func avatarServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	if _, err := c.DownloadMedia(p, &tg.DownloadOptions{FileName: cached}); err != nil {
+	if _, err := modules.TransferDownloadMedia(c, p, &tg.DownloadOptions{FileName: cached}); err != nil {
 		os.Remove(cached)
 		http.Error(w, "download failed", http.StatusBadGateway)
 		return
@@ -150,17 +172,17 @@ type qaPhoto struct {
 }
 
 type qaFrom struct {
-	ID           int64    `json:"id"`
-	FirstName    string   `json:"first_name,omitempty"`
-	LastName     string   `json:"last_name,omitempty"`
-	Name         string   `json:"name,omitempty"`
-	Username     string   `json:"username,omitempty"`
-	Title        string   `json:"title,omitempty"`
-	EmojiStatus  string   `json:"emoji_status,omitempty"`
-	IsPremium    bool     `json:"is_premium,omitempty"`
-	IsVerified   bool     `json:"is_verified,omitempty"`
-	IsBot        bool     `json:"is_bot,omitempty"`
-	Photo        *qaPhoto `json:"photo,omitempty"`
+	ID          int64    `json:"id"`
+	FirstName   string   `json:"first_name,omitempty"`
+	LastName    string   `json:"last_name,omitempty"`
+	Name        string   `json:"name,omitempty"`
+	Username    string   `json:"username,omitempty"`
+	Title       string   `json:"title,omitempty"`
+	EmojiStatus string   `json:"emoji_status,omitempty"`
+	IsPremium   bool     `json:"is_premium,omitempty"`
+	IsVerified  bool     `json:"is_verified,omitempty"`
+	IsBot       bool     `json:"is_bot,omitempty"`
+	Photo       *qaPhoto `json:"photo,omitempty"`
 }
 
 type qaReplyMessage struct {
@@ -327,10 +349,8 @@ func quoteResolveFrom(c *tg.Client, senderID, chatID int64) qaFrom {
 	f.IsBot = u.Bot
 	if u.Photo != nil {
 		if p, ok := u.Photo.(*tg.UserProfilePhotoObj); ok && p != nil && p.PhotoID != 0 {
-			if u.Username != "" {
-				f.Photo = &qaPhoto{URL: fmt.Sprintf("https://t.me/i/userpic/320/%s.jpg", u.Username)}
-			} else {
-				f.Photo = &qaPhoto{URL: fmt.Sprintf("%s/avatar/%d.jpg", avatarSelfURL(), senderID)}
+			if url := quoteAvatarURL(u.Username, senderID); url != "" {
+				f.Photo = &qaPhoto{URL: url}
 			}
 		}
 	}
@@ -363,15 +383,13 @@ func quoteResolveFrom(c *tg.Client, senderID, chatID int64) qaFrom {
 func quoteBuildMessage(client *tg.Client, msg *tg.NewMessage, chatID int64, includeReply bool) qaMessage {
 	from := quoteResolveFrom(client, msg.SenderID(), chatID)
 	out := qaMessage{
-		From:     from,
-		Text:     msg.RawText(),
-		Entities: quoteBuildEntities(msg.Message.Entities),
-		Avatar:   true,
-	}
-	if from.Title != "" {
-		out.SenderTag = from.Title
+		From:      from,
+		Text:      msg.RawText(),
+		Avatar:    true,
+		SenderTag: from.Title,
 	}
 	if msg.Message != nil {
+		out.Entities = quoteBuildEntities(msg.Message.Entities)
 		if msg.Message.ViaBotID != 0 {
 			if u, err := client.GetUser(msg.Message.ViaBotID); err == nil && u != nil && u.Username != "" {
 				out.ViaBot = "@" + u.Username
@@ -420,11 +438,13 @@ func quoteBuildMessage(client *tg.Client, msg *tg.NewMessage, chatID int64, incl
 		prevName = "User"
 	}
 	rm := &qaReplyMessage{
-		Name:     prevName,
-		Text:     prev.RawText(),
-		Entities: quoteBuildEntities(prev.Message.Entities),
-		ChatID:   chatID,
-		From:     &prevFrom,
+		Name:   prevName,
+		Text:   prev.RawText(),
+		ChatID: chatID,
+		From:   &prevFrom,
+	}
+	if prev.Message != nil {
+		rm.Entities = quoteBuildEntities(prev.Message.Entities)
 	}
 	if strings.TrimSpace(rm.Text) == "" && len(rm.Entities) == 0 {
 		return out
@@ -433,41 +453,39 @@ func quoteBuildMessage(client *tg.Client, msg *tg.NewMessage, chatID int64, incl
 	return out
 }
 
-func quoteRequestImage(req qaRequest, wantPNG bool) ([]byte, error) {
-	body, err := json.Marshal(req)
-	if err != nil {
-		return nil, err
-	}
+const quoteMaxImage = 15 << 20
+
+// quoteRequestImage returns the rendered image and whether it is PNG (detected from
+// magic bytes; the renderer may answer .png requests with WebP).
+func quoteRequestImage(req qaRequest, wantPNG bool) ([]byte, bool, error) {
 	endpoint := "/generate.webp"
 	if wantPNG {
 		endpoint = "/generate.png"
+		req.Ext = "png"
 	}
-	url := quoteAPIBase() + endpoint
-	httpClient := &http.Client{Timeout: 30 * time.Second}
-	resp, err := httpClient.Post(url, "application/json", bytes.NewReader(body))
+	body, err := json.Marshal(req)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
-	defer resp.Body.Close()
-	data, rerr := io.ReadAll(resp.Body)
-	if rerr != nil {
-		return nil, rerr
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	data, err := extFetch(ctx, http.MethodPost, quoteAPIBase()+endpoint, bytes.NewReader(body), quoteMaxImage, "Content-Type", "application/json")
+	if err != nil {
+		return nil, false, fmt.Errorf("quote renderer: %w", err)
 	}
-	if resp.StatusCode >= 400 {
-		return nil, fmt.Errorf("quote-api %d: %s", resp.StatusCode, strings.TrimSpace(string(data)))
+	switch {
+	case bytes.HasPrefix(data, []byte{0x89, 'P', 'N', 'G'}):
+		return data, true, nil
+	case len(data) > 12 && string(data[0:4]) == "RIFF" && string(data[8:12]) == "WEBP":
+		return data, false, nil
 	}
-	ct := resp.Header.Get("Content-Type")
-	if strings.Contains(ct, "json") {
-		var errResp struct {
-			Error string `json:"error"`
-		}
-		_ = json.Unmarshal(data, &errResp)
-		if errResp.Error != "" {
-			return nil, fmt.Errorf("quote-api error: %s", errResp.Error)
-		}
-		return nil, fmt.Errorf("quote-api returned unexpected json: %s", strings.TrimSpace(string(data)))
+	var errResp struct {
+		Error any `json:"error"`
 	}
-	return data, nil
+	if json.Unmarshal(data, &errResp) == nil && errResp.Error != nil {
+		return nil, false, fmt.Errorf("quote renderer: %v", errResp.Error)
+	}
+	return nil, false, fmt.Errorf("quote renderer returned an unknown format")
 }
 
 type quoteFlags struct {
@@ -497,7 +515,7 @@ func quoteParseFlags(args string) quoteFlags {
 		case strings.HasPrefix(lower, "brand="):
 			f.Brand = strings.TrimPrefix(lower, "brand=")
 		case strings.HasPrefix(lower, "scale="):
-			if n, err := strconv.Atoi(strings.TrimPrefix(lower, "scale=")); err == nil && n >= 1 && n <= 20 {
+			if n, err := strconv.Atoi(strings.TrimPrefix(lower, "scale=")); err == nil && n >= 1 && n <= 10 {
 				f.Scale = n
 			}
 		default:
@@ -550,7 +568,7 @@ func quoteCollectMessages(client *tg.Client, m *tg.NewMessage, target *tg.NewMes
 	return all
 }
 
-func quoteRateBucket() []byte { return []byte("quote_rate") }
+func quoteRateBucket() []byte  { return []byte("quote_rate") }
 func quoteVotesBucket() []byte { return []byte("quote_votes") }
 func quotePacksBucket() []byte { return []byte("quote_packs_by_chat") }
 
@@ -560,7 +578,7 @@ func quoteRateIsOn(chatID int64) bool {
 		return false
 	}
 	on := false
-	_ = d.View(func(tx *bolt.Tx) error {
+	_ = d.View(func(tx *mongostore.Tx) error {
 		b := tx.Bucket(quoteRateBucket())
 		if b == nil {
 			return nil
@@ -581,7 +599,7 @@ func quoteRateSet(chatID int64, on bool) error {
 	if err != nil || d == nil {
 		return fmt.Errorf("db unavailable")
 	}
-	return d.Update(func(tx *bolt.Tx) error {
+	return d.Update(func(tx *mongostore.Tx) error {
 		b, e := tx.CreateBucketIfNotExists(quoteRateBucket())
 		if e != nil {
 			return e
@@ -597,18 +615,20 @@ func quoteRateSet(chatID int64, on bool) error {
 }
 
 type quoteVoteRecord struct {
-	ChatID     int64           `json:"chat_id"`
-	QuoteID    uint64          `json:"quote_id"`
-	Up         map[int64]bool  `json:"up"`
-	Down       map[int64]bool  `json:"down"`
-	QuoterID   int64           `json:"quoter_id"`
-	QuoterName string          `json:"quoter_name"`
-	QuotedID   int64           `json:"quoted_id"`
-	QuotedName string          `json:"quoted_name"`
-	Preview    string          `json:"preview"`
-	MessageID  int32           `json:"message_id"`
-	Timestamp  int64           `json:"ts"`
+	ChatID     int64          `json:"chat_id"`
+	QuoteID    uint64         `json:"quote_id"`
+	Up         map[int64]bool `json:"up"`
+	Down       map[int64]bool `json:"down"`
+	QuoterID   int64          `json:"quoter_id"`
+	QuoterName string         `json:"quoter_name"`
+	QuotedID   int64          `json:"quoted_id"`
+	QuotedName string         `json:"quoted_name"`
+	Preview    string         `json:"preview"`
+	MessageID  int32          `json:"message_id"`
+	Timestamp  int64          `json:"ts"`
 }
+
+var quoteVoteMu sync.Mutex
 
 func quoteVoteKey(chatID int64, quoteID uint64) []byte {
 	b := make([]byte, 16)
@@ -624,7 +644,7 @@ func quoteVoteGet(chatID int64, quoteID uint64) *quoteVoteRecord {
 	}
 	var rec quoteVoteRecord
 	found := false
-	_ = d.View(func(tx *bolt.Tx) error {
+	_ = d.View(func(tx *mongostore.Tx) error {
 		b := tx.Bucket(quoteVotesBucket())
 		if b == nil {
 			return nil
@@ -655,7 +675,7 @@ func quoteVoteSave(rec *quoteVoteRecord) error {
 	if err != nil || d == nil {
 		return fmt.Errorf("db unavailable")
 	}
-	return d.Update(func(tx *bolt.Tx) error {
+	return d.Update(func(tx *mongostore.Tx) error {
 		b, e := tx.CreateBucketIfNotExists(quoteVotesBucket())
 		if e != nil {
 			return e
@@ -674,6 +694,37 @@ func quoteVoteKeyboard(chatID int64, quoteID uint64, up, down int) *tg.ReplyInli
 	return tg.NewKeyboard().AddRow(upBtn, downBtn).Build()
 }
 
+func quoteBuildRequest(m *tg.NewMessage, target *tg.NewMessage, flags quoteFlags) qaRequest {
+	scale := 2
+	if flags.HD {
+		scale = 5
+	}
+	if flags.Scale > 0 {
+		scale = flags.Scale
+	}
+	req := qaRequest{
+		BackgroundColor: cmp.Or(flags.Bg, "#1b1429"),
+		Width:           512,
+		Height:          768,
+		Scale:           scale,
+		EmojiBrand:      cmp.Or(flags.Brand, "apple"),
+		Messages:        quoteCollectMessages(m.Client, m, target, flags),
+	}
+	if flags.ImageMode {
+		req.Type = "image"
+	}
+	return req
+}
+
+func quoteStatus(m, status *tg.NewMessage, text string) {
+	if status != nil {
+		if _, err := status.Edit(text); err == nil {
+			return
+		}
+	}
+	m.Reply(text)
+}
+
 func quoteRenderCore(m *tg.NewMessage, target *tg.NewMessage, flags quoteFlags) error {
 	if strings.TrimSpace(target.RawText()) == "" {
 		m.Reply("<b>Nothing to quote.</b> Reply to a text message.")
@@ -682,55 +733,19 @@ func quoteRenderCore(m *tg.NewMessage, target *tg.NewMessage, flags quoteFlags) 
 
 	status, _ := m.Reply("<i>painting your quote...</i>")
 
-	scale := 2
-	if flags.HD {
-		scale = 5
-	}
-	if flags.Scale > 0 {
-		scale = flags.Scale
-	}
-	bg := flags.Bg
-	if bg == "" {
-		bg = "#1b1429"
-	}
-	brand := flags.Brand
-	if brand == "" {
-		brand = "apple"
-	}
-
-	messages := quoteCollectMessages(m.Client, m, target, flags)
-	req := qaRequest{
-		BackgroundColor: bg,
-		Width:           512,
-		Height:          768,
-		Scale:           scale,
-		EmojiBrand:      brand,
-		Messages:        messages,
-	}
-	if flags.ImageMode {
-		req.Type = "image"
-	}
-
-	wantPNG := flags.ImageMode || flags.HD
-	data, rerr := quoteRequestImage(req, wantPNG)
+	data, isPNG, rerr := quoteRequestImage(quoteBuildRequest(m, target, flags), flags.ImageMode || flags.HD)
 	if rerr != nil {
-		if status != nil {
-			status.Edit("failed: " + html.EscapeString(rerr.Error()))
-		}
+		quoteStatus(m, status, "<b>Quote failed:</b> "+html.EscapeString(rerr.Error()))
 		return nil
 	}
 
-	ext := ".webp"
-	mime := "image/webp"
-	if wantPNG {
-		ext = ".png"
-		mime = "image/png"
+	ext, mime := ".webp", "image/webp"
+	if isPNG {
+		ext, mime = ".png", "image/png"
 	}
 	outPath := filepath.Join(os.TempDir(), fmt.Sprintf("quote_%d%s", time.Now().UnixNano(), ext))
 	if werr := os.WriteFile(outPath, data, 0o644); werr != nil {
-		if status != nil {
-			status.Edit("failed to write image: " + html.EscapeString(werr.Error()))
-		}
+		quoteStatus(m, status, "<b>Quote failed:</b> "+html.EscapeString(werr.Error()))
 		return nil
 	}
 	defer os.Remove(outPath)
@@ -742,7 +757,7 @@ func quoteRenderCore(m *tg.NewMessage, target *tg.NewMessage, flags quoteFlags) 
 		FileName: "quote" + ext,
 		MimeType: mime,
 	}
-	if !wantPNG {
+	if !isPNG {
 		opts.Attributes = []tg.DocumentAttribute{
 			&tg.DocumentAttributeSticker{
 				Alt:        "💬",
@@ -751,15 +766,13 @@ func quoteRenderCore(m *tg.NewMessage, target *tg.NewMessage, flags quoteFlags) 
 			&tg.DocumentAttributeFilename{FileName: "quote.webp"},
 		}
 	}
-	if quoteRateIsOn(m.ChatID()) && quoteID != 0 {
+	if quoteID != 0 && quoteRateIsOn(m.ChatID()) {
 		opts.ReplyMarkup = quoteVoteKeyboard(m.ChatID(), quoteID, 0, 0)
 	}
 
-	sent, merr := m.ReplyMedia(outPath, opts)
+	sent, merr := modules.TransferReplyMedia(m, outPath, opts)
 	if merr != nil {
-		if status != nil {
-			status.Edit("upload failed: " + html.EscapeString(merr.Error()))
-		}
+		quoteStatus(m, status, "<b>Upload failed:</b> "+html.EscapeString(merr.Error()))
 		return nil
 	}
 	if sent != nil && quoteID != 0 {
@@ -824,10 +837,21 @@ func quoteSenderName(m *tg.NewMessage) string {
 
 func quotePreview(text string) string {
 	text = strings.TrimSpace(text)
-	if len(text) > 120 {
-		return text[:120] + "..."
+	return quoteTrunc(text, 120)
+}
+
+func quoteClip(s string, n int) string {
+	if utf8.RuneCountInString(s) <= n {
+		return s
 	}
-	return text
+	return string([]rune(s)[:n])
+}
+
+func quoteTrunc(s string, n int) string {
+	if c := quoteClip(s, n); c != s {
+		return c + "..."
+	}
+	return s
 }
 
 func quoteAutoSave(m *tg.NewMessage, target *tg.NewMessage, quotedID int64, quotedName string) (uint64, error) {
@@ -835,9 +859,7 @@ func quoteAutoSave(m *tg.NewMessage, target *tg.NewMessage, quotedID int64, quot
 	if text == "" {
 		return 0, nil
 	}
-	if len(text) > 4000 {
-		text = text[:4000]
-	}
+	text = quoteClip(text, 4000)
 	if err := quotesEnsureBucket(); err != nil {
 		return 0, err
 	}
@@ -851,7 +873,7 @@ func quoteAutoSave(m *tg.NewMessage, target *tg.NewMessage, quotedID int64, quot
 	}
 	savedByName := quoteSenderName(m)
 	var newID uint64
-	werr := d.Update(func(tx *bolt.Tx) error {
+	werr := d.Update(func(tx *mongostore.Tx) error {
 		b, e := tx.CreateBucketIfNotExists(quotesBucket)
 		if e != nil {
 			return e
@@ -931,6 +953,8 @@ func QuoteVoteCallback(m *tg.CallbackQuery) error {
 		m.Answer("voting is disabled here", &tg.CallbackOptions{Alert: false})
 		return nil
 	}
+	quoteVoteMu.Lock()
+	defer quoteVoteMu.Unlock()
 	rec := quoteVoteGet(chatID, quoteID)
 	if rec == nil {
 		m.Answer("quote not found", &tg.CallbackOptions{Alert: false})
@@ -965,7 +989,10 @@ func QuoteVoteCallback(m *tg.CallbackQuery) error {
 	}
 	_ = quoteVoteSave(rec)
 	kb := quoteVoteKeyboard(chatID, quoteID, len(rec.Up), len(rec.Down))
-	_, _ = m.Client.EditMessage(chatID, rec.MessageID, "", &tg.SendOptions{ReplyMarkup: kb})
+	// Raw edit: Client.EditMessage forces a " " caption, which stickers reject.
+	if peer, perr := m.Client.ResolvePeer(chatID); perr == nil {
+		_, _ = m.Client.MessagesEditMessage(&tg.MessagesEditMessageParams{Peer: peer, ID: rec.MessageID, ReplyMarkup: kb})
+	}
 	m.Answer(toast, &tg.CallbackOptions{Alert: false})
 	return nil
 }
@@ -975,7 +1002,7 @@ func QuoteRateHandler(m *tg.NewMessage) error {
 		m.Reply("<b>/qrate</b> works in groups only.")
 		return nil
 	}
-	if !modules.IsUserAdmin(m.Client, m.SenderID(), m.ChatID(), "") {
+	if !modules.IsUserAdmin(m.Client, m.SenderID(), m.ChannelID(), "") {
 		m.Reply("<b>Admins only.</b>")
 		return nil
 	}
@@ -1009,15 +1036,9 @@ func QuoteRandHandler(m *tg.NewMessage) error {
 		m.Reply("<b>No quotes saved here yet.</b> Run <code>/q</code> on a message first.")
 		return nil
 	}
-	idx := int(time.Now().UnixNano()) % len(all)
-	if idx < 0 {
-		idx = -idx
-	}
-	rec := all[idx]
+	rec := all[rand.IntN(len(all))]
 	preview := rec.Text
-	if len(preview) > 300 {
-		preview = preview[:300] + "..."
-	}
+	preview = quoteTrunc(preview, 300)
 	m.Reply(fmt.Sprintf("<b>%s</b> once said <code>#%d</code>:\n\n<i>%s</i>",
 		html.EscapeString(rec.UserName), rec.ID, html.EscapeString(preview)))
 	return nil
@@ -1042,7 +1063,7 @@ func QuoteTopHandler(m *tg.NewMessage) error {
 	var out []ranked
 	prefix := make([]byte, 8)
 	binary.BigEndian.PutUint64(prefix, uint64(m.ChatID()))
-	_ = d.View(func(tx *bolt.Tx) error {
+	_ = d.View(func(tx *mongostore.Tx) error {
 		b := tx.Bucket(quoteVotesBucket())
 		if b == nil {
 			return nil
@@ -1100,7 +1121,7 @@ func quoteChatPackGet(chatID int64) *quoteChatPack {
 	}
 	var pack quoteChatPack
 	found := false
-	_ = d.View(func(tx *bolt.Tx) error {
+	_ = d.View(func(tx *mongostore.Tx) error {
 		b := tx.Bucket(quotePacksBucket())
 		if b == nil {
 			return nil
@@ -1127,7 +1148,7 @@ func quoteChatPackSave(chatID int64, pack *quoteChatPack) error {
 	if err != nil || d == nil {
 		return fmt.Errorf("db unavailable")
 	}
-	return d.Update(func(tx *bolt.Tx) error {
+	return d.Update(func(tx *mongostore.Tx) error {
 		b, e := tx.CreateBucketIfNotExists(quotePacksBucket())
 		if e != nil {
 			return e
@@ -1148,6 +1169,7 @@ func QuoteStickerHandler(m *tg.NewMessage) error {
 		return nil
 	}
 	flags := quoteParseFlags(m.Args())
+	flags.ImageMode, flags.HD = false, false
 	target, err := quoteResolveTarget(m, flags)
 	if err != nil || target == nil {
 		m.Reply("<b>Usage:</b> reply to a message with <code>/qs</code> to add it to this group's quote sticker pack.")
@@ -1157,159 +1179,126 @@ func QuoteStickerHandler(m *tg.NewMessage) error {
 		m.Reply("<b>Nothing to quote.</b>")
 		return nil
 	}
+	me := m.Client.Me()
+	if me == nil || me.Username == "" {
+		m.Reply("<b>Error:</b> bot has no username; cannot own sticker sets.")
+		return nil
+	}
 
 	status, _ := m.Reply("<i>rendering + adding to pack...</i>")
 
-	scale := 2
-	if flags.HD {
-		scale = 5
-	}
-	if flags.Scale > 0 {
-		scale = flags.Scale
-	}
-	bg := flags.Bg
-	if bg == "" {
-		bg = "#1b1429"
-	}
-	brand := flags.Brand
-	if brand == "" {
-		brand = "apple"
-	}
-
-	messages := quoteCollectMessages(m.Client, m, target, flags)
-	req := qaRequest{
-		BackgroundColor: bg,
-		Width:           512,
-		Height:          768,
-		Scale:           scale,
-		EmojiBrand:      brand,
-		Messages:        messages,
-	}
-	data, rerr := quoteRequestImage(req, false)
+	data, _, rerr := quoteRequestImage(quoteBuildRequest(m, target, flags), false)
 	if rerr != nil {
-		if status != nil {
-			status.Edit("failed: " + html.EscapeString(rerr.Error()))
-		}
+		quoteStatus(m, status, "<b>Quote failed:</b> "+html.EscapeString(rerr.Error()))
 		return nil
 	}
-	outPath := filepath.Join(os.TempDir(), fmt.Sprintf("qs_%d.webp", time.Now().UnixNano()))
-	if werr := os.WriteFile(outPath, data, 0o644); werr != nil {
-		if status != nil {
-			status.Edit("failed to write image: " + html.EscapeString(werr.Error()))
-		}
-		return nil
-	}
+	ts := time.Now().UnixNano()
+	rawPath := filepath.Join(os.TempDir(), fmt.Sprintf("qs_%d_raw", ts))
+	outPath := filepath.Join(os.TempDir(), fmt.Sprintf("qs_%d.webp", ts))
+	defer os.Remove(rawPath)
 	defer os.Remove(outPath)
-
-	me := m.Client.Me()
-	if me == nil || me.Username == "" {
-		if status != nil {
-			status.Edit("bot has no username; cannot own sticker sets")
-		}
+	if werr := os.WriteFile(rawPath, data, 0o644); werr != nil {
+		quoteStatus(m, status, "<b>Quote failed:</b> "+html.EscapeString(werr.Error()))
+		return nil
+	}
+	// Sticker sets require 512px on the longest side and at most 512 KiB.
+	if eerr := kangEncodeImage(rawPath, outPath); eerr != nil {
+		quoteStatus(m, status, "<b>Quote failed:</b> "+html.EscapeString(eerr.Error()))
 		return nil
 	}
 
-	pack := quoteChatPackGet(m.ChatID())
-	needNew := pack == nil || pack.StickerCount >= MaxStickersPerPack
-
-	media, gerr := m.Client.GetSendableMedia(outPath, &tg.MediaMetadata{Inline: true})
+	media, gerr := modules.TransferSendableMedia(m.Client, outPath, &tg.MediaMetadata{Inline: true})
 	if gerr != nil {
-		if status != nil {
-			status.Edit("prepare media failed: " + html.EscapeString(gerr.Error()))
-		}
+		quoteStatus(m, status, "<b>Upload failed:</b> "+html.EscapeString(gerr.Error()))
 		return nil
 	}
 	inMedia, ok := media.(*tg.InputMediaDocument)
 	if !ok {
-		if status != nil {
-			status.Edit("unexpected media type from Telegram")
-		}
+		quoteStatus(m, status, "<b>Upload failed:</b> unexpected media type from Telegram.")
 		return nil
 	}
-	doc := inMedia.ID
-	emoji := "💬"
+	item := &tg.InputStickerSetItem{Document: inMedia.ID, Emoji: "💬"}
 
-	if needNew {
-		chatIDAbs := m.ChatID()
-		if chatIDAbs < 0 {
-			chatIDAbs = -chatIDAbs
+	pack := quoteChatPackGet(m.ChatID())
+	if pack != nil && pack.StickerCount < MaxStickersPerPack {
+		_, addErr := m.Client.StickersAddStickerToSet(&tg.InputStickerSetShortName{ShortName: pack.ShortName}, item)
+		if addErr == nil {
+			pack.StickerCount++
+			_ = quoteChatPackSave(m.ChatID(), pack)
+			quoteStatus(m, status, fmt.Sprintf(
+				"<b>Added to this chat's quote pack.</b>\nPack: <a href=\"https://t.me/addstickers/%s\">%s</a>\nStickers: %d/%d",
+				pack.ShortName, html.EscapeString(pack.Title), pack.StickerCount, MaxStickersPerPack,
+			))
+			return nil
 		}
-		packNumber := 1
-		if pack != nil {
-			packNumber = pack.PackNumber + 1
+		// Full or deleted packs roll over to a new one; anything else is reported.
+		if !tg.MatchError(addErr, "STICKERPACK_STICKERS_TOO_MUCH") && !tg.MatchError(addErr, "STICKERSET_INVALID") {
+			quoteStatus(m, status, stickerFriendlyError(m, addErr))
+			return nil
 		}
-		title := ""
-		if chat, cerr := m.Client.GetChat(m.ChatID()); cerr == nil && chat != nil {
-			title = chat.Title
-		}
-		if title == "" {
-			title = fmt.Sprintf("Chat %d", m.ChatID())
-		}
-		shortName := fmt.Sprintf("xquotes_%d_%d_by_%s", chatIDAbs, packNumber, me.Username)
-		fullTitle := fmt.Sprintf("%s — Quotes #%d", title, packNumber)
+	}
 
-		ownerID := m.SenderID()
-		ownerName := quoteSenderName(m)
-		if pack != nil {
-			ownerID = pack.OwnerID
-			ownerName = pack.OwnerName
-		}
+	chatIDAbs := m.ChatID()
+	if chatIDAbs < 0 {
+		chatIDAbs = -chatIDAbs
+	}
+	title := ""
+	if chat, cerr := m.Client.GetChat(m.ChatID()); cerr == nil && chat != nil {
+		title = chat.Title
+	} else if ch, cerr := m.Client.GetChannel(m.ChatID()); cerr == nil && ch != nil {
+		title = ch.Title
+	}
+	if title == "" {
+		title = fmt.Sprintf("Chat %d", m.ChatID())
+	}
+	ownerID, ownerName := m.SenderID(), quoteSenderName(m)
+	packNumber := 1
+	if pack != nil {
+		ownerID, ownerName = pack.OwnerID, pack.OwnerName
+		packNumber = pack.PackNumber + 1
+	}
+	if ownerID == 0 {
+		quoteStatus(m, status, "<b>Error:</b> send /qs as yourself (not anonymously) so the pack has an owner.")
+		return nil
+	}
+	ownerHash := quoteResolveAccessHash(m, ownerID)
 
-		_, createErr := m.Client.StickersCreateStickerSet(&tg.StickersCreateStickerSetParams{
-			UserID:    &tg.InputUserObj{UserID: ownerID, AccessHash: quoteResolveAccessHash(m, ownerID)},
+	var shortName, fullTitle string
+	var createErr error
+	for range 10 {
+		shortName = fmt.Sprintf("xquotes_%d_%d_by_%s", chatIDAbs, packNumber, me.Username)
+		fullTitle = quoteClip(fmt.Sprintf("%s — Quotes #%d", title, packNumber), 64)
+		_, createErr = m.Client.StickersCreateStickerSet(&tg.StickersCreateStickerSetParams{
+			UserID:    &tg.InputUserObj{UserID: ownerID, AccessHash: ownerHash},
 			Title:     fullTitle,
 			ShortName: shortName,
-			Stickers: []*tg.InputStickerSetItem{
-				{Document: doc, Emoji: emoji},
-			},
+			Stickers:  []*tg.InputStickerSetItem{item},
 		})
-		if createErr != nil {
-			if status != nil {
-				status.Edit(html.EscapeString(stickerFriendlyError(m, createErr)))
-			}
-			return nil
+		if createErr == nil || !tg.MatchError(createErr, "SHORT_NAME_OCCUPIED") {
+			break
 		}
-		newPack := &quoteChatPack{
-			OwnerID:      ownerID,
-			OwnerName:    ownerName,
-			ShortName:    shortName,
-			Title:        fullTitle,
-			PackNumber:   packNumber,
-			StickerCount: 1,
-		}
-		if err := quoteChatPackSave(m.ChatID(), newPack); err != nil {
-			if status != nil {
-				status.Edit("saved on Telegram but DB save failed: " + html.EscapeString(err.Error()))
-			}
-			return nil
-		}
-		if status != nil {
-			status.Edit(fmt.Sprintf(
-				"<b>New quote pack created for this chat.</b>\nPack: <a href=\"https://t.me/addstickers/%s\">%s</a>\nStickers: 1/%d",
-				shortName, html.EscapeString(fullTitle), MaxStickersPerPack,
-			))
-		}
+		packNumber++
+	}
+	if createErr != nil {
+		quoteStatus(m, status, stickerFriendlyError(m, createErr))
 		return nil
 	}
-
-	_, addErr := m.Client.StickersAddStickerToSet(
-		&tg.InputStickerSetShortName{ShortName: pack.ShortName},
-		&tg.InputStickerSetItem{Document: doc, Emoji: emoji},
-	)
-	if addErr != nil {
-		if status != nil {
-			status.Edit(html.EscapeString(stickerFriendlyError(m, addErr)))
-		}
+	newPack := &quoteChatPack{
+		OwnerID:      ownerID,
+		OwnerName:    ownerName,
+		ShortName:    shortName,
+		Title:        fullTitle,
+		PackNumber:   packNumber,
+		StickerCount: 1,
+	}
+	if err := quoteChatPackSave(m.ChatID(), newPack); err != nil {
+		quoteStatus(m, status, "Pack created on Telegram but DB save failed: "+html.EscapeString(err.Error()))
 		return nil
 	}
-	pack.StickerCount++
-	_ = quoteChatPackSave(m.ChatID(), pack)
-	if status != nil {
-		status.Edit(fmt.Sprintf(
-			"<b>Added to this chat's quote pack.</b>\nPack: <a href=\"https://t.me/addstickers/%s\">%s</a>\nStickers: %d/%d",
-			pack.ShortName, html.EscapeString(pack.Title), pack.StickerCount, MaxStickersPerPack,
-		))
-	}
+	quoteStatus(m, status, fmt.Sprintf(
+		"<b>New quote pack created for this chat.</b>\nPack: <a href=\"https://t.me/addstickers/%s\">%s</a>\nStickers: 1/%d",
+		shortName, html.EscapeString(fullTitle), MaxStickersPerPack,
+	))
 	return nil
 }
 
@@ -1328,7 +1317,7 @@ func quotesEnsureBucket() error {
 	if err != nil || d == nil {
 		return fmt.Errorf("db unavailable")
 	}
-	return d.Update(func(tx *bolt.Tx) error {
+	return d.Update(func(tx *mongostore.Tx) error {
 		_, e := tx.CreateBucketIfNotExists(quotesBucket)
 		return e
 	})
@@ -1341,7 +1330,7 @@ func quotesChatKey(chatID int64, id uint64) []byte {
 	return b
 }
 
-func quotesNextID(tx *bolt.Tx, chatID int64) uint64 {
+func quotesNextID(tx *mongostore.Tx, chatID int64) uint64 {
 	b := tx.Bucket(quotesBucket)
 	if b == nil {
 		return 1
@@ -1373,7 +1362,7 @@ func quotesListByChat(chatID int64) ([]quoteRecord, error) {
 	var out []quoteRecord
 	prefix := make([]byte, 8)
 	binary.BigEndian.PutUint64(prefix, uint64(chatID))
-	err = d.View(func(tx *bolt.Tx) error {
+	err = d.View(func(tx *mongostore.Tx) error {
 		b := tx.Bucket(quotesBucket)
 		if b == nil {
 			return nil
@@ -1406,9 +1395,7 @@ func QuoteSaveHandler(m *tg.NewMessage) error {
 		m.Reply("<b>Nothing to save.</b> The message has no text.")
 		return nil
 	}
-	if len(text) > 4000 {
-		text = text[:4000]
-	}
+	text = quoteClip(text, 4000)
 
 	var userID int64
 	name := "User"
@@ -1444,7 +1431,7 @@ func QuoteSaveHandler(m *tg.NewMessage) error {
 	}
 
 	var newID uint64
-	werr := d.Update(func(tx *bolt.Tx) error {
+	werr := d.Update(func(tx *mongostore.Tx) error {
 		b, e := tx.CreateBucketIfNotExists(quotesBucket)
 		if e != nil {
 			return e
@@ -1473,9 +1460,7 @@ func QuoteSaveHandler(m *tg.NewMessage) error {
 	}
 
 	preview := text
-	if len(preview) > 120 {
-		preview = preview[:120] + "..."
-	}
+	preview = quoteTrunc(preview, 120)
 	m.Reply(fmt.Sprintf("<b>Quote saved.</b> <code>#%d</code>\n\n<b>%s</b>: <i>%s</i>",
 		newID, html.EscapeString(name), html.EscapeString(preview)))
 	return nil
@@ -1506,9 +1491,7 @@ func QuotesListHandler(m *tg.NewMessage) error {
 	resp.WriteString("━━━━━━━━━━━━━━━━\n\n")
 	for _, rec := range all[start:end] {
 		preview := rec.Text
-		if len(preview) > 90 {
-			preview = preview[:90] + "..."
-		}
+		preview = quoteTrunc(preview, 90)
 		fmt.Fprintf(&resp, "<code>#%d</code> <b>%s</b>\n<i>%s</i>\n\n",
 			rec.ID,
 			html.EscapeString(rec.UserName),
@@ -1524,7 +1507,7 @@ func QuotesListHandler(m *tg.NewMessage) error {
 
 func QuoteDeleteHandler(m *tg.NewMessage) error {
 	if !m.IsPrivate() {
-		if !modules.IsUserAdmin(m.Client, m.SenderID(), m.ChatID(), "change_info") {
+		if !modules.IsUserAdmin(m.Client, m.SenderID(), m.ChannelID(), "change_info") {
 			m.Reply("<b>Permission denied.</b> Admins only.")
 			return nil
 		}
@@ -1550,7 +1533,7 @@ func QuoteDeleteHandler(m *tg.NewMessage) error {
 		return nil
 	}
 	found := false
-	_ = d.Update(func(tx *bolt.Tx) error {
+	_ = d.Update(func(tx *mongostore.Tx) error {
 		b := tx.Bucket(quotesBucket)
 		if b == nil {
 			return nil
@@ -1603,9 +1586,7 @@ func QuotesSearchHandler(m *tg.NewMessage) error {
 			break
 		}
 		preview := rec.Text
-		if len(preview) > 100 {
-			preview = preview[:100] + "..."
-		}
+		preview = quoteTrunc(preview, 100)
 		fmt.Fprintf(&resp, "<code>#%d</code> <b>%s</b>\n<i>%s</i>\n\n",
 			rec.ID, html.EscapeString(rec.UserName), html.EscapeString(preview))
 	}
@@ -1616,43 +1597,50 @@ func QuotesSearchHandler(m *tg.NewMessage) error {
 
 func registerQuotesHandlers() {
 	c := modules.Client
-	c.On("cmd:q", QuoteImageHandler)
-	c.On("cmd:qhd", QuoteHDImageHandler)
-	c.On("cmd:qsave", QuoteSaveHandler)
-	c.On("cmd:quotes", QuotesListHandler)
-	c.On("cmd:delq", QuoteDeleteHandler)
-	c.On("cmd:qsearch", QuotesSearchHandler)
-	c.On("cmd:qrate", QuoteRateHandler)
-	c.On("cmd:qrand", QuoteRandHandler)
-	c.On("cmd:qtop", QuoteTopHandler)
-	c.On("cmd:qs", QuoteStickerHandler)
+	modules.OnCommand(c, "cmd:q", QuoteImageHandler)
+	modules.OnCommand(c, "cmd:qhd", QuoteHDImageHandler)
+	modules.OnCommand(c, "cmd:qsave", QuoteSaveHandler)
+	modules.OnCommand(c, "cmd:quotes", QuotesListHandler)
+	modules.OnCommand(c, "cmd:delq", QuoteDeleteHandler)
+	modules.OnCommand(c, "cmd:qsearch", QuotesSearchHandler)
+	modules.OnCommand(c, "cmd:qrate", QuoteRateHandler)
+	modules.OnCommand(c, "cmd:qrand", QuoteRandHandler)
+	modules.OnCommand(c, "cmd:qtop", QuoteTopHandler)
+	modules.OnCommand(c, "cmd:qs", QuoteStickerHandler)
 	c.On("callback:qvote:", QuoteVoteCallback)
 }
 
 func init() {
 	modules.QueueHandlerRegistration(registerQuotesHandlers)
-}
 
-func memeFontPath(name string) string {
-	candidates := []string{
-		"./assets/" + name,
-		"assets/" + name,
-		"../assets/" + name,
-	}
-	if exe, err := os.Executable(); err == nil {
-		dir := filepath.Dir(exe)
-		candidates = append(candidates,
-			filepath.Join(dir, "assets", name),
-			filepath.Join(dir, "..", "assets", name),
-		)
-	}
-	if wd, err := os.Getwd(); err == nil {
-		candidates = append(candidates, filepath.Join(wd, "assets", name))
-	}
-	for _, p := range candidates {
-		if _, err := os.Stat(p); err == nil {
-			return p
-		}
-	}
-	return ""
+	modules.Mods.AddModule("Quotes", `<b>Quotes Module</b>
+
+Turn messages into Telegram-style quote stickers and keep a per-chat quote book.
+
+<b>Render:</b>
+ - /q — reply to a message to render it as a quote sticker (also saves it)
+ - /qhd — same, as a high-resolution PNG
+ - /qs — add the quote to this group's shared sticker pack (groups only)
+
+<b>/q flags</b> (any order, e.g. <code>/q r 3 red</code>):
+ - <code>r</code> — include the message it replies to
+ - <code>2</code>-<code>10</code> — stack that many recent messages
+ - <code>p</code> — image mode (PNG instead of sticker)
+ - <code>hd</code> — high resolution, <code>scale=1-10</code> — custom scale
+ - <code>q</code> — blockquote style
+ - <code>brand=apple|google|twitter</code> — emoji style
+ - any other word or <code>#hex</code> — background colour
+
+<b>Quote book:</b>
+ - /qsave — reply to save a message without rendering
+ - /quotes [page] — list saved quotes
+ - /qsearch &lt;keyword&gt; — search by text or author
+ - /qrand — a random saved quote
+ - /delq &lt;id&gt; — delete a quote (admins in groups)
+
+<b>Voting:</b>
+ - /qrate on|off — add 👍/👎 buttons to new /q stickers (admins)
+ - /qtop [n] — top voted quotes (default 10, max 50)
+
+<i>Note:</i> /qs needs the person who creates the pack to have started the bot in DM.`)
 }

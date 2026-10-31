@@ -1,14 +1,18 @@
 package extras
 
 import (
+	"context"
+	"errors"
 	"fmt"
+	"html"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
 
-	"github.com/amarnathcjd/gogram/telegram"
+	"github.com/xAmarnath/gogram/telegram"
 	modules "main/modules"
 )
 
@@ -115,7 +119,7 @@ func SetThumbHandler(m *telegram.NewMessage) error {
 		return nil
 	}
 
-	_, err = msg.Download(&telegram.DownloadOptions{FileName: "thumb.jpg"})
+	_, err = modules.TransferDownload(msg, &telegram.DownloadOptions{FileName: "thumb.jpg"})
 	if err != nil {
 		m.Reply("Error: " + err.Error())
 		return nil
@@ -143,147 +147,83 @@ func SetThumbHandler(m *telegram.NewMessage) error {
 }
 
 func MirrorFileHandler(m *telegram.NewMessage) error {
-	if !m.IsReply() && m.Args() == "" {
-		m.Reply("Reply to a file to download it\n\nOptions:\n-c <dest> : destination chat (@user, t.me/user, t.me/c/id)\n-nop : no progress\n-doc : force document\n-not : no thumbnail\n-d <sec> : delay in seconds\n-fn <name> : custom filename")
-		return nil
-	}
-
 	opts := parseMirrorArgs(m.Args())
-
-	var r, msg *telegram.NewMessage
-	if m.IsReply() {
-		reply, err := m.GetReplyMessage()
-		if err != nil {
-			m.Reply("Error: " + err.Error())
-			return nil
-		}
-		r = reply
+	source := *m
+	if !m.IsReply() {
+		message := *m.Message
+		message.Message = "/ldl " + opts.SourceLink
+		source.Message = &message
+	}
+	r, _, err := modules.ResolveDownloadSource(&source)
+	if err != nil {
+		_, err = m.Reply("Cannot read source: " + html.EscapeString(err.Error()))
+		return err
+	}
+	if r == nil || r.File == nil {
+		_, err = m.Reply("Reply to a file or provide a t.me file link.")
+		return err
+	}
+	status, err := m.Reply("Downloading…")
+	if err != nil {
+		return err
+	}
+	ctx, done := modules.TrackUserFileTransfer(status, m.SenderID())
+	defer done()
+	if err = os.MkdirAll("downloads", 0755); err != nil {
+		return err
+	}
+	dir, err := os.MkdirTemp("downloads", "mirror-")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(dir)
+	name := opts.FileName
+	if name == "" {
+		name = r.File.Name
+	}
+	name = filepath.Base(name)
+	if name == "." || name == "/" {
+		name = "file"
+	}
+	dl := &telegram.DownloadOptions{Ctx: ctx, FileName: filepath.Join(dir, name)}
+	if !opts.NoProgress {
+		dl.ProgressManager = modules.TransferProgress(status, modules.TransferMediaDC(r.Media()))
+	}
+	fi, err := modules.TransferDownload(r, dl)
+	if err == nil {
+		upload := &telegram.UploadOptions{Ctx: ctx}
 		if !opts.NoProgress {
-			msg, _ = m.Reply("Downloading...")
+			upload.ProgressManager = modules.TransferProgress(status)
 		}
-	} else if opts.SourceLink != "" {
-		// Parse source link
-		reg := regexp.MustCompile(`t.me/(\w+)/(\d+)`)
-		match := reg.FindStringSubmatch(opts.SourceLink)
-		if len(match) != 3 || match[1] == "c" {
-			// https://t.me/c/2183493392/8
-			reg = regexp.MustCompile(`t.me/c/(\d+)/(\d+)`)
-			match = reg.FindStringSubmatch(opts.SourceLink)
-			if len(match) != 3 {
-				m.Reply("Invalid link")
-				return nil
+		media := &telegram.MediaOptions{ForceDocument: opts.ForceDocument, Spoiler: true, Upload: upload, Caption: html.EscapeString(name), ParseMode: telegram.HTML}
+		if !opts.NoThumb {
+			if _, e := os.Stat("thumb.jpg"); e == nil {
+				media.Thumb = "thumb.jpg"
 			}
-
-			id, err := strconv.Atoi(match[2])
-			if err != nil {
-				m.Reply("Invalid link: " + err.Error())
-				return nil
-			}
-
-			chatID, err := strconv.Atoi(match[1])
-			if err != nil {
-				m.Reply("Invalid link: " + err.Error())
-				return nil
-			}
-
-			msgX, err := m.Client.GetMessageByID(chatID, int32(id))
-			if err != nil {
-				m.Reply("Error: " + err.Error())
-				return nil
-			}
-			r = msgX
-			if opts.FileName == "" {
-				opts.FileName = r.File.Name
-			}
-			if !opts.NoProgress {
-				msg, _ = m.Reply("Downloading... (from c " + strconv.Itoa(id) + ")")
-			}
+		}
+		if opts.Destination == nil {
+			_, err = modules.TransferUploadEdit(status, fi, media)
 		} else {
-			username := match[1]
-			id, err := strconv.Atoi(match[2])
-			if err != nil {
-				m.Reply("Invalid link")
-				return nil
-			}
-
-			msgX, err := m.Client.GetMessageByID(username, int32(id))
-			if err != nil {
-				m.Reply("Error: " + err.Error())
-				return nil
-			}
-			r = msgX
-			if opts.FileName == "" {
-				opts.FileName = r.File.Name
-			}
-			if !opts.NoProgress {
-				msg, _ = m.Reply("Downloading... (from " + username + " " + strconv.Itoa(id) + ")")
+			_, err = modules.TransferSendMedia(m.Client, opts.Destination, fi, media)
+			if err == nil {
+				_, err = status.Edit("File mirrored successfully.")
 			}
 		}
-	} else {
-		m.Reply("No source specified. Reply to a message or provide a t.me link")
-		return nil
 	}
-
-	// Set up download options
-	dlOpts := &telegram.DownloadOptions{FileName: opts.FileName}
-	if !opts.NoProgress && msg != nil {
-		dlOpts.ProgressManager = telegram.NewProgressManager(5).SetMessage(msg)
-	}
-
-	fi, err := r.Download(dlOpts)
 	if err != nil {
-		if msg != nil {
-			msg.Edit("Error: " + err.Error())
-		} else {
-			m.Reply("Error: " + err.Error())
+		text := "Mirror failed: " + html.EscapeString(err.Error())
+		if errors.Is(err, context.Canceled) {
+			text = "Mirror cancelled. Partial files removed."
 		}
-		return nil
-	}
-
-	// Set up upload options
-	var mediaOpts = &telegram.MediaOptions{
-		ForceDocument: opts.ForceDocument,
-		Spoiler:       true,
-	}
-
-	if !opts.NoProgress && msg != nil {
-		mediaOpts.Upload = &telegram.UploadOptions{
-			ProgressManager: telegram.NewProgressManager(5).SetMessage(msg),
-		}
-	}
-
-	if !opts.NoThumb {
-		if _, err := os.Stat("thumb.jpg"); err == nil {
-			mediaOpts.Thumb = "thumb.jpg"
-		}
-	}
-
-	// Determine destination
-	var dest any = m.ChatID()
-	if opts.Destination != nil {
-		dest = opts.Destination
-	}
-
-	_, err = m.Client.SendMedia(dest, fi, mediaOpts)
-	if err != nil {
-		if msg != nil {
-			msg.Edit("Upload Error: " + err.Error())
-		} else {
-			m.Reply("Upload Error: " + err.Error())
-		}
-	}
-
-	defer os.Remove(fi)
-	if msg != nil {
-		defer msg.Delete()
+		_, editErr := status.Edit(text, &telegram.SendOptions{ParseMode: telegram.HTML})
+		return editErr
 	}
 	return nil
 }
-
 func registerMediaHandlers() {
 	c := modules.Client
-	c.On("cmd:thumb", SetThumbHandler)
-	c.On("cmd:mirror", MirrorFileHandler)
+	modules.OnCommand(c, "cmd:thumb", SetThumbHandler, telegram.CustomFilter(modules.FilterTransferUser))
+	modules.OnCommand(c, "cmd:mirror", MirrorFileHandler, telegram.CustomFilter(modules.FilterTransferUser))
 }
 
 func init() {

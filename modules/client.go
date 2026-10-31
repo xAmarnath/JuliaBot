@@ -1,12 +1,11 @@
 package modules
 
 import (
-	"main/modules/db"
 	"os"
 	"strconv"
 	"strings"
 
-	tg "github.com/amarnathcjd/gogram/telegram"
+	tg "github.com/xAmarnath/gogram/telegram"
 )
 
 var (
@@ -31,12 +30,6 @@ func RegisterHandlers() {
 
 	_, _ = Client.UpdatesGetState()
 	Client.SetCommandPrefixes("./!-?")
-
-	if me := Client.Me(); me != nil && me.Username != "" {
-		if purged, err := db.PurgeStickersIfBotChanged(me.Username); err == nil && purged {
-			Client.Logger.Info("Sticker DB purged: previous packs were owned by a different bot. Fresh start under @" + me.Username)
-		}
-	}
 
 	if !LoadModules {
 		return
@@ -87,3 +80,21 @@ func FilterOwnerAndAuth(m *tg.NewMessage) bool {
 func FilterOwnerNoReply(m *tg.NewMessage) bool {
 	return m.SenderID() == OwnerId
 }
+
+func IsTransferUser(id int64) bool {
+	if id <= 0 {
+		return false
+	}
+	if id == OwnerId {
+		return true
+	}
+	for _, value := range strings.FieldsFunc(os.Getenv("AUTH_USERS"), func(r rune) bool { return r == ',' || r == ' ' || r == '\n' || r == '\t' }) {
+		user, err := strconv.ParseInt(value, 10, 64)
+		if err == nil && user == id {
+			return true
+		}
+	}
+	return false
+}
+
+func FilterTransferUser(m *tg.NewMessage) bool { return IsTransferUser(m.SenderID()) }

@@ -9,7 +9,7 @@ import (
 
 	modules "main/modules"
 
-	tg "github.com/amarnathcjd/gogram/telegram"
+	tg "github.com/xAmarnath/gogram/telegram"
 )
 
 type mathToken struct {
@@ -468,9 +468,9 @@ func UnitConvHandler(m *tg.NewMessage) error {
 
 func registerMathEngineHandlers() {
 	c := modules.Client
-	c.On("cmd:calc", CalcHandler)
-	c.On("cmd:eqsolve", EqSolveHandler)
-	c.On("cmd:unitconv", UnitConvHandler)
+	modules.OnCommand(c, "cmd:calc", CalcHandler)
+	modules.OnCommand(c, "cmd:eqsolve", EqSolveHandler)
+	modules.OnCommand(c, "cmd:unitconv", UnitConvHandler)
 }
 
 func init() {

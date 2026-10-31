@@ -1,8 +1,8 @@
 package extras
 
 import (
+	"context"
 	"fmt"
-	"hash/fnv"
 	"html"
 	"image"
 	"image/color"
@@ -16,14 +16,16 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
-	tg "github.com/amarnathcjd/gogram/telegram"
+	tg "github.com/xAmarnath/gogram/telegram"
 	"github.com/fogleman/gg"
-	"golang.org/x/image/font/basicfont"
+	"github.com/golang/freetype/truetype"
 )
 
 func circleCropApplyMask(src image.Image) image.Image {
@@ -69,29 +71,38 @@ func circleCropSavePNG(img image.Image, outPath string) error {
 	return gg.NewContextForImage(img).SavePNG(outPath)
 }
 
-func CircleCropHandler(m *tg.NewMessage) error {
+const imgMaxInput = 20 << 20
+
+// imgReplySource returns the replied photo/image-document message, or a user-facing error.
+func imgReplySource(m *tg.NewMessage, usage string) (*tg.NewMessage, string) {
 	if !m.IsReply() {
-		m.Reply("reply to a photo with <code>/circle</code> to crop it into a circle")
-		return nil
+		return nil, usage
 	}
-
 	r, err := m.GetReplyMessage()
-	if err != nil {
-		m.Reply("error: " + html.EscapeString(err.Error()))
-		return nil
+	if err != nil || r == nil {
+		return nil, "could not fetch the replied message"
 	}
+	if r.Photo() != nil {
+		return r, ""
+	}
+	if d := r.Document(); d != nil && strings.HasPrefix(d.MimeType, "image/") {
+		if d.Size > imgMaxInput {
+			return nil, "image is too large (max 20 MB)"
+		}
+		return r, ""
+	}
+	return nil, "the replied message is not an image"
+}
 
-	if r.Photo() == nil {
-		m.Reply("the replied message is not a photo")
+func CircleCropHandler(m *tg.NewMessage) error {
+	r, msg := imgReplySource(m, "reply to a photo with <code>/circle</code> to crop it into a circle")
+	if r == nil {
+		m.Reply(msg)
 		return nil
 	}
 
 	status, _ := m.Reply("<code>cropping into circle...</code>")
-
-	inPath := filepath.Join(os.TempDir(), fmt.Sprintf("circle_in_%d.jpg", time.Now().UnixNano()))
-	_, err = m.Client.DownloadMedia(r.Media(), &tg.DownloadOptions{FileName: inPath})
-	if err != nil {
-		msg := "error downloading photo: " + html.EscapeString(err.Error())
+	fail := func(msg string) error {
 		if status != nil {
 			status.Edit(msg)
 		} else {
@@ -99,55 +110,46 @@ func CircleCropHandler(m *tg.NewMessage) error {
 		}
 		return nil
 	}
+
+	inPath := filepath.Join(os.TempDir(), fmt.Sprintf("circle_in_%d", time.Now().UnixNano()))
+	got, err := modules.TransferDownload(r, &tg.DownloadOptions{FileName: inPath})
+	if got != "" && got != inPath {
+		defer os.Remove(got)
+	}
 	defer os.Remove(inPath)
+	if err != nil {
+		return fail("error downloading image: " + html.EscapeString(err.Error()))
+	}
+	if got != "" {
+		inPath = got
+	}
 
 	src, err := circleCropDecodeFile(inPath)
 	if err != nil {
-		msg := "error decoding image: " + html.EscapeString(err.Error())
-		if status != nil {
-			status.Edit(msg)
-		} else {
-			m.Reply(msg)
-		}
-		return nil
+		return fail("error decoding image: " + html.EscapeString(err.Error()))
 	}
-
 	b := src.Bounds()
 	if b.Dx() <= 0 || b.Dy() <= 0 {
-		msg := "invalid image dimensions"
-		if status != nil {
-			status.Edit(msg)
-		} else {
-			m.Reply(msg)
-		}
-		return nil
+		return fail("invalid image dimensions")
 	}
-
-	out := circleCropApplyMask(src)
 
 	outPath := filepath.Join(os.TempDir(), fmt.Sprintf("circle_out_%d.png", time.Now().UnixNano()))
-	if err := circleCropSavePNG(out, outPath); err != nil {
-		msg := "error saving png: " + html.EscapeString(err.Error())
-		if status != nil {
-			status.Edit(msg)
-		} else {
-			m.Reply(msg)
-		}
-		return nil
-	}
 	defer os.Remove(outPath)
+	if err := circleCropSavePNG(circleCropApplyMask(src), outPath); err != nil {
+		return fail("error saving png: " + html.EscapeString(err.Error()))
+	}
 
-	side := int(math.Min(float64(b.Dx()), float64(b.Dy())))
+	side := min(b.Dx(), b.Dy())
 	caption := fmt.Sprintf("<b>Circle Crop</b>\n<b>Size:</b> <code>%dx%d</code>", side, side)
-
 	if status != nil {
 		status.Delete()
 	}
-
-	_, merr := m.ReplyMedia(outPath, &tg.MediaOptions{
-		Caption:  caption,
-		FileName: "circle.png",
-		MimeType: "image/png",
+	// Sent as a file so Telegram keeps the transparent corners.
+	_, merr := modules.TransferReplyMedia(m, outPath, &tg.MediaOptions{
+		Caption:       caption,
+		FileName:      "circle.png",
+		MimeType:      "image/png",
+		ForceDocument: true,
 	})
 	if merr != nil {
 		m.Reply("upload failed: " + html.EscapeString(merr.Error()))
@@ -157,7 +159,7 @@ func CircleCropHandler(m *tg.NewMessage) error {
 
 func registerImageCropHandlers() {
 	c := modules.Client
-	c.On("cmd:circle", CircleCropHandler)
+	modules.OnCommand(c, "cmd:circle", CircleCropHandler)
 }
 
 func initFromSrc_image_crop_0_1() { modules.QueueHandlerRegistration(registerImageCropHandlers) }
@@ -425,12 +427,30 @@ func colorsLoadFont(dc *gg.Context, size float64) {
 		)
 	}
 	for _, p := range candidates {
-		if _, err := os.Stat(p); err == nil {
-			if err := dc.LoadFontFace(p, size); err == nil {
-				return
-			}
+		if f := imgFont(p); f != nil {
+			dc.SetFontFace(truetype.NewFace(f, &truetype.Options{Size: size}))
+			return
 		}
 	}
+}
+
+var imgFontCache sync.Map
+
+// imgFont parses a font file once; gg.LoadFontFace re-reads and re-parses it on every call.
+func imgFont(path string) *truetype.Font {
+	if v, ok := imgFontCache.Load(path); ok {
+		return v.(*truetype.Font)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	f, err := truetype.Parse(data)
+	if err != nil {
+		return nil
+	}
+	v, _ := imgFontCache.LoadOrStore(path, f)
+	return v.(*truetype.Font)
 }
 
 func colorsRenderSwatch(c color.RGBA) (string, error) {
@@ -538,7 +558,7 @@ func ColorHandler(m *tg.NewMessage) error {
 		status.Delete()
 	}
 
-	_, merr := m.ReplyMedia(out, &tg.MediaOptions{
+	_, merr := modules.TransferReplyMedia(m, out, &tg.MediaOptions{
 		Caption:  b.String(),
 		FileName: "color.png",
 		MimeType: "image/png",
@@ -553,13 +573,13 @@ func ColorHandler(m *tg.NewMessage) error {
 func ColorsHandler(m *tg.NewMessage) error {
 	arg := strings.TrimSpace(m.Args())
 	if arg == "" {
-		m.Reply("usage: <code>/colors &lt;hex&gt;</code>\nexample: <code>/colors #ff6a3d</code>")
+		m.Reply("usage: <code>/colors &lt;hex_or_name&gt;</code>\nexample: <code>/colors #ff6a3d</code>")
 		return nil
 	}
 	token := strings.Fields(arg)[0]
-	c, err := colorsParseHex(token)
+	c, _, err := colorsResolve(token)
 	if err != nil {
-		m.Reply("invalid hex color: " + html.EscapeString(token))
+		m.Reply("invalid color: " + html.EscapeString(token))
 		return nil
 	}
 
@@ -582,72 +602,78 @@ func ColorsHandler(m *tg.NewMessage) error {
 
 func registerColorsHandlers() {
 	c := modules.Client
-	c.On("cmd:color", ColorHandler)
-	c.On("cmd:colors", ColorsHandler)
+	modules.OnCommand(c, "cmd:color", ColorHandler)
+	modules.OnCommand(c, "cmd:colors", ColorsHandler)
 }
 
 func initFromSrc_colors_1_1() {
 	modules.QueueHandlerRegistration(registerColorsHandlers)
 }
 
-func WallpaperHandler(m *tg.NewMessage) error {
-	query := strings.TrimSpace(m.Args())
-	if query == "" {
-		m.Reply("usage: <code>/wallpaper &lt;query&gt;</code> or <code>/wallpaper random</code>")
-		return nil
-	}
-
-	var endpoint string
-	var label string
-	if strings.EqualFold(query, "random") {
-		endpoint = fmt.Sprintf("https://picsum.photos/1280/720?rand=%d", time.Now().UnixNano())
-		label = "random"
-	} else {
-		endpoint = "https://picsum.photos/seed/" + url.PathEscape(query) + "/1280/720"
-		label = query
-	}
-
-	req, err := http.NewRequest(http.MethodGet, endpoint, nil)
+// imgDownloadTemp streams an image URL into a temp file (capped at imgMaxInput).
+func imgDownloadTemp(ctx context.Context, target, pattern string) (string, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
 	if err != nil {
-		m.Reply("error: " + html.EscapeString(err.Error()))
-		return nil
+		return "", err
 	}
-	req.Header.Set("User-Agent", "JuliaBot/1.0")
-
-	client := &http.Client{Timeout: 30 * time.Second}
-	resp, err := client.Do(req)
+	req.Header.Set("User-Agent", browserUA)
+	resp, err := extHTTP.Do(req)
 	if err != nil {
-		m.Reply("error fetching wallpaper: " + html.EscapeString(err.Error()))
-		return nil
+		return "", err
 	}
 	defer resp.Body.Close()
-
 	if resp.StatusCode != http.StatusOK {
-		m.Reply(fmt.Sprintf("wallpaper api returned status %d", resp.StatusCode))
-		return nil
+		return "", &httpStatusError{Code: resp.StatusCode}
 	}
-
-	tmpPath := filepath.Join(os.TempDir(), fmt.Sprintf("wallpaper_%d.jpg", time.Now().UnixNano()))
-	out, err := os.Create(tmpPath)
+	if ct := resp.Header.Get("Content-Type"); !strings.HasPrefix(ct, "image/") {
+		return "", fmt.Errorf("unexpected content-type %q", ct)
+	}
+	f, err := os.CreateTemp("", pattern)
 	if err != nil {
-		m.Reply("error creating temp file: " + html.EscapeString(err.Error()))
-		return nil
+		return "", err
 	}
-
-	if _, err := io.Copy(out, io.LimitReader(resp.Body, 15*1024*1024)); err != nil {
-		out.Close()
-		os.Remove(tmpPath)
-		m.Reply("error writing wallpaper: " + html.EscapeString(err.Error()))
-		return nil
+	n, err := io.Copy(f, io.LimitReader(resp.Body, imgMaxInput+1))
+	f.Close()
+	switch {
+	case err != nil:
+	case n == 0:
+		err = fmt.Errorf("empty image response")
+	case n > imgMaxInput:
+		err = fmt.Errorf("image exceeds %d MB", imgMaxInput>>20)
 	}
-	out.Close()
-	defer os.Remove(tmpPath)
-
-	caption := "<b>Wallpaper</b>\n<code>" + html.EscapeString(label) + "</code>"
-	_, err = m.ReplyMedia(tmpPath, &tg.MediaOptions{Caption: caption})
 	if err != nil {
-		m.Reply("error sending wallpaper: " + html.EscapeString(err.Error()))
+		os.Remove(f.Name())
+		return "", err
+	}
+	return f.Name(), nil
+}
+
+func WallpaperHandler(m *tg.NewMessage) error {
+	seed := strings.TrimSpace(m.Args())
+	status := modules.NewStatus(m, "Fetching a wallpaper…")
+	endpoint := fmt.Sprintf("https://picsum.photos/1280/720?random=%d", time.Now().UnixNano())
+	label := "random"
+	if seed != "" && !strings.EqualFold(seed, "random") {
+		if r := []rune(seed); len(r) > 64 {
+			seed = string(r[:64])
+		}
+		endpoint = "https://picsum.photos/seed/" + url.PathEscape(seed) + "/1280/720"
+		label = "seed: " + seed
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+	path, err := imgDownloadTemp(ctx, endpoint, "wallpaper-*.jpg")
+	if err != nil {
+		status.Edit("error fetching wallpaper: " + html.EscapeString(err.Error()))
 		return nil
+	}
+	defer os.Remove(path)
+
+	caption := "<b>Wallpaper</b> · 1280x720\n<code>" + html.EscapeString(label) + "</code>"
+	status.Done()
+	if _, err = modules.TransferReplyMedia(m, path, &tg.MediaOptions{Caption: caption}); err != nil {
+		status.Edit("error sending wallpaper: " + html.EscapeString(err.Error()))
 	}
 	return nil
 }
@@ -656,1540 +682,35 @@ func initFromSrc_wallpaper_2_1() { modules.QueueHandlerRegistration(registerWall
 
 func registerWallpaperHandlers() {
 	c := modules.Client
-	c.On("cmd:wallpaper", WallpaperHandler)
+	modules.OnCommand(c, "cmd:wallpaper", WallpaperHandler)
 }
 
-type pcardPalette struct {
-	BgTop   color.RGBA
-	BgMid   color.RGBA
-	BgBot   color.RGBA
-	Accent  color.RGBA
-	Accent2 color.RGBA
-	Surface color.RGBA
-}
-
-type pcardTarget struct {
-	UserID    int64
-	FirstName string
-	LastName  string
-	Username  string
-	Photo     tg.UserProfilePhoto
-}
-
-var pcardPalettes = []pcardPalette{
-	{color.RGBA{0x0b, 0x0f, 0x1c, 0xff}, color.RGBA{0x14, 0x18, 0x2c, 0xff}, color.RGBA{0x1d, 0x22, 0x3d, 0xff}, color.RGBA{0x7c, 0x3a, 0xed, 0xff}, color.RGBA{0xc0, 0x84, 0xfc, 0xff}, color.RGBA{0x1a, 0x1f, 0x35, 0xff}},
-	{color.RGBA{0x0a, 0x1a, 0x14, 0xff}, color.RGBA{0x0e, 0x26, 0x1f, 0xff}, color.RGBA{0x13, 0x33, 0x2a, 0xff}, color.RGBA{0x10, 0xb9, 0x81, 0xff}, color.RGBA{0x6e, 0xe7, 0xb7, 0xff}, color.RGBA{0x10, 0x28, 0x22, 0xff}},
-	{color.RGBA{0x1a, 0x07, 0x0c, 0xff}, color.RGBA{0x2c, 0x0c, 0x18, 0xff}, color.RGBA{0x40, 0x12, 0x24, 0xff}, color.RGBA{0xf4, 0x3f, 0x5e, 0xff}, color.RGBA{0xfd, 0xa4, 0xaf, 0xff}, color.RGBA{0x33, 0x10, 0x1d, 0xff}},
-	{color.RGBA{0x08, 0x10, 0x22, 0xff}, color.RGBA{0x0d, 0x1b, 0x36, 0xff}, color.RGBA{0x12, 0x26, 0x4c, 0xff}, color.RGBA{0x38, 0xbd, 0xf8, 0xff}, color.RGBA{0xa5, 0xe5, 0xfd, 0xff}, color.RGBA{0x12, 0x21, 0x40, 0xff}},
-	{color.RGBA{0x1b, 0x10, 0x05, 0xff}, color.RGBA{0x2c, 0x1a, 0x09, 0xff}, color.RGBA{0x40, 0x26, 0x0d, 0xff}, color.RGBA{0xf5, 0x9e, 0x0b, 0xff}, color.RGBA{0xfc, 0xd3, 0x4d, 0xff}, color.RGBA{0x33, 0x21, 0x0d, 0xff}},
-	{color.RGBA{0x12, 0x09, 0x1f, 0xff}, color.RGBA{0x1f, 0x10, 0x33, 0xff}, color.RGBA{0x32, 0x18, 0x51, 0xff}, color.RGBA{0xd9, 0x46, 0xef, 0xff}, color.RGBA{0xf0, 0xab, 0xfc, 0xff}, color.RGBA{0x29, 0x14, 0x45, 0xff}},
-	{color.RGBA{0x05, 0x14, 0x1b, 0xff}, color.RGBA{0x08, 0x22, 0x2d, 0xff}, color.RGBA{0x0c, 0x33, 0x42, 0xff}, color.RGBA{0x06, 0xb6, 0xd4, 0xff}, color.RGBA{0x67, 0xe8, 0xf9, 0xff}, color.RGBA{0x0a, 0x2c, 0x38, 0xff}},
-	{color.RGBA{0x18, 0x05, 0x05, 0xff}, color.RGBA{0x29, 0x0a, 0x0a, 0xff}, color.RGBA{0x3d, 0x10, 0x10, 0xff}, color.RGBA{0xef, 0x44, 0x44, 0xff}, color.RGBA{0xfc, 0xa5, 0xa5, 0xff}, color.RGBA{0x33, 0x0d, 0x0d, 0xff}},
-	{color.RGBA{0x0a, 0x16, 0x05, 0xff}, color.RGBA{0x14, 0x26, 0x0c, 0xff}, color.RGBA{0x1f, 0x37, 0x12, 0xff}, color.RGBA{0x84, 0xcc, 0x16, 0xff}, color.RGBA{0xbe, 0xf2, 0x64, 0xff}, color.RGBA{0x1a, 0x2e, 0x0e, 0xff}},
-	{color.RGBA{0x18, 0x10, 0x05, 0xff}, color.RGBA{0x29, 0x1c, 0x09, 0xff}, color.RGBA{0x3d, 0x2a, 0x0d, 0xff}, color.RGBA{0xea, 0x58, 0x0c, 0xff}, color.RGBA{0xfd, 0xba, 0x74, 0xff}, color.RGBA{0x33, 0x24, 0x0d, 0xff}},
-	{color.RGBA{0x0c, 0x0c, 0x16, 0xff}, color.RGBA{0x16, 0x16, 0x26, 0xff}, color.RGBA{0x22, 0x22, 0x3a, 0xff}, color.RGBA{0x64, 0x74, 0xff, 0xff}, color.RGBA{0xa5, 0xb4, 0xfc, 0xff}, color.RGBA{0x1c, 0x1c, 0x33, 0xff}},
-	{color.RGBA{0x1a, 0x0b, 0x14, 0xff}, color.RGBA{0x2a, 0x10, 0x21, 0xff}, color.RGBA{0x3d, 0x17, 0x30, 0xff}, color.RGBA{0xec, 0x48, 0x99, 0xff}, color.RGBA{0xf9, 0xa8, 0xd4, 0xff}, color.RGBA{0x33, 0x14, 0x29, 0xff}},
-}
-
-var pcardTitles = []string{
-	"Adventurer", "Mystic", "Visionary", "Wanderer", "Sage", "Trailblazer",
-	"Dreamweaver", "Stargazer", "Pathfinder", "Lorekeeper", "Nightowl", "Daybreaker",
-	"Stormcaller", "Ironheart", "Lightbringer", "Shadowdancer", "Voidwalker", "Skyweaver",
-	"Frostborn", "Emberforged", "Tidecaller", "Worldshaper", "Mythmaker", "Realmrider",
-	"Spellbound", "Soulforged", "Runekeeper", "Echoseeker", "Phoenixsworn", "Starborn",
-	"Cloudwalker", "Duskbringer", "Ashborn", "Moonrider", "Sunseeker", "Wavebreaker",
-	"Thornheart", "Silvertongue", "Gladewatcher", "Suncrafter", "Emberwitch", "Rimebound",
-	"Windshaper", "Ravensworn", "Ashenwolf", "Steelmind", "Owlbound", "Riftwalker",
-	"Prismborn", "Grimshade", "Ironquill", "Songkeeper", "Firelark", "Coldforged",
-	"Latecomer", "Firstlight", "Solargazer", "Duneskipper", "Cinderpath", "Loomweaver",
-	"Nightscribe", "Ashenroamer",
-}
-
-
-var pcardAuraColors = []color.RGBA{
-	{0xFF, 0xD7, 0x54, 0xFF}, {0x8B, 0x5C, 0xF6, 0xFF},
-	{0xF9, 0x5D, 0x3B, 0xFF}, {0x38, 0xBD, 0xF8, 0xFF},
-	{0xFA, 0xCC, 0x15, 0xFF}, {0x4A, 0xDE, 0x80, 0xFF},
-	{0xFB, 0xBF, 0x24, 0xFF}, {0xEC, 0x4C, 0x8B, 0xFF},
-	{0xFF, 0x66, 0x99, 0xFF}, {0xA5, 0x8B, 0xFF, 0xFF},
-	{0x60, 0xA5, 0xFA, 0xFF}, {0x86, 0xEF, 0xAC, 0xFF},
-	{0xF4, 0x72, 0xB6, 0xFF}, {0x2D, 0xD4, 0xBF, 0xFF},
-	{0xE1, 0x1D, 0x48, 0xFF}, {0x22, 0xC5, 0x5E, 0xFF},
-	{0xC0, 0x82, 0xFF, 0xFF}, {0xF8, 0x71, 0x71, 0xFF},
-	{0x0E, 0xA5, 0xE9, 0xFF}, {0x84, 0xCC, 0x16, 0xFF},
-	{0xF9, 0x73, 0x16, 0xFF}, {0xBE, 0x18, 0x5D, 0xFF},
-	{0x14, 0xB8, 0xA6, 0xFF}, {0xF5, 0x9E, 0x0B, 0xFF},
-}
-
-func pcardAuraColorFor(userID int64) color.RGBA {
-	return pcardAuraColors[pcardPick(userID, "auracolor", len(pcardAuraColors))]
-}
-
-var pcardStatNames = []string{
-	"POWER", "AURA", "VIBE", "LUCK", "CHAOS", "GRACE", "MAGIC",
-	"FOCUS", "ECHO", "SPARK", "CHILL", "REACH", "PULSE", "GRIT", "FLOW",
-}
-
-type pcardMetric struct {
-	Name   string
-	Salt   string
-	FromFn func(*userPerf) int
-}
-
-var pcardRealMetrics = []pcardMetric{
-	{"POWER", "power", func(p *userPerf) int { return pcardScaleLog(p.TotalMsgs, 5000) }},
-	{"CHAOS", "chaos", func(p *userPerf) int { return pcardScaleRatio(p.NightMsgs, p.TotalMsgs) }},
-	{"AURA", "aura", func(p *userPerf) int { return pcardScaleLog(int64(len(p.Chats)), 40) }},
-	{"MAGIC", "magic", func(p *userPerf) int { return pcardScaleLog(int64(len(p.Commands)), 30) }},
-	{"VIBE", "vibe", func(p *userPerf) int { return pcardScaleRatio(p.ReplyMsgs, p.TotalMsgs) }},
-	{"ECHO", "echo", func(p *userPerf) int { return pcardScaleRatio(p.StickerMsgs, p.TotalMsgs) }},
-	{"SPARK", "spark", func(p *userPerf) int { return pcardScaleRatio(p.LinkMsgs, p.TotalMsgs) }},
-	{"REACH", "reach", func(p *userPerf) int { return pcardScaleRatio(p.MediaMsgs, p.TotalMsgs) }},
-	{"FLOW", "flow", func(p *userPerf) int {
-		if p.TotalMsgs == 0 {
-			return 0
-		}
-		avg := float64(p.CharSum) / float64(p.TotalMsgs)
-		v := int(avg * 1.4)
-		if v > 100 {
-			v = 100
-		}
-		return v
-	}},
-	{"FOCUS", "focus", func(p *userPerf) int { return pcardScaleRatio(p.CmdMsgs, p.TotalMsgs) }},
-	{"PULSE", "pulse", func(p *userPerf) int {
-		if p.LastSeen == 0 {
-			return 0
-		}
-		diff := time.Now().Unix() - p.LastSeen
-		if diff < 3600 {
-			return 100
-		}
-		if diff < 86400 {
-			return 80
-		}
-		if diff < 7*86400 {
-			return 50
-		}
-		if diff < 30*86400 {
-			return 25
-		}
-		return 5
-	}},
-	{"GRIT", "grit", func(p *userPerf) int {
-		if p.FirstSeen == 0 {
-			return 0
-		}
-		days := (time.Now().Unix() - p.FirstSeen) / 86400
-		return pcardScaleLog(days, 180)
-	}},
-	{"PEAK", "peak", func(p *userPerf) int {
-		var mx, sum int64
-		for _, h := range p.HourBuckets {
-			sum += h
-			if h > mx {
-				mx = h
-			}
-		}
-		if sum == 0 {
-			return 0
-		}
-		return pcardScaleRatio(mx, sum)
-	}},
-	{"STREAK", "streak", func(p *userPerf) int {
-		return pcardScaleLog(int64(pcardLongestDailyStreak(p.DailyMsgs)), 60)
-	}},
-	{"LOYAL", "loyal", func(p *userPerf) int {
-		if p.TotalMsgs == 0 || len(p.Chats) == 0 {
-			return 0
-		}
-		var mx int64
-		for _, c := range p.Chats {
-			if c > mx {
-				mx = c
-			}
-		}
-		return pcardScaleRatio(mx, p.TotalMsgs)
-	}},
-	{"RANGE", "range", func(p *userPerf) int { return pcardScaleLog(int64(len(p.Commands)), 60) }},
-	{"WAVE", "wave", func(p *userPerf) int {
-		if len(p.DailyMsgs) < 3 {
-			return 0
-		}
-		var sum float64
-		for _, v := range p.DailyMsgs {
-			sum += float64(v)
-		}
-		mean := sum / float64(len(p.DailyMsgs))
-		if mean == 0 {
-			return 0
-		}
-		var sq float64
-		for _, v := range p.DailyMsgs {
-			d := float64(v) - mean
-			sq += d * d
-		}
-		stddev := sq / float64(len(p.DailyMsgs))
-		v := int(stddev / mean * 30)
-		if v > 100 {
-			v = 100
-		}
-		return v
-	}},
-	{"DAWN", "dawn", func(p *userPerf) int {
-		var dawn int64
-		for i := 5; i <= 10; i++ {
-			dawn += p.HourBuckets[i]
-		}
-		return pcardScaleRatio(dawn, p.TotalMsgs)
-	}},
-}
-
-func pcardLongestDailyStreak(daily map[string]int64) int {
-	if len(daily) == 0 {
-		return 0
-	}
-	days := make([]time.Time, 0, len(daily))
-	for k, v := range daily {
-		if v <= 0 {
-			continue
-		}
-		t, err := time.Parse("2006-01-02", k)
-		if err != nil {
-			continue
-		}
-		days = append(days, t)
-	}
-	if len(days) == 0 {
-		return 0
-	}
-	sort.Slice(days, func(i, j int) bool { return days[i].Before(days[j]) })
-	best, cur := 1, 1
-	for i := 1; i < len(days); i++ {
-		if days[i].Sub(days[i-1]) == 24*time.Hour {
-			cur++
-			if cur > best {
-				best = cur
-			}
-		} else {
-			cur = 1
-		}
-	}
-	return best
-}
-
-func pcardScaleLog(n, cap int64) int {
-	if n <= 0 {
-		return 0
-	}
-	if n >= cap {
-		return 100
-	}
-	f := float64(n) / float64(cap)
-	v := int(100 * (0.5 + 0.5*f*f))
-	if v > 100 {
-		v = 100
-	}
-	if v < 5 {
-		v = 5
-	}
-	return v
-}
-
-func pcardScaleRatio(part, total int64) int {
-	if total <= 0 {
-		return 0
-	}
-	ratio := float64(part) / float64(total)
-	v := int(ratio * 250)
-	if v > 100 {
-		v = 100
-	}
-	return v
-}
-
-func pcardHasRealData(p *userPerf) bool {
-	return p != nil && p.TotalMsgs >= 25
-}
-
-type pcardStat struct {
-	Name  string
-	Value int
-}
-
-func pcardStatsFor(userID int64) []pcardStat {
-	perf := UserPerfGet(userID)
-	if pcardHasRealData(perf) {
-		buckets := make([]pcardMetric, len(pcardRealMetrics))
-		copy(buckets, pcardRealMetrics)
-		type scored struct {
-			m pcardMetric
-			v int
-			s uint64
-		}
-		out := make([]scored, 0, len(buckets))
-		for _, m := range buckets {
-			v := m.FromFn(perf)
-			if v <= 0 {
-				continue
-			}
-			out = append(out, scored{m, v, pcardHash(userID, m.Salt)})
-		}
-		if len(out) >= 3 {
-			for i := range out {
-				j := i + int(out[i].s%uint64(len(out)-i))
-				out[i], out[j] = out[j], out[i]
-			}
-			out = out[:3]
-			result := make([]pcardStat, 0, 3)
-			for _, s := range out {
-				result = append(result, pcardStat{s.m.Name, s.v})
-			}
-			return result
-		}
-	}
-	used := map[int]bool{}
-	out := make([]pcardStat, 0, 3)
-	for i := 0; i < 3; i++ {
-		idx := pcardPick(userID, fmt.Sprintf("statname_%d", i), len(pcardStatNames))
-		for used[idx] {
-			idx = (idx + 1) % len(pcardStatNames)
-		}
-		used[idx] = true
-		val := 40 + int(pcardHash(userID, fmt.Sprintf("statval_%d", i))%61)
-		out = append(out, pcardStat{pcardStatNames[idx], val})
-	}
-	return out
-}
-
-type pcardRank struct {
-	Name  string
-	Color color.RGBA
-}
-
-var pcardRanks = []pcardRank{
-	{"BRONZE", color.RGBA{0xCD, 0x7F, 0x32, 0xFF}},
-	{"SILVER", color.RGBA{0xC0, 0xC0, 0xC0, 0xFF}},
-	{"GOLD", color.RGBA{0xFF, 0xD7, 0x00, 0xFF}},
-	{"PLATINUM", color.RGBA{0xE5, 0xE4, 0xE2, 0xFF}},
-	{"DIAMOND", color.RGBA{0x67, 0xE8, 0xF9, 0xFF}},
-	{"MYTHIC", color.RGBA{0xC0, 0x82, 0xFF, 0xFF}},
-}
-
-func pcardRankFor(perf *userPerf) pcardRank {
-	if perf == nil {
-		return pcardRanks[0]
-	}
-	n := perf.TotalMsgs
-	switch {
-	case n >= 20000:
-		return pcardRanks[5]
-	case n >= 8000:
-		return pcardRanks[4]
-	case n >= 3000:
-		return pcardRanks[3]
-	case n >= 1000:
-		return pcardRanks[2]
-	case n >= 250:
-		return pcardRanks[1]
-	default:
-		return pcardRanks[0]
-	}
-}
-
-func pcardBadgesFor(perf *userPerf) []string {
-	if perf == nil || perf.TotalMsgs < 50 {
-		return nil
-	}
-	var out []string
-	total := float64(perf.TotalMsgs)
-	if perf.TotalMsgs >= 5000 {
-		out = append(out, "Chatterbox")
-	}
-	if float64(perf.NightMsgs)/total >= 0.35 {
-		out = append(out, "Night Owl")
-	}
-	var dawn int64
-	for i := 5; i <= 10; i++ {
-		dawn += perf.HourBuckets[i]
-	}
-	if float64(dawn)/total >= 0.35 {
-		out = append(out, "Early Bird")
-	}
-	if float64(perf.StickerMsgs)/total >= 0.25 {
-		out = append(out, "Sticker King")
-	}
-	if float64(perf.MediaMsgs)/total >= 0.4 {
-		out = append(out, "Media Hoarder")
-	}
-	if float64(perf.ReplyMsgs)/total >= 0.5 {
-		out = append(out, "Reply Guy")
-	}
-	if float64(perf.LinkMsgs)/total >= 0.2 {
-		out = append(out, "Linkposter")
-	}
-	if len(perf.Chats) >= 10 {
-		out = append(out, "Nomad")
-	}
-	if len(perf.Chats) >= 25 {
-		out = append(out, "Explorer")
-	}
-	if len(perf.Commands) >= 20 {
-		out = append(out, "Power User")
-	}
-	if len(perf.Commands) >= 50 {
-		out = append(out, "Command Master")
-	}
-	if float64(perf.CmdMsgs)/total >= 0.5 {
-		out = append(out, "Bot Whisperer")
-	}
-	avg := float64(perf.CharSum) / total
-	if avg >= 120 {
-		out = append(out, "Wordsmith")
-	}
-	if avg >= 200 {
-		out = append(out, "Storyteller")
-	}
-	if avg <= 8 && perf.TotalMsgs >= 200 {
-		out = append(out, "Terse")
-	}
-	if perf.FirstSeen > 0 && (time.Now().Unix()-perf.FirstSeen) >= 365*86400 {
-		out = append(out, "Veteran")
-	}
-	if pcardLongestDailyStreak(perf.DailyMsgs) >= 30 {
-		out = append(out, "Regular")
-	}
-	if len(out) > 3 {
-		out = out[:3]
-	}
-	return out
-}
-
-func pcardHash(userID int64, salt string) uint64 {
-	h := fnv.New64a()
-	h.Write([]byte(strconv.FormatInt(userID, 10)))
-	h.Write([]byte("|"))
-	h.Write([]byte(salt))
-	return h.Sum64()
-}
-
-func pcardPick(userID int64, salt string, n int) int {
-	if n <= 0 {
-		return 0
-	}
-	return int(pcardHash(userID, salt) % uint64(n))
-}
-
-func pcardPalette4(userID int64) pcardPalette {
-	return pcardPalettes[pcardPick(userID, "palette", len(pcardPalettes))]
-}
-
-func pcardTitleFor(userID int64) string {
-	return pcardTitles[pcardPick(userID, "title", len(pcardTitles))]
-}
-
-
-func pcardMemberSinceLegacy(userID int64) string {
-	now := time.Now().Year()
-	years := []int{2013, 2014, 2015, 2016, 2017, 2018, 2019, 2020, 2021, 2022, 2023, 2024}
-	if userID < 1_000_000 {
-		return "2013"
-	}
-	if userID < 10_000_000 {
-		return "2014"
-	}
-	if userID < 100_000_000 {
-		return "2015"
-	}
-	if userID < 200_000_000 {
-		return "2017"
-	}
-	if userID < 500_000_000 {
-		return "2018"
-	}
-	if userID < 1_000_000_000 {
-		return "2020"
-	}
-	if userID < 1_500_000_000 {
-		return "2021"
-	}
-	if userID < 2_000_000_000 {
-		return "2022"
-	}
-	if userID < 5_000_000_000 {
-		return "2023"
-	}
-	if now < 2024 {
-		now = 2024
-	}
-	return strconv.Itoa(years[len(years)-1])
-}
-
-func pcardMemberSince(userID int64) string {
-	if ts := modules.NewUserDateEstimator().Estimate(userID); ts > 0 {
-		return time.Unix(ts, 0).Format("Jan 2006")
-	}
-	perf := UserPerfGet(userID)
-	if perf != nil && perf.FirstSeen > 0 {
-		return time.Unix(perf.FirstSeen, 0).Format("Jan 2006")
-	}
-	return pcardMemberSinceLegacy(userID)
-}
-
-func pcardFontPath(name string) string {
-	candidates := []string{
-		"./assets/" + name,
-		"assets/" + name,
-		"../assets/" + name,
-	}
-	if exe, err := os.Executable(); err == nil {
-		dir := filepath.Dir(exe)
-		candidates = append(candidates,
-			filepath.Join(dir, "assets", name),
-			filepath.Join(dir, "..", "assets", name),
-		)
-	}
-	if wd, err := os.Getwd(); err == nil {
-		candidates = append(candidates, filepath.Join(wd, "assets", name))
-	}
-	for _, p := range candidates {
-		if _, err := os.Stat(p); err == nil {
-			return p
-		}
-	}
-	return ""
-}
-
-func pcardLoadFont(dc *gg.Context, size float64) bool {
-	for _, name := range []string{"GoNotoCurrent-Bold.ttf", "GoNotoCurrent-Regular.ttf", "NotoSans-Bold.ttf", "NotoSans-Regular.ttf", "Inter_28pt-Bold.ttf"} {
-		p := pcardFontPath(name)
-		if p == "" {
-			continue
-		}
-		if err := dc.LoadFontFace(p, size); err == nil {
-			return true
-		}
-	}
-	dc.SetFontFace(basicfont.Face7x13)
-	return false
-}
-
-func pcardStripEmoji(s string) string {
-	if s == "" {
-		return s
-	}
-	var b strings.Builder
-	b.Grow(len(s))
-	for _, r := range s {
-		if pcardIsEmojiRune(r) {
-			continue
-		}
-		b.WriteRune(r)
-	}
-	return strings.TrimSpace(b.String())
-}
-
-func pcardIsEmojiRune(r rune) bool {
-	switch {
-	case r == 0x200D, r == 0xFE0F, r == 0x20E3:
-		return true
-	case r >= 0x1F000 && r <= 0x1FFFF:
-		return true
-	case r >= 0x2600 && r <= 0x27BF:
-		return true
-	case r >= 0x1F1E6 && r <= 0x1F1FF:
-		return true
-	case r >= 0x2700 && r <= 0x27BF:
-		return true
-	case r >= 0x1F900 && r <= 0x1F9FF:
-		return true
-	case r >= 0x1FA70 && r <= 0x1FAFF:
-		return true
-	case r >= 0x2300 && r <= 0x23FF:
-		return true
-	case r >= 0x25A0 && r <= 0x25FF:
-		return true
-	case r == 0x2934 || r == 0x2935, r >= 0x2B00 && r <= 0x2BFF:
-		return true
-	case r >= 0x1F3FB && r <= 0x1F3FF:
-		return true
-	}
-	return false
-}
-
-
-func pcardDrawAvatarRing(dc *gg.Context, cx, cy, r float64, pal pcardPalette, avatarPath string) {
-	dc.SetRGBA255(int(pal.Accent.R), int(pal.Accent.G), int(pal.Accent.B), 30)
-	dc.DrawCircle(cx, cy, r+14)
-	dc.Fill()
-
-	dc.SetRGBA255(int(pal.Accent.R), int(pal.Accent.G), int(pal.Accent.B), 220)
-	dc.SetLineWidth(3)
-	dc.DrawCircle(cx, cy, r+6)
-	dc.Stroke()
-
-	if avatarPath != "" {
-		f, err := os.Open(avatarPath)
-		if err == nil {
-			defer f.Close()
-			img, _, derr := image.Decode(f)
-			if derr == nil {
-				b := img.Bounds()
-				srcW := float64(b.Dx())
-				srcH := float64(b.Dy())
-				side := srcW
-				if srcH < side {
-					side = srcH
-				}
-				sx := (srcW - side) / 2
-				sy := (srcH - side) / 2
-				diameter := int(math.Ceil(r * 2))
-				scale := float64(diameter) / side
-				tmp := gg.NewContext(diameter, diameter)
-				tmp.Scale(scale, scale)
-				tmp.DrawImage(img, int(-sx), int(-sy))
-
-				dc.Push()
-				dc.DrawCircle(cx, cy, r)
-				dc.Clip()
-				dc.DrawImage(tmp.Image(), int(cx-r), int(cy-r))
-				dc.ResetClip()
-				dc.Pop()
-				return
-			}
-		}
-	}
-
-	dc.SetRGBA255(int(pal.Accent.R)/2, int(pal.Accent.G)/2, int(pal.Accent.B)/2, 255)
-	dc.DrawCircle(cx, cy, r)
-	dc.Fill()
-}
-
-func pcardInitials(name string) string {
-	parts := strings.Fields(strings.TrimSpace(name))
-	if len(parts) == 0 {
-		return "?"
-	}
-	if len(parts) == 1 {
-		r := []rune(parts[0])
-		if len(r) == 0 {
-			return "?"
-		}
-		if len(r) == 1 {
-			return strings.ToUpper(string(r[0]))
-		}
-		return strings.ToUpper(string(r[0:2]))
-	}
-	a := []rune(parts[0])
-	b := []rune(parts[len(parts)-1])
-	if len(a) == 0 || len(b) == 0 {
-		return "?"
-	}
-	return strings.ToUpper(string(a[0]) + string(b[0]))
-}
-
-func pcardDrawInitialsAvatar(dc *gg.Context, cx, cy, r float64, initials string, pal pcardPalette) {
-	dc.Push()
-	defer dc.Pop()
-	dc.DrawCircle(cx, cy, r)
-	dc.SetRGBA255(int(pal.Accent.R)/2, int(pal.Accent.G)/2, int(pal.Accent.B)/2, 255)
-	dc.Fill()
-	pcardLoadFont(dc, r*0.85)
-	dc.SetRGB(1, 1, 1)
-	if initials == "" {
-		initials = "?"
-	}
-	dc.DrawStringAnchored(initials, cx, cy, 0.5, 0.55)
-}
-
-func pcardDrawStatBar(dc *gg.Context, x, y, w, h float64, label string, value int, pal pcardPalette) {
-	pcardLoadFont(dc, 18)
-	dc.SetRGBA(1, 1, 1, 0.6)
-	dc.DrawString(label, x, y-8)
-
-	pcardLoadFont(dc, 18)
-	dc.SetRGBA255(int(pal.Accent2.R), int(pal.Accent2.G), int(pal.Accent2.B), 240)
-	valStr := fmt.Sprintf("%d", value)
-	vw, _ := dc.MeasureString(valStr)
-	dc.DrawString(valStr, x+w-vw, y-8)
-
-	dc.SetRGBA(1, 1, 1, 0.09)
-	dc.DrawRoundedRectangle(x, y, w, h, h/2)
-	dc.Fill()
-
-	fillPct := float64(value) / 100.0
-	if fillPct < 0 {
-		fillPct = 0
-	}
-	if fillPct > 1 {
-		fillPct = 1
-	}
-	fillW := w * fillPct
-	if fillW < h {
-		fillW = h
-	}
-	dc.SetRGBA255(int(pal.Accent.R), int(pal.Accent.G), int(pal.Accent.B), 235)
-	dc.DrawRoundedRectangle(x, y, fillW, h, h/2)
-	dc.Fill()
-}
-
-func pcardDrawLabel(dc *gg.Context, text string, x, y float64) {
-	pcardLoadFont(dc, 12)
-	dc.SetRGBA(1, 1, 1, 0.38)
-	dc.DrawString(text, x, y)
-}
-
-func pcardDrawCornerBrackets(dc *gg.Context, x, y, w, h float64, pal pcardPalette) {
-	dc.SetRGBA255(int(pal.Accent.R), int(pal.Accent.G), int(pal.Accent.B), 220)
-	dc.SetLineWidth(2)
-	const armLen = 22.0
-	const inset = 16.0
-	dc.DrawLine(x+inset, y+inset+armLen, x+inset, y+inset)
-	dc.DrawLine(x+inset, y+inset, x+inset+armLen, y+inset)
-	dc.Stroke()
-	dc.DrawLine(x+w-inset-armLen, y+inset, x+w-inset, y+inset)
-	dc.DrawLine(x+w-inset, y+inset, x+w-inset, y+inset+armLen)
-	dc.Stroke()
-	dc.DrawLine(x+inset, y+h-inset-armLen, x+inset, y+h-inset)
-	dc.DrawLine(x+inset, y+h-inset, x+inset+armLen, y+h-inset)
-	dc.Stroke()
-	dc.DrawLine(x+w-inset-armLen, y+h-inset, x+w-inset, y+h-inset)
-	dc.DrawLine(x+w-inset, y+h-inset, x+w-inset, y+h-inset-armLen)
-	dc.Stroke()
-}
-
-func pcardSerialFor(userID int64) string {
-	h := pcardHash(userID, "serial")
-	block := func(shift uint) string {
-		v := (h >> shift) & 0xFFFF
-		return fmt.Sprintf("%04X", v)
-	}
-	return fmt.Sprintf("N° %s · %s · %s", block(0), block(16), block(32))
-}
-
-func pcardPeakHourLabel(perf *userPerf) (string, int) {
-	if perf == nil {
-		return "—", -1
-	}
-	var total int64
-	for _, v := range perf.HourBuckets {
-		total += v
-	}
-	if total < 5 {
-		return "—", -1
-	}
-	best := 0
-	bestVal := perf.HourBuckets[0]
-	for i, v := range perf.HourBuckets {
-		if v > bestVal {
-			bestVal = v
-			best = i
-		}
-	}
-	start := best - 1
-	end := best + 2
-	if start < 0 {
-		start += 24
-	}
-	if end > 23 {
-		end -= 24
-	}
-	return fmt.Sprintf("%02d:00–%02d:00", start, end), best
-}
-
-func pcardDrawSparkline(dc *gg.Context, x, y, w, h float64, perf *userPerf, pal pcardPalette) {
-	dc.SetRGBA255(255, 255, 255, 8)
-	dc.DrawRoundedRectangle(x, y, w, h, 10)
-	dc.Fill()
-	dc.SetRGBA255(int(pal.Accent.R), int(pal.Accent.G), int(pal.Accent.B), 55)
-	dc.SetLineWidth(1)
-	dc.DrawRoundedRectangle(x, y, w, h, 10)
-	dc.Stroke()
-
-	pcardLoadFont(dc, 11)
-	dc.SetRGBA(1, 1, 1, 0.38)
-	dc.DrawString("LAST 14 DAYS", x+12, y+16)
-
-	const days = 14
-	buckets := make([]int64, days)
-	if perf != nil && perf.DailyMsgs != nil {
-		now := time.Now()
-		for i := 0; i < days; i++ {
-			k := now.AddDate(0, 0, -(days - 1 - i)).Format("2006-01-02")
-			buckets[i] = perf.DailyMsgs[k]
-		}
-	}
-	maxV := int64(1)
-	for _, v := range buckets {
-		if v > maxV {
-			maxV = v
-		}
-	}
-
-	plotX := x + 12
-	plotY := y + 22
-	plotW := w - 24
-	plotH := h - 30
-	barW := plotW / float64(days)
-	for i, v := range buckets {
-		bh := plotH * float64(v) / float64(maxV)
-		if v > 0 && bh < 3 {
-			bh = 3
-		}
-		bx := plotX + float64(i)*barW + 1
-		by := plotY + plotH - bh
-		bar := barW - 2
-		alpha := uint8(120)
-		if i == days-1 {
-			alpha = 235
-		} else if i >= days-3 {
-			alpha = 180
-		}
-		dc.SetRGBA255(int(pal.Accent.R), int(pal.Accent.G), int(pal.Accent.B), int(alpha))
-		dc.DrawRoundedRectangle(bx, by, bar, bh, 2)
-		dc.Fill()
-	}
-
-	total := int64(0)
-	for _, v := range buckets {
-		total += v
-	}
-	summary := fmt.Sprintf("%d msgs", total)
-	pcardLoadFont(dc, 11)
-	dc.SetRGBA(1, 1, 1, 0.55)
-	sw, _ := dc.MeasureString(summary)
-	dc.DrawString(summary, x+w-12-sw, y+16)
-}
-
-func pcardNextRankThreshold(current pcardRank) (string, int64) {
-	tiers := []struct {
-		Name string
-		Need int64
-	}{
-		{"BRONZE", 0},
-		{"SILVER", 250},
-		{"GOLD", 1000},
-		{"PLATINUM", 3000},
-		{"DIAMOND", 8000},
-		{"MYTHIC", 20000},
-	}
-	for i, t := range tiers {
-		if t.Name == current.Name && i+1 < len(tiers) {
-			return tiers[i+1].Name, tiers[i+1].Need
-		}
-	}
-	return "", 0
-}
-
-func pcardCurrentRankFloor(rank pcardRank) int64 {
-	switch rank.Name {
-	case "BRONZE":
-		return 0
-	case "SILVER":
-		return 250
-	case "GOLD":
-		return 1000
-	case "PLATINUM":
-		return 3000
-	case "DIAMOND":
-		return 8000
-	case "MYTHIC":
-		return 20000
-	}
-	return 0
-}
-
-func pcardDrawRankProgress(dc *gg.Context, x, y, w float64, perf *userPerf, rank pcardRank, pal pcardPalette) {
-	nextName, nextNeed := pcardNextRankThreshold(rank)
-	if nextName == "" {
-		pcardLoadFont(dc, 12)
-		dc.SetRGBA(1, 1, 1, 0.5)
-		dc.DrawString(rank.Name+" · MAX RANK", x, y+10)
-		return
-	}
-	floor := pcardCurrentRankFloor(rank)
-	span := float64(nextNeed - floor)
-	progress := float64(perf.TotalMsgs - floor)
-	if progress < 0 {
-		progress = 0
-	}
-	if progress > span {
-		progress = span
-	}
-	pct := 0.0
-	if span > 0 {
-		pct = progress / span
-	}
-
-	pcardLoadFont(dc, 12)
-	dc.SetRGBA(1, 1, 1, 0.45)
-	label := fmt.Sprintf("%s → %s   %d / %d", rank.Name, nextName, perf.TotalMsgs, nextNeed)
-	dc.DrawString(label, x, y+10)
-
-	barY := y + 18
-	barH := 6.0
-	dc.SetRGBA(1, 1, 1, 0.09)
-	dc.DrawRoundedRectangle(x, barY, w, barH, barH/2)
-	dc.Fill()
-	fillW := w * pct
-	if fillW < barH {
-		fillW = barH
-	}
-	dc.SetRGBA255(int(rank.Color.R), int(rank.Color.G), int(rank.Color.B), 220)
-	dc.DrawRoundedRectangle(x, barY, fillW, barH, barH/2)
-	dc.Fill()
-	_ = pal
-}
-
-func pcardDrawTopCommands(dc *gg.Context, x, y, w float64, perf *userPerf, pal pcardPalette) {
-	pcardLoadFont(dc, 12)
-	dc.SetRGBA(1, 1, 1, 0.38)
-	dc.DrawString("TOP COMMANDS", x, y+10)
-
-	if perf == nil || len(perf.Commands) == 0 {
-		pcardLoadFont(dc, 13)
-		dc.SetRGBA(1, 1, 1, 0.32)
-		dc.DrawString("no commands used yet", x+130, y+10)
-		return
-	}
-	type kv struct {
-		K string
-		V int64
-	}
-	all := make([]kv, 0, len(perf.Commands))
-	for k, v := range perf.Commands {
-		all = append(all, kv{k, v})
-	}
-	sort.Slice(all, func(i, j int) bool { return all[i].V > all[j].V })
-	n := 3
-	if len(all) < n {
-		n = len(all)
-	}
-	cx := x + 130
-	pcardLoadFont(dc, 13)
-	for i := 0; i < n; i++ {
-		entry := fmt.Sprintf("/%s ×%d", all[i].K, all[i].V)
-		if i > 0 {
-			dc.SetRGBA(1, 1, 1, 0.2)
-			dc.DrawString("·", cx, y+10)
-			cx += 12
-		}
-		dc.SetRGBA255(int(pal.Accent2.R), int(pal.Accent2.G), int(pal.Accent2.B), 220)
-		ew, _ := dc.MeasureString(entry)
-		if cx+ew > x+w-4 {
-			break
-		}
-		dc.DrawString(entry, cx, y+10)
-		cx += ew + 8
-	}
-}
-
-func pcardDrawGrain(dc *gg.Context, w, h int, userID int64) {
-	seed := pcardHash(userID, "grain")
-	dots := 320
-	for i := 0; i < dots; i++ {
-		sx := math.Mod(float64((seed>>uint(i%32))%uint64(w))+float64(i*11%w), float64(w))
-		sy := math.Mod(float64((seed>>uint((i*5)%32))%uint64(h))+float64(i*13%h), float64(h))
-		alpha := 6 + (i*3)%14
-		dc.SetRGBA255(255, 255, 255, alpha)
-		dc.DrawPoint(sx, sy, 0.5)
-		dc.Fill()
-	}
-}
-
-func pcardResolveTarget(m *tg.NewMessage) (pcardTarget, error) {
-	var info pcardTarget
-	if m.IsReply() {
-		reply, err := m.GetReplyMessage()
-		if err == nil && reply != nil && reply.SenderID() != 0 {
-			u, uerr := m.Client.GetUser(reply.SenderID())
-			if uerr == nil && u != nil {
-				info.UserID = u.ID
-				info.FirstName = u.FirstName
-				info.LastName = u.LastName
-				info.Username = u.Username
-				info.Photo = u.Photo
-				return info, nil
-			}
-			info.UserID = reply.SenderID()
-			info.FirstName = "User"
-			return info, nil
-		}
-	}
-	args := strings.TrimSpace(m.Args())
-	if args != "" {
-		token := strings.Fields(args)[0]
-		token = strings.TrimPrefix(token, "@")
-		if n, err := strconv.ParseInt(token, 10, 64); err == nil {
-			u, uerr := m.Client.GetUser(n)
-			if uerr == nil && u != nil {
-				info.UserID = u.ID
-				info.FirstName = u.FirstName
-				info.LastName = u.LastName
-				info.Username = u.Username
-				info.Photo = u.Photo
-				return info, nil
-			}
-			return info, fmt.Errorf("could not resolve user %d", n)
-		}
-		peer, err := m.Client.ResolvePeer(token)
-		if err != nil {
-			return info, err
-		}
-		id := m.Client.GetPeerID(peer)
-		u, uerr := m.Client.GetUser(id)
-		if uerr == nil && u != nil {
-			info.UserID = u.ID
-			info.FirstName = u.FirstName
-			info.LastName = u.LastName
-			info.Username = u.Username
-			info.Photo = u.Photo
-			return info, nil
-		}
-		info.UserID = id
-		info.FirstName = token
-		return info, nil
-	}
-	if m.Sender != nil {
-		info.UserID = m.Sender.ID
-		info.FirstName = m.Sender.FirstName
-		info.LastName = m.Sender.LastName
-		info.Username = m.Sender.Username
-		info.Photo = m.Sender.Photo
-		return info, nil
-	}
-	info.UserID = m.SenderID()
-	info.FirstName = "User"
-	return info, nil
-}
-
-func pcardGetAccessHash(c *tg.Client, userID int64) int64 {
-	peer, err := c.ResolvePeer(userID)
-	if err != nil {
-		return 0
-	}
-	if pu, ok := peer.(*tg.InputPeerUser); ok {
-		return pu.AccessHash
-	}
-	return 0
-}
-
-func pcardDownloadAvatar(c *tg.Client, info pcardTarget) string {
-	if info.UserID == 0 || info.Photo == nil {
-		return ""
-	}
-	full, err := c.UsersGetFullUser(&tg.InputUserObj{
-		UserID:     info.UserID,
-		AccessHash: pcardGetAccessHash(c, info.UserID),
-	})
-	if err != nil || full == nil {
-		return ""
-	}
-	uf := full.FullUser
-	var photo tg.Photo
-	if uf.ProfilePhoto != nil {
-		photo = uf.ProfilePhoto
-	} else if uf.PersonalPhoto != nil {
-		photo = uf.PersonalPhoto
-	} else if uf.FallbackPhoto != nil {
-		photo = uf.FallbackPhoto
-	}
-	if photo == nil {
-		return ""
-	}
-	p, ok := photo.(*tg.PhotoObj)
-	if !ok || p == nil {
-		return ""
-	}
-	tmp := filepath.Join(os.TempDir(), fmt.Sprintf("pcard_av_%d_%d.jpg", info.UserID, time.Now().UnixNano()))
-	_, err = c.DownloadMedia(p, &tg.DownloadOptions{FileName: tmp})
-	if err != nil {
-		os.Remove(tmp)
-		return ""
-	}
-	return tmp
-}
-
-func pcardRender(info pcardTarget, avatarPath string) (string, error) {
-	const W, H = 1280, 720
-
-	dc := gg.NewContext(W, H)
-	pal := pcardPalette4(info.UserID)
-	perf := UserPerfGet(info.UserID)
-	rank := pcardRankFor(perf)
-	auraColor := pcardAuraColorFor(info.UserID)
-
-	bg := gg.NewLinearGradient(0, 0, float64(W), float64(H))
-	bg.AddColorStop(0, pal.BgTop)
-	bg.AddColorStop(0.55, pal.BgMid)
-	bg.AddColorStop(1, pal.BgBot)
-	dc.SetFillStyle(bg)
-	dc.DrawRectangle(0, 0, W, H)
-	dc.Fill()
-
-	starSeed := pcardHash(info.UserID, "stars")
-	for i := 0; i < 22; i++ {
-		sx := math.Mod(float64((starSeed>>uint(i%32))%uint64(W))+float64(i*17%W), float64(W))
-		sy := math.Mod(float64((starSeed>>uint((i*3)%32))%uint64(H))+float64(i*29%H), float64(H))
-		rad := 0.6 + float64(i%4)*0.25
-		alpha := 18 + (i*7)%25
-		dc.SetRGBA255(255, 255, 255, alpha)
-		dc.DrawCircle(sx, sy, rad)
-		dc.Fill()
-	}
-
-	const (
-		cardPadX = 44.0
-		cardPadY = 44.0
-	)
-	cardX := cardPadX
-	cardY := cardPadY
-	cardW := float64(W) - cardPadX*2
-	cardH := float64(H) - cardPadY*2
-	cardR := 24.0
-
-	dc.SetRGBA255(int(pal.Accent.R), int(pal.Accent.G), int(pal.Accent.B), 90)
-	dc.SetLineWidth(1)
-	dc.DrawRoundedRectangle(cardX-10, cardY-10, cardW+20, cardH+20, cardR+4)
-	dc.Stroke()
-
-	dc.SetRGBA255(16, 20, 30, 245)
-	dc.DrawRoundedRectangle(cardX, cardY, cardW, cardH, cardR)
-	dc.Fill()
-
-	holo := gg.NewLinearGradient(cardX, cardY, cardX+cardW, cardY+cardH)
-	holo.AddColorStop(0, color.RGBA{pal.Accent.R, pal.Accent.G, pal.Accent.B, 160})
-	holo.AddColorStop(0.5, color.RGBA{pal.Accent2.R, pal.Accent2.G, pal.Accent2.B, 90})
-	holo.AddColorStop(1, color.RGBA{auraColor.R, auraColor.G, auraColor.B, 160})
-	dc.SetFillStyle(holo)
-	dc.SetLineWidth(2.5)
-	dc.DrawRoundedRectangle(cardX, cardY, cardW, cardH, cardR)
-	dc.SetStrokeStyle(holo)
-	dc.Stroke()
-
-	dc.SetRGBA(1, 1, 1, 0.05)
-	dc.SetLineWidth(1)
-	dc.DrawRoundedRectangle(cardX+7, cardY+7, cardW-14, cardH-14, cardR-6)
-	dc.Stroke()
-
-	pcardDrawCornerBrackets(dc, cardX, cardY, cardW, cardH, pal)
-
-	sidebarW := 330.0
-	sidebarX := cardX
-	dc.SetRGBA255(255, 255, 255, 4)
-	dc.DrawRoundedRectangle(sidebarX+14, cardY+14, sidebarW-14, cardH-28, cardR-4)
-	dc.Fill()
-
-	dc.SetRGBA255(255, 255, 255, 18)
-	dc.SetLineWidth(1)
-	dc.DrawLine(sidebarX+sidebarW, cardY+40, sidebarX+sidebarW, cardY+cardH-40)
-	dc.Stroke()
-
-	avCX := sidebarX + sidebarW/2
-	avCY := cardY + 178
-	avR := 96.0
-
-	if avatarPath != "" {
-		pcardDrawAvatarRing(dc, avCX, avCY, avR, pal, avatarPath)
-	} else {
-		dc.SetRGBA255(int(pal.Accent.R), int(pal.Accent.G), int(pal.Accent.B), 30)
-		dc.DrawCircle(avCX, avCY, avR+14)
-		dc.Fill()
-		dc.SetRGBA255(int(pal.Accent.R), int(pal.Accent.G), int(pal.Accent.B), 220)
-		dc.SetLineWidth(3)
-		dc.DrawCircle(avCX, avCY, avR+6)
-		dc.Stroke()
-		name := strings.TrimSpace(info.FirstName + " " + info.LastName)
-		pcardDrawInitialsAvatar(dc, avCX, avCY, avR, pcardInitials(name), pal)
-	}
-
-	serialY := avCY + avR + 32
-	pcardLoadFont(dc, 12)
-	dc.SetRGBA(1, 1, 1, 0.35)
-	serial := pcardSerialFor(info.UserID)
-	sw, _ := dc.MeasureString(serial)
-	dc.DrawString(serial, avCX-sw/2, serialY)
-
-	sidebarInnerX := sidebarX + 34
-	infoY := serialY + 38
-
-	pcardDrawLabel(dc, "USER ID", sidebarInnerX, infoY)
-	pcardLoadFont(dc, 22)
-	dc.SetRGB(1, 1, 1)
-	dc.DrawString(strconv.FormatInt(info.UserID, 10), sidebarInnerX, infoY+30)
-
-	infoY += 72
-	pcardDrawLabel(dc, "MEMBER SINCE", sidebarInnerX, infoY)
-	pcardLoadFont(dc, 22)
-	dc.SetRGB(1, 1, 1)
-	dc.DrawString(pcardMemberSince(info.UserID), sidebarInnerX, infoY+30)
-
-	infoY += 72
-	pcardDrawLabel(dc, "ACTIVE IN", sidebarInnerX, infoY)
-	pcardLoadFont(dc, 22)
-	dc.SetRGB(1, 1, 1)
-	dc.DrawString(fmt.Sprintf("%d chats", len(perf.Chats)), sidebarInnerX, infoY+30)
-
-	infoY += 72
-	pcardDrawLabel(dc, "PEAK HOUR", sidebarInnerX, infoY)
-	pcardLoadFont(dc, 22)
-	dc.SetRGB(1, 1, 1)
-	peakLabel, peakHour := pcardPeakHourLabel(perf)
-	dc.DrawString(peakLabel, sidebarInnerX, infoY+30)
-
-	contentX := sidebarX + sidebarW + 34
-	contentRight := cardX + cardW - 34
-	contentW := contentRight - contentX
-
-	pcardLoadFont(dc, 11)
-	dc.SetRGBA(1, 1, 1, 0.35)
-	wm := "· JULIABOT ID CARD ·"
-	wmW, _ := dc.MeasureString(wm)
-	dc.DrawString(wm, contentRight-wmW, cardY+34)
-
-	displayName := pcardStripEmoji(strings.TrimSpace(info.FirstName + " " + info.LastName))
-	if displayName == "" {
-		displayName = "User"
-	}
-	titleY := cardY + 130
-	nameSize := 62.0
-	pcardLoadFont(dc, nameSize)
-	for {
-		w, _ := dc.MeasureString(displayName)
-		if w <= contentW-20 || nameSize <= 30 {
-			break
-		}
-		nameSize -= 4
-		pcardLoadFont(dc, nameSize)
-	}
-	dc.SetRGB(1, 1, 1)
-	dc.DrawString(displayName, contentX, titleY)
-
-	nameUnderY := titleY + 10
-	dc.SetRGBA255(int(pal.Accent.R), int(pal.Accent.G), int(pal.Accent.B), 220)
-	dc.SetLineWidth(2)
-	dc.DrawLine(contentX, nameUnderY, contentX+42, nameUnderY)
-	dc.Stroke()
-
-	if uname := pcardStripEmoji(info.Username); uname != "" {
-		pcardLoadFont(dc, 22)
-		dc.SetRGBA(1, 1, 1, 0.55)
-		dc.DrawString("@"+uname, contentX, titleY+36)
-	}
-
-	pillH := 40.0
-	pillR := pillH / 2
-	badgeY := titleY + 62
-
-	title := pcardTitleFor(info.UserID)
-	pcardLoadFont(dc, 20)
-	titleTextW, _ := dc.MeasureString(title)
-	titlePillW := titleTextW + pillH
-
-	dc.SetRGBA255(int(pal.Accent.R), int(pal.Accent.G), int(pal.Accent.B), 55)
-	dc.DrawRoundedRectangle(contentX, badgeY, titlePillW, pillH, pillR)
-	dc.Fill()
-	dc.SetRGBA255(int(auraColor.R), int(auraColor.G), int(auraColor.B), 255)
-	dc.DrawCircle(contentX+pillR-4, badgeY+pillH/2, 5)
-	dc.Fill()
-	dc.SetRGBA255(int(pal.Accent2.R), int(pal.Accent2.G), int(pal.Accent2.B), 255)
-	dc.DrawString(title, contentX+pillR+6, badgeY+pillH/2+7)
-
-	rankGap := 10.0
-	rankX := contentX + titlePillW + rankGap
-	pcardLoadFont(dc, 18)
-	rankTextW, _ := dc.MeasureString(rank.Name)
-	rankPillW := rankTextW + pillH
-	dc.SetRGBA255(int(rank.Color.R), int(rank.Color.G), int(rank.Color.B), 45)
-	dc.DrawRoundedRectangle(rankX, badgeY, rankPillW, pillH, pillR)
-	dc.Fill()
-	dc.SetRGBA255(int(rank.Color.R), int(rank.Color.G), int(rank.Color.B), 180)
-	dc.SetLineWidth(1.5)
-	dc.DrawRoundedRectangle(rankX, badgeY, rankPillW, pillH, pillR)
-	dc.Stroke()
-	dc.SetRGBA255(int(rank.Color.R), int(rank.Color.G), int(rank.Color.B), 240)
-	dc.DrawString(rank.Name, rankX+pillR, badgeY+pillH/2+6)
-
-	sparkY := badgeY + pillH + 22
-	sparkH := 46.0
-	pcardDrawSparkline(dc, contentX, sparkY, contentW, sparkH, perf, pal)
-
-	statsX := contentX
-	statsW := contentW
-	statsY := sparkY + sparkH + 20
-	statsH := 176.0
-
-	dc.SetRGBA255(255, 255, 255, 8)
-	dc.DrawRoundedRectangle(statsX, statsY, statsW, statsH, 16)
-	dc.Fill()
-	dc.SetRGBA255(int(pal.Accent.R), int(pal.Accent.G), int(pal.Accent.B), 60)
-	dc.SetLineWidth(1)
-	dc.DrawRoundedRectangle(statsX, statsY, statsW, statsH, 16)
-	dc.Stroke()
-
-	pcardDrawLabel(dc, "STATS", statsX+22, statsY+26)
-	provisional := !pcardHasRealData(perf)
-	if provisional {
-		pcardLoadFont(dc, 11)
-		dc.SetRGBA(1, 1, 1, 0.35)
-		tag := "PROVISIONAL · " + strconv.FormatInt(perf.TotalMsgs, 10) + "/25"
-		tagW, _ := dc.MeasureString(tag)
-		dc.DrawString(tag, statsX+statsW-tagW-22, statsY+26)
-	}
-
-	stats := pcardStatsFor(info.UserID)
-	statLeft := statsX + 22
-	statRight := statsX + statsW - 22
-	barW := statRight - statLeft
-	rowH := 38.0
-	firstRowY := statsY + 56
-	for i, s := range stats {
-		y := firstRowY + float64(i)*rowH
-		pcardDrawStatBar(dc, statLeft, y, barW, 12, s.Name, s.Value, pal)
-	}
-
-	progY := statsY + statsH + 18
-	pcardDrawRankProgress(dc, statsX, progY, statsW, perf, rank, pal)
-
-	topCmdsY := progY + 42
-	pcardDrawTopCommands(dc, statsX, topCmdsY, statsW, perf, pal)
-
-	badges := pcardBadgesFor(perf)
-	if len(badges) > 0 {
-		badgeRowY := cardY + cardH - 46
-		bx := statsX
-		pcardLoadFont(dc, 13)
-		for _, b := range badges {
-			bw, _ := dc.MeasureString(b)
-			padW := bw + 22
-			if bx+padW > cardX+cardW-32 {
-				break
-			}
-			dc.SetRGBA255(int(pal.Accent2.R), int(pal.Accent2.G), int(pal.Accent2.B), 50)
-			dc.DrawRoundedRectangle(bx, badgeRowY, padW, 24, 12)
-			dc.Fill()
-			dc.SetRGBA255(int(pal.Accent2.R), int(pal.Accent2.G), int(pal.Accent2.B), 150)
-			dc.SetLineWidth(1)
-			dc.DrawRoundedRectangle(bx, badgeRowY, padW, 24, 12)
-			dc.Stroke()
-			dc.SetRGB(1, 1, 1)
-			dc.DrawString(b, bx+11, badgeRowY+17)
-			bx += padW + 8
-		}
-		_ = peakHour
-	}
-
-	pcardDrawGrain(dc, W, H, info.UserID)
-
-	outPath := filepath.Join(
-		os.TempDir(),
-		fmt.Sprintf(
-			"pcard_%d_%d.png",
-			info.UserID,
-			time.Now().UnixNano(),
-		),
-	)
-
-	if err := dc.SavePNG(outPath); err != nil {
-		return "", err
-	}
-
-	return outPath, nil
-}
-
-func ProfileCardHandler(m *tg.NewMessage) error {
-	status, _ := m.Reply("<i>forging your card...</i>")
-
-	info, err := pcardResolveTarget(m)
-	if err != nil {
-		if status != nil {
-			status.Edit("failed: " + html.EscapeString(err.Error()))
-		}
-		return nil
-	}
-	if info.UserID == 0 {
-		if status != nil {
-			status.Edit("could not resolve user")
-		}
-		return nil
-	}
-
-	avatarPath := pcardDownloadAvatar(m.Client, info)
-	defer func() {
-		if avatarPath != "" {
-			os.Remove(avatarPath)
-		}
-	}()
-
-	outPath, rerr := pcardRender(info, avatarPath)
-	if rerr != nil || outPath == "" {
-		msg := "render failed"
-		if rerr != nil {
-			msg = html.EscapeString(rerr.Error())
-		}
-		if status != nil {
-			status.Edit("failed: " + msg)
-		}
-		return nil
-	}
-	defer os.Remove(outPath)
-
-	displayName := strings.TrimSpace(info.FirstName + " " + info.LastName)
-	if displayName == "" {
-		displayName = "User"
-	}
-	caption := fmt.Sprintf("<b>%s</b>", html.EscapeString(displayName))
-	if info.Username != "" {
-		caption += fmt.Sprintf(" · @%s", html.EscapeString(info.Username))
-	}
-	caption += fmt.Sprintf("\n<i>%s</i>", html.EscapeString(pcardTitleFor(info.UserID)))
-
-	if status != nil {
-		_, _ = status.Delete()
-	}
-
-	if _, merr := m.ReplyMedia(outPath, &tg.MediaOptions{
-		Caption:  caption,
-		FileName: fmt.Sprintf("card_%d.png", info.UserID),
-		MimeType: "image/png",
-	}); merr != nil {
-		m.Reply("upload failed: " + html.EscapeString(merr.Error()))
-	}
-	return nil
-}
-
-func CardHelpHandler(m *tg.NewMessage) error {
-	txt := `<b>Card Legend</b>
-
-<b>Rank</b> is based on total messages sent:
-• <code>BRONZE</code> — under 250
-• <code>SILVER</code> — 250+
-• <code>GOLD</code> — 1,000+
-• <code>PLATINUM</code> — 3,000+
-• <code>DIAMOND</code> — 8,000+
-• <code>MYTHIC</code> — 20,000+
-
-<b>Stats</b> (3 randomly picked per card):
-• <code>POWER</code> — total messages sent
-• <code>CHAOS</code> — % of messages between midnight and dawn
-• <code>AURA</code> — number of chats you post in
-• <code>MAGIC</code> — unique commands used
-• <code>VIBE</code> — % of your messages that are replies
-• <code>ECHO</code> — % that are stickers
-• <code>SPARK</code> — % that contain links
-• <code>REACH</code> — % that carry media
-• <code>FLOW</code> — average message length
-• <code>FOCUS</code> — % of messages that are commands
-• <code>PULSE</code> — how recently you were last active
-• <code>GRIT</code> — days since first seen
-• <code>PEAK</code> — how spiky vs spread your day is
-• <code>STREAK</code> — longest run of consecutive active days
-• <code>LOYAL</code> — % of messages in your top single chat
-• <code>RANGE</code> — variety of commands you use
-• <code>WAVE</code> — how bursty your daily activity is
-• <code>DAWN</code> — % of messages in morning hours (5–10)
-
-<b>Badges</b> (up to 3, earned when triggered):
-• <b>Chatterbox</b> — 5,000+ messages
-• <b>Night Owl</b> — 35%+ messages at night
-• <b>Early Bird</b> — 35%+ messages 5–10 AM
-• <b>Sticker King</b> — 25%+ stickers
-• <b>Media Hoarder</b> — 40%+ media
-• <b>Reply Guy</b> — 50%+ replies
-• <b>Linkposter</b> — 20%+ links
-• <b>Nomad</b> — 10+ chats
-• <b>Explorer</b> — 25+ chats
-• <b>Power User</b> — 20+ unique commands
-• <b>Command Master</b> — 50+ unique commands
-• <b>Bot Whisperer</b> — 50%+ commands
-• <b>Wordsmith</b> — avg length ≥ 120 chars
-• <b>Storyteller</b> — avg length ≥ 200 chars
-• <b>Terse</b> — avg length ≤ 8 (over 200 msgs)
-• <b>Veteran</b> — tracked for a year+
-• <b>Regular</b> — 30+ day active streak
-
-<b>Title</b> and <b>aura color</b> are picked from a fixed pool based on your user ID — same every time for you, different for everyone else.`
-	m.Reply(txt)
-	return nil
-}
-
-func registerProfileCardsHandlers() {
-	c := modules.Client
-	c.On("cmd:card", ProfileCardHandler)
-	c.On("cmd:cardhelp", CardHelpHandler)
-}
-
-func initFromSrc_profile_cards_3_1() {
-	modules.QueueHandlerRegistration(registerProfileCardsHandlers)
-}
-
-func fetchScreenshot(target string) (string, error) {
-	endpoint := "https://image.thum.io/get/width/1280/" + target
-	client := &http.Client{Timeout: 60 * time.Second}
-	req, err := http.NewRequest(http.MethodGet, endpoint, nil)
-	if err != nil {
-		return "", err
-	}
-	req.Header.Set("User-Agent", "JuliaBot/1.0")
-	resp, err := client.Do(req)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("thum.io returned status %d", resp.StatusCode)
-	}
-	ct := resp.Header.Get("Content-Type")
-	if !strings.HasPrefix(ct, "image/") {
-		return "", fmt.Errorf("unexpected content-type: %s", ct)
-	}
-	f, err := os.CreateTemp("", "ss-*.png")
-	if err != nil {
-		return "", err
-	}
-	defer f.Close()
-	if _, err := io.Copy(f, io.LimitReader(resp.Body, 15*1024*1024)); err != nil {
-		os.Remove(f.Name())
-		return "", err
-	}
-	st, err := os.Stat(f.Name())
-	if err != nil {
-		os.Remove(f.Name())
-		return "", err
-	}
-	if st.Size() == 0 {
-		os.Remove(f.Name())
-		return "", fmt.Errorf("empty screenshot response")
-	}
-	return f.Name(), nil
-}
+var ssURLRe = regexp.MustCompile(`(?i)(?:https?://)?(?:[a-z0-9-]+\.)+[a-z]{2,}(?::\d+)?(?:/\S*)?`)
 
 func ScreenshotHandler(m *tg.NewMessage) error {
-	target := strings.TrimSpace(m.Args())
-	if target == "" && m.IsReply() {
-		r, err := m.GetReplyMessage()
-		if err == nil {
-			target = strings.TrimSpace(r.Text())
+	src := strings.TrimSpace(m.Args())
+	if src == "" && m.IsReply() {
+		if r, err := m.GetReplyMessage(); err == nil && r != nil {
+			src = r.Text()
 		}
 	}
+	target := ssURLRe.FindString(src)
 	if target == "" {
-		m.Reply("usage: <code>/ss &lt;url&gt;</code>")
+		m.Reply("usage: <code>/ss &lt;url&gt;</code> or reply to a message containing a link")
 		return nil
 	}
-
-	if !strings.HasPrefix(target, "http://") && !strings.HasPrefix(target, "https://") {
+	if lt := strings.ToLower(target); !strings.HasPrefix(lt, "http://") && !strings.HasPrefix(lt, "https://") {
 		target = "https://" + target
 	}
-
-	u, err := url.Parse(target)
-	if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") {
+	if u, err := url.Parse(target); err != nil || u.Host == "" {
 		m.Reply("invalid url, must be http(s)")
 		return nil
 	}
 
 	status, _ := m.Reply("<code>capturing screenshot...</code>")
-
-	path, err := fetchScreenshot(target)
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	path, err := imgDownloadTemp(ctx, "https://image.thum.io/get/width/1280/"+target, "ss-*.png")
 	if err != nil {
 		msg := "error fetching screenshot: " + html.EscapeString(err.Error())
 		if status != nil {
@@ -2204,9 +725,8 @@ func ScreenshotHandler(m *tg.NewMessage) error {
 	if status != nil {
 		status.Delete()
 	}
-
 	caption := "<b>Screenshot</b>\n<a href=\"" + html.EscapeString(target) + "\">" + html.EscapeString(target) + "</a>"
-	if _, merr := m.ReplyMedia(path, &tg.MediaOptions{
+	if _, merr := modules.TransferReplyMedia(m, path, &tg.MediaOptions{
 		Caption:  caption,
 		FileName: "screenshot.png",
 		MimeType: "image/png",
@@ -2220,13 +740,31 @@ func initFromSrc_screenshot_4_1() { modules.QueueHandlerRegistration(registerScr
 
 func registerScreenshotHandlers() {
 	c := modules.Client
-	c.On("cmd:ss", ScreenshotHandler)
+	modules.OnCommand(c, "cmd:ss", ScreenshotHandler)
 }
 
 func init() {
 	initFromSrc_image_crop_0_1()
 	initFromSrc_colors_1_1()
 	initFromSrc_wallpaper_2_1()
-	initFromSrc_profile_cards_3_1()
 	initFromSrc_screenshot_4_1()
+
+	modules.Mods.AddModule("Images", `<b>Images Module</b>
+
+<b>Commands:</b>
+ - /circle — reply to a photo or image file to crop it into a transparent circle PNG
+ - /color &lt;name|hex&gt; — color swatch with hex, RGB and HSL
+ - /colors &lt;hex|name&gt; — nearest named CSS colors
+ - /wallpaper [seed] — random 1280x720 wallpaper; a seed always returns the same image
+ - /ss &lt;url&gt; — website screenshot (or reply to a message containing a link)
+
+<b>Examples:</b>
+ - <code>/color #FF6A3D</code>
+ - <code>/colors teal</code>
+ - <code>/wallpaper ocean</code>
+ - <code>/ss github.com</code>`)
+
+	modules.Mods.AddModule("Profile", `<b>Profile</b>
+/avatar [@user|id] — full-size profile photo of you, a replied user, or the given user
+Your player card is <code>/card</code> in the Game section.`)
 }
