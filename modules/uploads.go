@@ -106,9 +106,12 @@ func UploadHandle(m *tg.NewMessage) error {
 		return err
 	}
 	if filename == "" {
-		_, err = m.Reply("Usage: <code>/ul filename [-s] [--doc] [--split 1900MiB]</code>")
-		return err
+		return showUploadPicker(m, spoiler, document, requested)
 	}
+	return uploadLocalFile(m, filename, spoiler, document, requested)
+}
+
+func uploadLocalFile(m *tg.NewMessage, filename string, spoiler, document bool, requested int64) error {
 	file, err := os.Open(filename)
 	if err != nil {
 		_, err = m.Reply("Cannot open file: " + html.EscapeString(err.Error()))

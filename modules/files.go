@@ -352,7 +352,7 @@ func init() {
 
 <code>/file &lt;fileId&gt;</code> - Send a file by its fileId
 <code>/fid</code> - Reply to a file to get its fileId
-<code>/ul &lt;filename&gt; [-s] [--doc] [--split 1900MiB]</code> - Upload or split a file
+<code>/ul [filename] [-s] [--doc] [--split 1900MiB]</code> - Upload or split a file; omit the filename to browse downloads, newest first
 <code>/ldl [t.me link]</code> - Download a file
 <code>/ariadl &lt;HTTP URL or magnet&gt;</code> - Download with aria2
 <code>/cancel</code> - Reply to a transfer message to cancel it`)
@@ -366,6 +366,7 @@ func registerFileHandlers() {
 	OnCommand(c, "cmd:ldl", DownloadHandle, tg.CustomFilter(FilterTransferUser))
 	OnCommand(c, "cmd:cancel", CancelDownloadHandle, tg.CustomFilter(FilterTransferUser))
 	c.On("callback:filecancel:", CancelTransferCallback)
+	c.On("callback:ulp:", UploadPickerCallback)
 	OnCommand(c, "cmd:ariadl", AriaDownloadHandle, tg.CustomFilter(FilterTransferUser))
 	OnCommand(c, "cmd:fileinfo", FileInfoHandle, tg.CustomFilter(FilterTransferUser))
 	OnCommand(c, "cmd:finfo", FileInfoHandle, tg.CustomFilter(FilterTransferUser))
