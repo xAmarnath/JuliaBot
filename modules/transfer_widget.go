@@ -137,7 +137,7 @@ func (v *transferProgressView) progressInterval() time.Duration {
 }
 
 func newTransferProgress(m *tg.NewMessage, phase, name string, size int64, widgetInterval ...time.Duration) (*transferProgressView, error) {
-	v := &transferProgressView{total: size, started: time.Now(),
+	v := &transferProgressView{total: size, started: time.Now(), editInterval: time.Second,
 		state: transferWidgetState{Phase: phase, Name: name, Size: HumanBytes(uint64(max(0, size)))}}
 	if len(widgetInterval) > 0 {
 		v.editInterval = widgetInterval[0]

@@ -292,7 +292,7 @@ func runAriaDownload(ctx context.Context, uri, dir string, progress func([]ariaI
 	if err = rpc.call(ctx, "addUri", []any{[]string{uri}, map[string]string{"dir": dir, "seed-time": "0"}}, &gid); err != nil {
 		return nil, err
 	}
-	ticker := time.NewTicker(2 * time.Second)
+	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
 	failures := 0
 	for {
@@ -469,12 +469,15 @@ func (v *transferProgressView) updateAria(ctx context.Context, items []ariaItem,
 	if time.Now().Before(v.nextEdit) {
 		return
 	}
-	v.nextEdit = time.Now().Add(5 * time.Second)
+	v.nextEdit = time.Now().Truncate(v.progressInterval()).Add(v.progressInterval())
 	editCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 	if err := v.writeState(editCtx, v.state.JSON()); err != nil {
 		if wait := tg.GetFloodWait(err); wait > 0 {
-			v.nextEdit = time.Now().Add(time.Duration(wait)*time.Second + time.Second)
+			v.nextEdit = time.Now().Add(max(v.progressInterval(), time.Duration(wait)*time.Second+250*time.Millisecond))
+		}
+		if v.status != nil && v.status.Client != nil {
+			v.status.Client.Log.Warn("aria2 widget progress edit failed: message=%d interval=%s flood_wait=%ds error=%v", v.status.ID, v.progressInterval(), tg.GetFloodWait(err), err)
 		}
 	}
 }
