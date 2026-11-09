@@ -9,11 +9,72 @@ import (
 	"math"
 	"strings"
 	"testing"
+	"testing/synctest"
 	"time"
 	"unicode/utf8"
 
 	tg "github.com/xAmarnath/gogram/telegram"
 )
+
+func TestLDLWidgetCadenceAndFloodBackoff(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		writes := 0
+		var editErr error
+		v := &transferProgressView{widget: true, total: 1000, started: time.Now(), editInterval: time.Second,
+			nextEdit: time.Now().Add(time.Second), writeState: func(context.Context, string) error {
+				writes++
+				return editErr
+			}}
+		update := func() { v.updateProgress(context.Background(), &tg.ProgressInfo{Current: 100}, 0, 1, 1, "File DC: 2") }
+		time.Sleep(999 * time.Millisecond)
+		update()
+		if writes != 0 {
+			t.Fatal("edited before one second")
+		}
+		time.Sleep(time.Millisecond)
+		update()
+		if writes != 1 {
+			t.Fatal("did not edit at one second")
+		}
+		editErr = errors.New("FLOOD_WAIT_2")
+		time.Sleep(time.Second)
+		update()
+		if writes != 2 {
+			t.Fatal("did not edit at two seconds")
+		}
+		editErr = nil
+		time.Sleep(2 * time.Second)
+		update()
+		if writes != 2 {
+			t.Fatal("ignored flood wait padding")
+		}
+		time.Sleep(250 * time.Millisecond)
+		update()
+		if writes != 3 {
+			t.Fatal("did not resume after flood wait")
+		}
+		time.Sleep(time.Second)
+		update()
+		if writes != 4 {
+			t.Fatal("did not return to one-second cadence")
+		}
+	})
+}
+
+func TestLDLWidgetTickerJitterDoesNotSkipUpdates(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		writes := 0
+		v := &transferProgressView{widget: true, total: 1000, started: time.Now(), editInterval: time.Second,
+			writeState: func(context.Context, string) error { writes++; return nil }}
+		for _, delay := range []time.Duration{1010 * time.Millisecond, 990 * time.Millisecond, 1010 * time.Millisecond, 990 * time.Millisecond} {
+			time.Sleep(delay)
+			v.updateProgress(context.Background(), &tg.ProgressInfo{Current: 100}, 0, 1, 1, "File DC: 2")
+		}
+		if writes != 4 {
+			t.Fatalf("ticker jitter skipped updates: got %d, want 4", writes)
+		}
+	})
+}
 
 func TestTransferWidgetPayloadLimits(t *testing.T) {
 	for name, source := range map[string]string{"transfer": transferWidgetHTML, "inline": inlineWidgetHTML} {

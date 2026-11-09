@@ -5,8 +5,8 @@ import (
 	"context"
 	"crypto/sha256"
 	"fmt"
-	tg "github.com/xAmarnath/gogram/telegram"
 	"github.com/joho/godotenv"
+	tg "github.com/xAmarnath/gogram/telegram"
 	"io"
 	"os"
 	"strconv"
@@ -93,6 +93,10 @@ func TestLiveDualClient(t *testing.T) {
 	defer func() { CloseTransfers(); transferService.Store(nil) }()
 	s := transferService.Load()
 	t.Logf("Main @%s; helper premium=%v", bot.Me().Username, user.Me().Premium)
+	if os.Getenv("JB_LDL_WIDGET_TEST") == "1" {
+		testLiveLDLWidgetAndText(t, ctx, bot, user, s)
+		return
+	}
 	limits, e := user.GetUploadLimits(ctx)
 	if e != nil {
 		t.Fatal(e)
@@ -193,6 +197,95 @@ func TestLiveDualClient(t *testing.T) {
 				t.Fatal("reconstructed split file hash mismatch")
 			}
 			t.Logf("Verified %d parts, %d bytes, filenames, captions and reconstructed SHA256", count, len(joined))
+		})
+	}
+}
+
+func testLiveLDLWidgetAndText(t *testing.T, ctx context.Context, bot, user *tg.Client, s *FileTransfers) {
+	t.Helper()
+	payload := bytes.Repeat([]byte("JuliaBot LDL user-session check\n"), 32768)
+	source, cleanup, err := s.upload(ctx, payload, tg.MediaOptions{FileName: "ldl-session-test.bin", ForceDocument: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cleanup()
+	requests := func(c *tg.Client) int64 {
+		var n int64
+		for _, stat := range c.GetTransferStats() {
+			if !stat.Upload {
+				n += stat.Requests
+			}
+		}
+		return n
+	}
+	for _, widget := range []bool{true, false} {
+		t.Run(fmt.Sprintf("widget_%v", widget), func(t *testing.T) {
+			request, err := bot.SendMessage(s.userPeer, "Automated LDL progress/session check")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer s.cleanup(bot, s.userPeer, request)
+			view := &transferProgressView{status: request}
+			if widget {
+				view, err = newTransferProgress(request, "Downloading", "ldl-session-test.bin", int64(len(payload)), time.Second)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer s.cleanup(bot, s.userPeer, view.status)
+				if !view.widget {
+					t.Fatal("widget rejected in private chat")
+				}
+				write := view.writeState
+				attempts, floods, successes := 0, 0, 0
+				view.writeState = func(ctx context.Context, data string) error {
+					attempts++
+					err := write(ctx, data)
+					if tg.GetFloodWait(err) > 0 {
+						floods++
+					}
+					if err != nil {
+						t.Logf("live widget edit: %v", err)
+					} else {
+						successes++
+					}
+					return err
+				}
+				started := time.Now()
+				for i := int64(1); i <= 20; i++ {
+					select {
+					case <-ctx.Done():
+						t.Fatal(ctx.Err())
+					case <-time.After(time.Until(view.nextEdit)):
+					}
+					view.updateProgress(ctx, &tg.ProgressInfo{Current: i * 1000, CurrentSpeed: 1000, ETA: 20 - float64(i)}, 0, 1, 1, "File DC: 2")
+				}
+				t.Logf("Live Telegram widget: %d/%d successful edits in %.2fs; flood waits=%d", successes, attempts, time.Since(started).Seconds(), floods)
+				if attempts != 20 || successes+floods != attempts {
+					t.Fatal("missing widget updates or unexpected edit errors")
+				}
+				view.writeState = write
+			}
+			transferCtx, done := TrackUserFileTransfer(view.status, s.userID)
+			defer done()
+			if selected := transferForContext(source.Client, transferCtx); selected != s || selected.user != user {
+				t.Fatal("user session was not selected")
+			}
+			botBefore, userBefore := requests(bot), requests(user)
+			file, err := TransferDownload(source, &tg.DownloadOptions{Ctx: transferCtx, FileName: t.TempDir() + "/fixture.bin", ProgressManager: view.Progress(transferCtx, 0, 1, 1, TransferMediaDC(source.Media()))})
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, err := os.ReadFile(file)
+			if err != nil || sha256.Sum256(got) != sha256.Sum256(payload) {
+				t.Fatal("download hash mismatch", err)
+			}
+			if requests(bot) != botBefore || requests(user) <= userBefore {
+				t.Fatal("download did not exclusively use user session")
+			}
+			if err := view.Finish("Completed", "User-session download verified", "LDL check passed"); err != nil {
+				t.Fatal(err)
+			}
+			t.Logf("widget=%v: SHA-256 verified; bot download requests=0; user download requests=%d", widget, requests(user)-userBefore)
 		})
 	}
 }

@@ -71,15 +71,16 @@ func (s transferWidgetState) JSON() string {
 }
 
 type transferProgressView struct {
-	status     *tg.NewMessage
-	widget     bool
-	mu         sync.Mutex
-	state      transferWidgetState
-	total      int64
-	started    time.Time
-	nextEdit   time.Time
-	generation uint64
-	writeState func(context.Context, string) error
+	status       *tg.NewMessage
+	widget       bool
+	mu           sync.Mutex
+	state        transferWidgetState
+	total        int64
+	started      time.Time
+	nextEdit     time.Time
+	editInterval time.Duration
+	generation   uint64
+	writeState   func(context.Context, string) error
 }
 
 // NewTransferProgress shares the same controller with commands in extras.
@@ -128,9 +129,19 @@ func widgetUnavailable(err error) bool {
 	return false
 }
 
-func newTransferProgress(m *tg.NewMessage, phase, name string, size int64) (*transferProgressView, error) {
-	v := &transferProgressView{total: size, started: time.Now(), nextEdit: time.Now().Add(5 * time.Second),
+func (v *transferProgressView) progressInterval() time.Duration {
+	if v.editInterval < time.Second {
+		return 5 * time.Second
+	}
+	return v.editInterval
+}
+
+func newTransferProgress(m *tg.NewMessage, phase, name string, size int64, widgetInterval ...time.Duration) (*transferProgressView, error) {
+	v := &transferProgressView{total: size, started: time.Now(),
 		state: transferWidgetState{Phase: phase, Name: name, Size: HumanBytes(uint64(max(0, size)))}}
+	if len(widgetInterval) > 0 {
+		v.editInterval = widgetInterval[0]
+	}
 	caption := phase + " " + transferCaption(widgetText(name, 220)) + ". Reply with /cancel to stop."
 	status, err := transferMessageCall(context.Background(), func() (*tg.NewMessage, error) {
 		return m.ReplyMedia(&tg.InputMediaWidget{AllowQueries: true, Width: 340, Height: 0, Html: transferWidgetHTML, ChatData: v.state.JSON()}, &tg.MediaOptions{Caption: caption, ParseMode: tg.HTML})
@@ -148,6 +159,7 @@ func newTransferProgress(m *tg.NewMessage, phase, name string, size int64) (*tra
 		}
 	}
 	v.status, v.widget = status, isTransferWidget(status)
+	v.nextEdit = time.Now().Add(v.progressInterval())
 	v.writeState = func(ctx context.Context, data string) error {
 		_, err := status.Client.MakeRequest(ctx, &tg.MessagesEditMessageWidgetDataParams{Peer: status.Peer, ID: status.ID, ChatData: data})
 		if tg.MatchError(err, "MESSAGE_NOT_MODIFIED") {
@@ -180,7 +192,7 @@ func (v *transferProgressView) Progress(ctx context.Context, offset, part, parts
 	if dc > 0 {
 		dcText = fmt.Sprintf("%s: %d", label, dc)
 	}
-	return tg.NewProgressManager(5).WithCallback(func(info *tg.ProgressInfo) {
+	return tg.NewProgressManager(int(v.progressInterval() / time.Second)).WithCallback(func(info *tg.ProgressInfo) {
 		v.updateProgress(ctx, info, offset, part, parts, dcText, generation)
 	})
 }
@@ -213,12 +225,17 @@ func (v *transferProgressView) updateProgress(ctx context.Context, info *tg.Prog
 	if time.Now().Before(v.nextEdit) {
 		return
 	}
-	v.nextEdit = time.Now().Add(5 * time.Second)
+	// Use fixed interval boundaries so small ticker delays do not cause the
+	// next progress callback to be skipped by a second, drifting throttle.
+	v.nextEdit = time.Now().Truncate(v.progressInterval()).Add(v.progressInterval())
 	updateCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 	if err := v.writeState(updateCtx, v.state.JSON()); err != nil {
 		if wait := tg.GetFloodWait(err); wait > 0 {
-			v.nextEdit = time.Now().Add(max(5*time.Second, time.Duration(wait)*time.Second+250*time.Millisecond))
+			v.nextEdit = time.Now().Add(max(v.progressInterval(), time.Duration(wait)*time.Second+250*time.Millisecond))
+		}
+		if v.status != nil && v.status.Client != nil {
+			v.status.Client.Log.Warn("transfer widget progress edit failed: message=%d interval=%s flood_wait=%ds error=%v", v.status.ID, v.progressInterval(), tg.GetFloodWait(err), err)
 		}
 	}
 }

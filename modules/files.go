@@ -178,13 +178,14 @@ func DownloadHandle(m *tg.NewMessage) error {
 	} else if !os.IsNotExist(err) {
 		return err
 	}
-	view, err := newTransferProgress(m, "Downloading", name, r.File.Size)
+	view, err := newTransferProgress(m, "Downloading", name, r.File.Size, time.Second)
 	if err != nil {
 		return err
 	}
 	status := view.status
 	ctx, done := TrackUserFileTransfer(status, m.SenderID())
 	defer done()
+	m.Client.Log.Info("ldl download: user_session=%v widget=%v", transferForContext(r.Client, ctx) != nil, view.widget)
 	start := time.Now()
 	opt := &tg.DownloadOptions{Ctx: ctx, FileName: path, ProgressManager: view.Progress(ctx, 0, 1, 1, TransferMediaDC(r.Media()))}
 	file, err := TransferDownload(r, opt)
