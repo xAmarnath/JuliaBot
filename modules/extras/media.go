@@ -163,18 +163,19 @@ func MirrorFileHandler(m *telegram.NewMessage) error {
 		_, err = m.Reply("Reply to a file or provide a t.me file link.")
 		return err
 	}
-	status, err := m.Reply("Downloading…")
+	view, err := modules.NewTransferProgress(m, "Downloading", r.File.Name, r.File.Size)
 	if err != nil {
 		return err
 	}
+	status := view.Status()
 	ctx, done := modules.TrackUserFileTransfer(status, m.SenderID())
 	defer done()
 	if err = os.MkdirAll("downloads", 0755); err != nil {
-		return err
+		return view.Finish("Failed", "Cannot create download directory.", "Mirror failed: cannot create download directory.")
 	}
 	dir, err := os.MkdirTemp("downloads", "mirror-")
 	if err != nil {
-		return err
+		return view.Finish("Failed", "Cannot create temporary directory.", "Mirror failed: cannot create temporary directory.")
 	}
 	defer os.RemoveAll(dir)
 	name := opts.FileName
@@ -187,13 +188,16 @@ func MirrorFileHandler(m *telegram.NewMessage) error {
 	}
 	dl := &telegram.DownloadOptions{Ctx: ctx, FileName: filepath.Join(dir, name)}
 	if !opts.NoProgress {
-		dl.ProgressManager = modules.TransferProgress(status, modules.TransferMediaDC(r.Media()))
+		dl.ProgressManager = view.Progress(ctx, 0, 1, 1, modules.TransferMediaDC(r.Media()))
 	}
 	fi, err := modules.TransferDownload(r, dl)
 	if err == nil {
+		if phaseErr := view.BeginPhase(ctx, "Uploading", r.File.Size); phaseErr != nil {
+			m.Client.Log.Warn("mirror phase update: %v", phaseErr)
+		}
 		upload := &telegram.UploadOptions{Ctx: ctx}
 		if !opts.NoProgress {
-			upload.ProgressManager = modules.TransferProgress(status)
+			upload.ProgressManager = view.Progress(ctx, 0, 1, 1)
 		}
 		media := &telegram.MediaOptions{ForceDocument: opts.ForceDocument, Spoiler: true, Upload: upload, Caption: html.EscapeString(name), ParseMode: telegram.HTML}
 		if !opts.NoThumb {
@@ -205,20 +209,23 @@ func MirrorFileHandler(m *telegram.NewMessage) error {
 			_, err = modules.TransferUploadEdit(status, fi, media)
 		} else {
 			_, err = modules.TransferSendMedia(m.Client, opts.Destination, fi, media)
-			if err == nil {
-				_, err = status.Edit("File mirrored successfully.")
-			}
 		}
 	}
 	if err != nil {
 		text := "Mirror failed: " + html.EscapeString(err.Error())
+		detail := err.Error()
 		if errors.Is(err, context.Canceled) {
 			text = "Mirror cancelled. Partial files removed."
+			detail = "Partial files removed."
 		}
-		_, editErr := status.Edit(text, &telegram.SendOptions{ParseMode: telegram.HTML})
-		return editErr
+		phase := "Failed"
+		if errors.Is(err, context.Canceled) {
+			phase = "Cancelled"
+		}
+		m.Client.Log.Warn("mirror stopped: %v", err)
+		return view.Finish(phase, detail, text)
 	}
-	return nil
+	return view.Finish("Completed", "File delivered. Temporary download removed.", "File mirrored successfully.")
 }
 func registerMediaHandlers() {
 	c := modules.Client

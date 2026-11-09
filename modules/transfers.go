@@ -542,11 +542,14 @@ func TransferUploadEdit(status *tg.NewMessage, media any, opts ...*tg.MediaOptio
 // stickers. Send those as a new bot message using the bot's received reference.
 // Keep the progress message until delivery succeeds so failures remain visible.
 func deliverTransferUpload(ctx context.Context, bot transferAPI, status *tg.NewMessage, media any, opt tg.MediaOptions, send *tg.SendOptions, caption any) (*tg.NewMessage, error) {
-	result, err := transferMessageCall(ctx, func() (*tg.NewMessage, error) {
-		return bot.EditMessage(status.Peer, status.ID, caption, send)
-	})
-	if err == nil || !tg.MatchError(err, "MEDIA_NEW_INVALID") {
-		return result, err
+	widget := isTransferWidget(status)
+	if !widget {
+		result, err := transferMessageCall(ctx, func() (*tg.NewMessage, error) {
+			return bot.EditMessage(status.Peer, status.ID, caption, send)
+		})
+		if err == nil || !tg.MatchError(err, "MEDIA_NEW_INVALID") {
+			return result, err
+		}
 	}
 	if opt.ReplyTo == nil && opt.ReplyID == 0 {
 		opt.ReplyID = status.ReplyToMsgID()
@@ -556,11 +559,16 @@ func deliverTransferUpload(ctx context.Context, bot transferAPI, status *tg.NewM
 			opt.TopicID = reply.ReplyToTopID
 		}
 	}
-	result, err = transferMessageCall(ctx, func() (*tg.NewMessage, error) {
+	result, err := transferMessageCall(ctx, func() (*tg.NewMessage, error) {
 		return bot.SendMedia(status.Peer, media, &opt)
 	})
 	if err != nil {
 		return nil, err
+	}
+	// Widget HTML is immutable. Keep its live state and send the finished file
+	// separately, including every split part under the same progress card.
+	if widget {
+		return result, nil
 	}
 	// A cleanup failure must not turn a delivered upload into a failed upload.
 	if _, cleanupErr := bot.DeleteMessages(status.Peer, []int32{status.ID}); cleanupErr != nil && Client != nil {

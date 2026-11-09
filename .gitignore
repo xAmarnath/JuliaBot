@@ -40,6 +40,9 @@ snap.go
 *.sqlite
 *.db
 *.html
+!modules/transfer_progress.html
+!modules/inline_widget.html
+!modules/extras/imdb_widget.html
 *.bin
 *.b64
 user1

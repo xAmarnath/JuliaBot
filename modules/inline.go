@@ -8,8 +8,8 @@ import (
 	"net/url"
 	"strconv"
 
-	"github.com/xAmarnath/gogram/telegram"
 	"github.com/fogleman/gg"
+	"github.com/xAmarnath/gogram/telegram"
 )
 
 func DogeSticker(m *telegram.NewMessage) error {
@@ -281,6 +281,9 @@ func EmptyPreviewInline(i *telegram.InlineQuery) error {
 
 func registerInlineHandlers() {
 	c := Client
+	c.On("inline:^test$", inlineWidgetTest)
+	c.AddRawHandler(&telegram.UpdateInlineBotWidgetQuery{}, inlineWidgetTestQuery)
+	c.AddRawHandler(&telegram.UpdateBotInlineSend{}, inlineWidgetTestChosen)
 	c.On("inline:prev", EmptyPreviewInline)
 	c.On("inline:pin", PinterestInlineHandle)
 }

@@ -1,0 +1,8 @@
+<html><head><style>
+body{margin:0;padding:16px;font:16px/1.4 sans-serif;color:var(--tg-theme-text-color)}h3{margin:0 0 8px;font-size:20px}p{margin:8px 0}#state{padding:12px;border-radius:12px;background:var(--tg-theme-secondary-bg-color);overflow-wrap:anywhere}button{width:100%;min-height:44px;margin-top:8px;border:0;border-radius:12px;font:inherit;background:var(--tg-theme-button-color);color:var(--tg-theme-button-text-color)}button:disabled{opacity:.6}#feedback{font-size:14px;min-height:20px}
+</style></head><body><h3>JuliaBot inline widget</h3><p>Send this card, then tap below to ask the bot to update its state.</p><p id="state">Waiting for a state update.</p><button id="test">Test state update</button><p id="feedback"></p><script>
+var W=window.TelegramWidget,B=document.getElementById('test'),F=document.getElementById('feedback');
+function draw(){var s={};try{s=JSON.parse(W.chatData||'{}')}catch(e){}document.getElementById('state').textContent=s.message||'Waiting for a state update.';B.disabled=W.isPreview||W.isForward;if(W.isPreview)F.textContent='Send the card to try it.';else if(W.isForward)F.textContent='Use the original card to test.'}
+B.onclick=function(){if(!W)return;B.disabled=true;F.textContent='Asking the bot...';W.request('inline-widget-test').then(function(a){var r={};try{r=JSON.parse(a.result||'{}')}catch(e){}F.textContent=r.message||'Bot replied.';B.disabled=false},function(e){F.textContent='Request failed: '+(e.code||'FAILED')+'. Tap to retry.';B.disabled=false})};
+if(W){draw();W.onEvent('chatDataChanged',draw);W.ready()}else{B.disabled=true}
+</script></body></html>

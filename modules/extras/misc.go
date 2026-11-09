@@ -19,8 +19,8 @@ import (
 	modules "main/modules"
 	"main/modules/db"
 
-	tg "github.com/xAmarnath/gogram/telegram"
 	"github.com/patrickmn/go-cache"
+	tg "github.com/xAmarnath/gogram/telegram"
 	"main/internal/mongostore"
 )
 
@@ -563,6 +563,7 @@ func registerMiscHandlers() {
 	c := modules.Client
 	modules.OnCommand(c, "cmd:imdb", IMDbHandler)
 	c.On("callback:imdb:", IMDbCallback)
+	c.AddRawHandler(&tg.UpdateBotWidgetQuery{}, imdbWidgetQuery)
 	modules.OnCommand(c, "cmd:help", modules.HelpHandle)
 	modules.OnCommand(c, "cmd:nightmode", NightModeHandler)
 	modules.OnCommand(c, "cmd:tempnote", SaveTempNoteHandler)
@@ -630,7 +631,7 @@ func imdbClient(ctx context.Context) (*scraper.Scraper, func(), error) {
 	return imdbState.client, release, nil
 }
 
-func IMDbHandler(m *tg.NewMessage) error {
+func imdbTextHandler(m *tg.NewMessage) error {
 	query := strings.TrimSpace(m.Args())
 	if query == "" {
 		_, err := m.Reply("Usage: <code>/imdb movie name</code>, <code>/imdb tt0133093</code>, or an IMDb title URL.")

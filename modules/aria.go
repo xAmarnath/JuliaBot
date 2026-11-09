@@ -354,15 +354,20 @@ func AriaDownloadHandle(m *tg.NewMessage) error {
 			_ = os.RemoveAll(dir)
 		}
 	}()
-	status, err := m.Reply("Starting aria2 download…")
+	view, err := newTransferProgress(m, "Starting aria2", "Waiting for file name", 0)
 	if err != nil {
 		return err
 	}
+	status := view.status
 	ctx, done := TrackFileTransfer(status, m.SenderID())
 	defer done()
 	started := time.Now()
 	last := time.Time{}
 	files, err := runAriaDownload(ctx, uri, dir, func(items []ariaItem) {
+		if view.widget {
+			view.updateAria(ctx, items, uri)
+			return
+		}
 		if time.Since(last) < 5*time.Second || ctx.Err() != nil {
 			return
 		}
@@ -372,11 +377,16 @@ func AriaDownloadHandle(m *tg.NewMessage) error {
 	})
 	if err != nil {
 		text := "aria2 download failed: " + html.EscapeString(err.Error())
+		detail := err.Error()
 		if errors.Is(err, context.Canceled) {
 			text = "aria2 download cancelled. Partial files removed."
+			detail = "Partial files removed."
 		}
-		_, editErr := status.Edit(text)
-		return editErr
+		phase := "Failed"
+		if errors.Is(err, context.Canceled) {
+			phase = "Cancelled"
+		}
+		return view.Finish(phase, detail, text)
 	}
 	completed = true
 	var out strings.Builder
@@ -392,6 +402,79 @@ func AriaDownloadHandle(m *tg.NewMessage) error {
 		fmt.Fprintf(&out, "…and %d more files.\n", len(files)-12)
 	}
 	out.WriteString("Use <code>/ul path</code> to upload a file.")
-	_, err = status.Edit(out.String(), &tg.SendOptions{ParseMode: tg.HTML})
-	return err
+	return view.Finish("Completed", fmt.Sprintf("%d file(s) saved. Use /ul with a path below to upload.", len(files)), out.String())
+}
+
+func ariaWidgetState(items []ariaItem, uri string, elapsed time.Duration) (transferWidgetState, int64) {
+	total, current, speed, _, _ := ariaTotals(items)
+	s := transferWidgetState{Phase: "Downloading", Elapsed: elapsed.Round(time.Second).String()}
+	u, _ := url.Parse(uri)
+	magnet := u != nil && strings.EqualFold(u.Scheme, "magnet")
+	var connections, seeders int64
+	metadata := false
+	for _, item := range items {
+		if len(item.FollowedBy) > 0 {
+			continue
+		}
+		if item.Bittorrent.Info.Name != "" {
+			s.Name = item.Bittorrent.Info.Name
+			metadata = true
+		}
+		if s.Name == "" && len(item.Files) > 0 && !strings.HasPrefix(item.Files[0].Path, "[MEMORY]") {
+			s.Name = filepath.Base(item.Files[0].Path)
+		}
+		n, _ := strconv.ParseInt(item.Connections, 10, 64)
+		connections += n
+		n, _ = strconv.ParseInt(item.Seeders, 10, 64)
+		seeders += n
+	}
+	if s.Name == "" && u != nil {
+		s.Name = u.Query().Get("dn")
+		if s.Name == "" && !magnet {
+			s.Name = filepath.Base(u.Path)
+		}
+	}
+	if s.Name == "" || s.Name == "." {
+		s.Name = "Waiting for file name"
+	}
+	s.Size = HumanBytes(uint64(max(0, current))) + " / " + HumanBytes(uint64(max(0, total)))
+	if total > 0 {
+		s.Percent = int(min(100.0, 100*float64(current)/float64(total)))
+	} else {
+		s.Size = HumanBytes(uint64(max(0, current))) + " / unknown"
+	}
+	s.Speed = HumanBytes(uint64(max(0, speed))) + "/s"
+	if speed > 0 && total > current {
+		s.ETA = (time.Duration((total-current)/speed) * time.Second).String()
+	}
+	if magnet {
+		s.DC = fmt.Sprintf("%d connections · %d seeders", connections, seeders)
+		if !metadata {
+			s.Phase = "Fetching metadata"
+			s.Detail = "Connecting to the torrent network…"
+		} else if speed == 0 && current < total {
+			s.Detail = "Waiting for peers to send file data…"
+		}
+	}
+	return s, total
+}
+
+func (v *transferProgressView) updateAria(ctx context.Context, items []ariaItem, uri string) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	if v.state.Done || ctx.Err() != nil {
+		return
+	}
+	v.state, v.total = ariaWidgetState(items, uri, time.Since(v.started))
+	if time.Now().Before(v.nextEdit) {
+		return
+	}
+	v.nextEdit = time.Now().Add(5 * time.Second)
+	editCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	if err := v.writeState(editCtx, v.state.JSON()); err != nil {
+		if wait := tg.GetFloodWait(err); wait > 0 {
+			v.nextEdit = time.Now().Add(time.Duration(wait)*time.Second + time.Second)
+		}
+	}
 }

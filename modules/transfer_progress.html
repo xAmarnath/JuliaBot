@@ -1,0 +1,38 @@
+<!doctype html>
+<html><head><style>
+*{box-sizing:border-box}body{margin:0;padding:16px;font:14px system-ui;color:var(--tg-theme-text-color,#202124);background:var(--tg-theme-bg-color,#fff)}
+.top,.row{display:flex;justify-content:space-between;gap:12px;align-items:center}.title{font-weight:700;font-size:16px}.hint{color:var(--tg-theme-hint-color,#707579)}
+#name{margin:10px 0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.track{height:8px;border-radius:4px;background:var(--tg-theme-secondary-bg-color,#eef0f2);overflow:hidden}#bar{height:8px;background:var(--tg-theme-button-color,#3390ec);width:0}
+.row{margin-top:10px;font-size:13px}.right{text-align:right}#detail{font-size:13px;line-height:18px;margin-top:10px;overflow-wrap:break-word}
+button{width:100%;min-height:44px;margin-top:12px;border:0;border-radius:8px;font:inherit;font-weight:600;background:var(--tg-theme-secondary-bg-color,#eef0f2);color:var(--tg-theme-text-color,#202124)}button[disabled]{color:var(--tg-theme-hint-color,#707579)}#notice{margin-top:6px;font-size:12px;line-height:16px}
+</style></head><body>
+<div class="top"><span id="phase" class="title">Preparing</span><span id="percent">0%</span></div>
+<div id="name">File transfer</div><div class="track"><div id="bar"></div></div>
+<div class="row"><span id="size"></span><span id="speed" class="right"></span></div>
+<div class="row hint"><span id="elapsed"></span><span id="eta" class="right"></span></div>
+<div class="row hint"><span id="dc"></span><span id="part" class="right"></span></div>
+<div id="detail"></div><button id="cancel">Cancel transfer</button><div id="notice" class="hint"></div>
+<script>
+var W=window.TelegramWidget,pending=false,stopping=false,state={};
+function el(id){return document.getElementById(id)}
+function text(id,value){el(id).textContent=value||''}
+function draw(){
+ try{state=JSON.parse(W.chatData)||{}}catch(e){state={}}
+ var p=Math.max(0,Math.min(100,Number(state.percent)||0)),done=!!state.done;
+ text('phase',state.phase||'Transfer');text('name',state.name||'File transfer');text('percent',Math.floor(p)+'%');el('bar').style.width=p+'%';
+ text('size',state.size);text('speed',state.speed);text('elapsed',state.elapsed?'Elapsed '+state.elapsed:'');text('eta',!done&&state.eta?(state.parts>1?'Part ETA ':'ETA ')+state.eta:'');text('dc',state.dc);text('part',state.parts>1?'Part '+state.part+'/'+state.parts:'');text('detail',state.detail);
+ var unavailable=!W.viewer||W.isForward||W.isPreview;
+ el('cancel').disabled=done||pending||stopping||unavailable;
+ text('cancel',done?state.phase:stopping?'Cancelling…':pending?'Requesting…':'Cancel transfer');
+ if(done)text('notice','');else if(unavailable)text('notice','Open the original transfer to cancel.');
+}
+el('cancel').addEventListener('click',function(){
+ if(pending||stopping||state.done)return;
+ pending=true;text('notice','');draw();
+ W.request('filecancel').then(function(answer){
+  var result={};try{result=JSON.parse(answer.result)||{}}catch(e){}
+  pending=false;stopping=!!result.ok;draw();if(!state.done)text('notice',result.message||'No answer. Try again.');
+ },function(error){pending=false;draw();if(!state.done)text('notice','Cancel failed: '+(error.code||'FAILED')+'. Try again.');});
+});
+if(W){W.onEvent('chatDataChanged',draw);draw();W.ready()}
+</script></body></html>

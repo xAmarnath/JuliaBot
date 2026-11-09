@@ -126,24 +126,25 @@ func uploadLocalFile(m *tg.NewMessage, filename string, spoiler, document bool, 
 		_, err = m.Reply("Choose a non-empty file.")
 		return err
 	}
-	status, err := transferMessageCall(context.Background(), func() (*tg.NewMessage, error) { return m.Reply("Preparing upload…") })
+	view, err := newTransferProgress(m, "Preparing upload", filepath.Base(filename), info.Size())
 	if err != nil {
 		return err
 	}
+	status := view.status
 	ctx, done := TrackUserFileTransfer(status, m.SenderID())
 	defer done()
 	started := time.Now()
 	limits, err := uploadAccountLimits(ctx, m.Client)
 	if err != nil {
-		return uploadFailure(status, err)
+		return view.UploadFailure(err)
 	}
 	partSize, count, err := uploadPartSize(info.Size(), limits.MaxFileSize, requested)
 	if err != nil {
-		return uploadFailure(status, err)
+		return view.UploadFailure(err)
 	}
 	for i := int64(0); i < count; i++ {
 		if err := ctx.Err(); err != nil {
-			return uploadFailure(status, err)
+			return view.UploadFailure(err)
 		}
 		partStatus := status
 		name := filepath.Base(filename)
@@ -151,27 +152,33 @@ func uploadLocalFile(m *tg.NewMessage, filename string, spoiler, document bool, 
 		unbind := func() {}
 		if count > 1 {
 			name = fmt.Sprintf("%s.part%05d", name, i+1)
-			partStatus, err = transferMessageCall(ctx, func() (*tg.NewMessage, error) {
-				return m.Reply(fmt.Sprintf("Uploading part %d/%d…", i+1, count))
-			})
-			if err != nil {
-				return uploadFailure(status, fmt.Errorf("prepare part %d/%d: %w", i+1, count, err))
+			if !view.widget {
+				partStatus, err = transferMessageCall(ctx, func() (*tg.NewMessage, error) {
+					return m.Reply(fmt.Sprintf("Uploading part %d/%d…", i+1, count))
+				})
+				if err != nil {
+					return view.UploadFailure(fmt.Errorf("prepare part %d/%d: %w", i+1, count, err))
+				}
+				unbind = bindTransferStatus(status, partStatus)
 			}
-			unbind = bindTransferStatus(status, partStatus)
 			n := min(partSize, info.Size()-i*partSize)
 			media = tg.ReaderAtSource{Reader: io.NewSectionReader(file, i*partSize, n), Size: n, Name: name}
 		}
 		partStarted := time.Now()
+		progress := view.Progress(ctx, i*partSize, i+1, count)
+		if partStatus != status {
+			progress = TransferProgress(partStatus)
+		}
 		var uploaded *tg.NewMessage
 		uploaded, err = TransferUploadEdit(partStatus, media, &tg.MediaOptions{FileName: name, ForceDocument: document || count > 1,
 			Spoiler: spoiler, Caption: transferCaption(name), ParseMode: tg.HTML,
-			Upload: &tg.UploadOptions{Ctx: ctx, ProgressManager: TransferProgress(partStatus)}})
+			Upload: &tg.UploadOptions{Ctx: ctx, ProgressManager: progress}})
 		unbind()
 		if err != nil {
 			if partStatus != status {
 				_ = uploadFailure(partStatus, err)
 			}
-			return uploadFailure(status, err)
+			return view.UploadFailure(err)
 		}
 		caption := uploadCompletedCaption(name, time.Since(partStarted))
 		// Stickers have no editable caption; delivery already completed.
@@ -182,15 +189,22 @@ func uploadLocalFile(m *tg.NewMessage, filename string, spoiler, document bool, 
 				m.Client.Log.Warn("upload completed but timing caption failed: %v", captionErr)
 			}
 		}
-		if count > 1 {
+		if count > 1 && !view.widget {
 			_, _ = transferMessageCall(ctx, func() (*tg.NewMessage, error) {
 				return status.Edit(fmt.Sprintf("Uploaded %d/%d parts of %s", i+1, count, transferCaption(filename)), &tg.SendOptions{ReplyMarkup: transferCancelKeyboard(status.ID)})
 			})
 		}
 	}
+	caption := uploadCompletedCaption(filepath.Base(filename), time.Since(started))
+	if count > 1 {
+		caption = fmt.Sprintf("Uploaded all %d parts of %s in %.2f seconds.\nJoin them in order with <code>cat %s.part* &gt; %s</code>.", count, transferCaption(filename), time.Since(started).Seconds(), html.EscapeString(shellQuote(filepath.Base(filename))), html.EscapeString(shellQuote(filepath.Base(filename))))
+	}
+	if view.widget {
+		return view.Finish("Completed", "Files delivered to this chat.", caption)
+	}
 	if count > 1 {
 		_, err = transferMessageCall(ctx, func() (*tg.NewMessage, error) {
-			return status.Edit(fmt.Sprintf("Uploaded all %d parts of %s in %.2f seconds.\nJoin them in order with <code>cat %s.part* &gt; %s</code>.", count, transferCaption(filename), time.Since(started).Seconds(), html.EscapeString(shellQuote(filepath.Base(filename))), html.EscapeString(shellQuote(filepath.Base(filename)))))
+			return status.Edit(caption)
 		})
 	}
 	return err

@@ -53,7 +53,9 @@ func trackFileTransfer(parent context.Context, m *tg.NewMessage, owner int64) (c
 	cancelMutex.Lock()
 	downloadCancels[key] = activeFileTransfer{ctx, cancel, owner}
 	cancelMutex.Unlock()
-	_, _ = m.Edit(m.MessageText(), &tg.SendOptions{ParseMode: tg.HTML, ReplyMarkup: transferCancelKeyboard(m.ID)})
+	if !isTransferWidget(m) {
+		_, _ = m.Edit(m.MessageText(), &tg.SendOptions{ParseMode: tg.HTML, ReplyMarkup: transferCancelKeyboard(m.ID)})
+	}
 	return ctx, func() { cancel(); cancelMutex.Lock(); delete(downloadCancels, key); cancelMutex.Unlock() }
 }
 func SendFileByIDHandle(m *tg.NewMessage) error {
@@ -176,26 +178,27 @@ func DownloadHandle(m *tg.NewMessage) error {
 	} else if !os.IsNotExist(err) {
 		return err
 	}
-	status, err := m.Reply("Downloading...")
+	view, err := newTransferProgress(m, "Downloading", name, r.File.Size)
 	if err != nil {
 		return err
 	}
+	status := view.status
 	ctx, done := TrackUserFileTransfer(status, m.SenderID())
 	defer done()
 	start := time.Now()
-	opt := &tg.DownloadOptions{Ctx: ctx, FileName: path, ProgressManager: TransferProgress(status, TransferMediaDC(r.Media()))}
+	opt := &tg.DownloadOptions{Ctx: ctx, FileName: path, ProgressManager: view.Progress(ctx, 0, 1, 1, TransferMediaDC(r.Media()))}
 	file, err := TransferDownload(r, opt)
 	if err != nil {
 		_ = os.Remove(path)
 		message := "Download failed: " + html.EscapeString(err.Error())
+		phase, detail := "Failed", err.Error()
 		if errors.Is(err, context.Canceled) {
 			message = "Download cancelled."
+			phase, detail = "Cancelled", "Partial download removed."
 		}
-		_, editErr := status.Edit(message)
-		return editErr
+		return view.Finish(phase, detail, message)
 	}
-	_, err = status.Edit(fmt.Sprintf("Downloaded %s in <code>%s</code>", transferCaption(file), time.Since(start).Round(time.Millisecond)))
-	return err
+	return view.Finish("Completed", "Saved to "+file, fmt.Sprintf("Downloaded %s in <code>%s</code>", transferCaption(file), time.Since(start).Round(time.Millisecond)))
 }
 
 func CancelDownloadHandle(m *tg.NewMessage) error {
@@ -366,6 +369,7 @@ func registerFileHandlers() {
 	OnCommand(c, "cmd:ldl", DownloadHandle, tg.CustomFilter(FilterTransferUser))
 	OnCommand(c, "cmd:cancel", CancelDownloadHandle, tg.CustomFilter(FilterTransferUser))
 	c.On("callback:filecancel:", CancelTransferCallback)
+	c.AddRawHandler(&tg.UpdateBotWidgetQuery{}, transferWidgetQuery)
 	c.On("callback:ulp:", UploadPickerCallback)
 	OnCommand(c, "cmd:ariadl", AriaDownloadHandle, tg.CustomFilter(FilterTransferUser))
 	OnCommand(c, "cmd:fileinfo", FileInfoHandle, tg.CustomFilter(FilterTransferUser))
