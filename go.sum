@@ -67,6 +67,8 @@ github.com/xAmarnath/gogram v1.8.0-beta.14 h1:ECvAvcMtm8Mb477dgkcKu7BmXIjQkih9/9
 github.com/xAmarnath/gogram v1.8.0-beta.14/go.mod h1:Q9LIdNI+FM54xMw5rg7y9+9UGwq5/RZ7I/AP2hoaC/w=
 github.com/xAmarnath/gogram v1.8.0-beta.15 h1:ftt4951aNbtPRyo3gdxEd3PF4KwkfS6J2pGbMi3XnoI=
 github.com/xAmarnath/gogram v1.8.0-beta.15/go.mod h1:Q9LIdNI+FM54xMw5rg7y9+9UGwq5/RZ7I/AP2hoaC/w=
+github.com/xAmarnath/gogram v1.8.0-beta.15.0.20261111172126-b395abd8c143 h1:uWHqi791IUuKkgMP5Rd7qLynCz1GXuRWsqGcs2HLZm4=
+github.com/xAmarnath/gogram v1.8.0-beta.15.0.20261111172126-b395abd8c143/go.mod h1:Q9LIdNI+FM54xMw5rg7y9+9UGwq5/RZ7I/AP2hoaC/w=
 github.com/xdg-go/pbkdf2 v1.0.0 h1:Su7DPu48wXMwC3bs7MCNG+z4FhcyEuz5dlvchbq0B0c=
 github.com/xdg-go/pbkdf2 v1.0.0/go.mod h1:jrpuAogTd400dnrH08LKmI/xc1MbPOebTwRqcT5RDeI=
 github.com/xdg-go/scram v1.2.0 h1:bYKF2AEwG5rqd1BumT4gAnvwU/M9nBp2pTSxeZw7Wvs=

@@ -39,11 +39,9 @@ type userPerf struct {
 }
 
 var (
-	userPerfCache   = map[int64]*userPerf{}
-	userPerfDirty   = map[int64]bool{}
-	userPerfMu      sync.Mutex
-	userPerfFlushed bool
-	userPerfFlushMu sync.Mutex
+	userPerfCache = map[int64]*userPerf{}
+	userPerfDirty = map[int64]bool{}
+	userPerfMu    sync.Mutex
 )
 
 func userPerfKey(userID int64) []byte {
@@ -192,23 +190,6 @@ func userPerfFlushAll() {
 	}
 }
 
-func userPerfStartFlusher() {
-	userPerfFlushMu.Lock()
-	if userPerfFlushed {
-		userPerfFlushMu.Unlock()
-		return
-	}
-	userPerfFlushed = true
-	userPerfFlushMu.Unlock()
-	go func() {
-		t := time.NewTicker(30 * time.Second)
-		defer t.Stop()
-		for range t.C {
-			userPerfFlushAll()
-		}
-	}()
-}
-
 func userPerfHasURL(text string) bool {
 	if text == "" {
 		return false
@@ -317,7 +298,6 @@ func UserPerfTracker(m *tg.NewMessage) error {
 // No commands or help of its own: this feeds the profile card in images.go.
 func registerUserPerfHandlers() {
 	c := modules.Client
-	userPerfStartFlusher()
 	c.On(tg.OnNewMessage, UserPerfTracker)
 }
 

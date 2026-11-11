@@ -8,7 +8,6 @@ import (
 	"sort"
 	"strings"
 	"sync"
-	"time"
 
 	tg "github.com/xAmarnath/gogram/telegram"
 	"main/internal/mongostore"
@@ -31,8 +30,6 @@ var (
 	chatStatsCache   = make(map[int64]*chatStatsEntry)
 	chatStatsDirty   = make(map[int64]bool)
 	chatStatsCacheMu sync.Mutex
-	chatStatsStarted bool
-	chatStatsStartMu sync.Mutex
 )
 
 func chatStatsKey(chatID int64) []byte {
@@ -145,24 +142,6 @@ func chatStatsFlush() {
 		}
 		chatStatsCacheMu.Unlock()
 	}
-}
-
-func chatStatsLoop() {
-	chatStatsStartMu.Lock()
-	if chatStatsStarted {
-		chatStatsStartMu.Unlock()
-		return
-	}
-	chatStatsStarted = true
-	chatStatsStartMu.Unlock()
-
-	go func() {
-		t := time.NewTicker(30 * time.Second)
-		defer t.Stop()
-		for range t.C {
-			chatStatsFlush()
-		}
-	}()
 }
 
 func chatStatsHasURL(m *tg.NewMessage) bool {
@@ -338,7 +317,6 @@ func TopUsersHandler(m *tg.NewMessage) error {
 
 func registerChatStatsHandlers() {
 	c := modules.Client
-	chatStatsLoop()
 	c.On(tg.OnNewMessage, ChatStatsTrackHandler)
 	modules.OnCommand(c, "cmd:chatstats", ChatStatsHandler)
 	modules.OnCommand(c, "cmd:topusers", TopUsersHandler)

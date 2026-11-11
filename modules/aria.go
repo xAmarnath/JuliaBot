@@ -354,13 +354,23 @@ func AriaDownloadHandle(m *tg.NewMessage) error {
 			_ = os.RemoveAll(dir)
 		}
 	}()
-	view, err := newTransferProgress(m, "Starting aria2", "Waiting for file name", 0)
+	view, err := newTransferProgress(m, "Queued", "Waiting for a download slot · maximum 2 active", 0)
 	if err != nil {
 		return err
 	}
 	status := view.status
 	ctx, done := TrackFileTransfer(status, m.SenderID())
 	defer done()
+	release, err := ariaDownloads.acquire(ctx)
+	if err != nil {
+		phase := "Failed"
+		if errors.Is(err, context.Canceled) {
+			phase = "Cancelled"
+		}
+		return view.Finish(phase, err.Error(), "aria2: "+html.EscapeString(err.Error()))
+	}
+	defer release()
+	_ = view.BeginPhase(ctx, "Starting aria2", 0)
 	started := time.Now()
 	last := time.Time{}
 	files, err := runAriaDownload(ctx, uri, dir, func(items []ariaItem) {
@@ -375,6 +385,7 @@ func AriaDownloadHandle(m *tg.NewMessage) error {
 		text := ariaProgressText(items, uri, time.Since(started))
 		_, _ = status.Edit(text, &tg.SendOptions{ParseMode: tg.HTML, ReplyMarkup: transferCancelKeyboard(status.ID)})
 	})
+	release() // The process has stopped; a slow final Telegram edit must not hold its slot.
 	if err != nil {
 		text := "aria2 download failed: " + html.EscapeString(err.Error())
 		detail := err.Error()

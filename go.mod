@@ -9,7 +9,7 @@ require (
 	github.com/shirou/gopsutil v3.21.11+incompatible
 	github.com/shirou/gopsutil/v4 v4.25.10
 	github.com/skip2/go-qrcode v0.0.0-20200617195104-da1b6568686e
-	github.com/xAmarnath/gogram v1.8.0-beta.15
+	github.com/xAmarnath/gogram v1.8.0-beta.15.0.20261111172126-b395abd8c143
 	go.mongodb.org/mongo-driver/v2 v2.9.1
 	golang.org/x/image v0.33.0
 	golang.org/x/net v0.56.0

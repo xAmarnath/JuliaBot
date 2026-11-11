@@ -117,6 +117,7 @@ func main() {
 	modules.SetupFilters(ownerId, LoadModules)
 	extras.AvatarServerInit(client)
 	modules.RegisterHandlers()
+	stopStatistics := extras.StartStatistics()
 	if err := extras.StartGame(ctx); err != nil {
 		log.Fatalf("initialize game: %v", err)
 	}
@@ -136,6 +137,7 @@ func main() {
 	client.Idle()
 	modules.FlushLastSeen()
 	extras.FlushGame()
+	stopStatistics()
 	db.CloseDB()
 
 	client.Logger.Info("Bot stopped")
