@@ -36,6 +36,7 @@ vendor/*
 *.py
 snap.go
 *.js 
+!modules/arcade_*_engine.js
 *.wasm
 *.sqlite
 *.db

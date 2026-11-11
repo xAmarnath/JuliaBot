@@ -7,23 +7,21 @@ import (
 	tg "github.com/xAmarnath/gogram/telegram"
 )
 
-//go:embed arcade_ttt.html arcade_blocks.html arcade_2048.html
+//go:embed arcade_ttt.html arcade_blocks.html arcade_2048.html arcade_*_engine.js arcade.css
 var arcadeCards embed.FS
-
-//go:embed arcade_engine.js
-var arcadeEngine string
 
 func arcadeCard(game string) string {
 	if game != "blocks" && game != "2048" {
 		game = "ttt"
 	}
 	card, _ := arcadeCards.ReadFile("arcade_" + game + ".html")
-	return strings.Replace(string(card), "/* ARCADE_ENGINE */", arcadeEngine, 1)
+	engine, _ := arcadeCards.ReadFile("arcade_" + game + "_engine.js")
+	style, _ := arcadeCards.ReadFile("arcade.css")
+	return strings.NewReplacer("/* ARCADE_ENGINE */", string(engine), "/* ARCADE_STYLE */", string(style)).Replace(string(card))
 }
 
 func sendArcade(m *tg.NewMessage, game string) error {
-	_, err := m.ReplyMedia(&tg.InputMediaWidget{Width: 340, Height: 0, Html: arcadeCard(game)},
-		&tg.MediaOptions{Caption: "Julia Arcade · /tictactoe · /blocks · /2048. Each player has their own game."})
+	_, err := m.ReplyMedia(&tg.InputMediaWidget{Width: 340, Height: 0, Html: arcadeCard(game)})
 	if err == nil {
 		return nil
 	}
@@ -45,5 +43,5 @@ func init() {
 			})
 		}
 	})
-	Mods.AddModule("Arcade", "<b>Julia Arcade</b>\n/arcade or /tictactoe — play the machine\n/blocks — falling blocks with touch controls\n/2048 — swipe to merge 2 → 4 → 8 → 2048\nGames run in Telegram widgets, with separate boards for each player.")
+	Mods.AddModule("Arcade", "<b>Games</b>\n/arcade or /tictactoe — play the machine\n/blocks — Tetris with touch controls\n/2048 — swipe to merge on 4×4, 5×5 or 6×6 grids\nGames run in Telegram widgets, with separate boards for each player.")
 }
